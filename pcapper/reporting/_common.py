@@ -12,12 +12,11 @@ verbatim, only its location changed.
 from __future__ import annotations
 from ..utils import is_public_ip as _is_public_ip
 import re
-from collections import Counter, defaultdict
+from collections import Counter
 from typing import Callable, Iterable, Protocol
 from ..coloring import (
     danger,
     header,
-    highlight,
     label,
     muted,
     ok,
@@ -34,7 +33,6 @@ from ..utils import (
     redact_sensitive_text,
     terminal_safe,
     safe_float,
-    sparkline,
 )
 
 
@@ -529,7 +527,7 @@ def _filtered_detections(summary, verbose: bool) -> list[dict[str, object]]:
         detections = filtered
 
     path_obj = getattr(summary, "path", None)
-    if path_obj is not None and getattr(path_obj, "name", "") == "ALL_PCAPS":
+    if path_obj is not None and str(getattr(path_obj, "name", "") or "").startswith("ALL_PCAPS"):
         detections = _collapse_rollup_detections(detections)
     return detections
 
@@ -782,6 +780,10 @@ def _render_deterministic_checks(
     "Deterministic … Security Checks" section (label + per-finding evidence,
     with cleared checks collapsed to one line). Used by protocol renderers that
     compute rich checks but had no surfacing path of their own."""
+    from ._style import analysis_sections
+
+    if not analysis_sections():  # analysis-only output (see _style.analysis_sections)
+        return
     checks = getattr(summary, "deterministic_checks", {}) or {}
     if not isinstance(checks, dict):
         return
@@ -1060,180 +1062,16 @@ def _render_ot_verdict(lines: list[str], label: str, anomalies: object) -> None:
             lines.append(muted(f"- {tid}"))
 
 
-@_ot_full_render
 def _render_industrial_summary(
     title: str, summary: object, packet_label: str = "Protocol Packets"
 ) -> str:
-    if not summary:
-        return ""
+    """The shared OT report (see :mod:`._ot`), commands classed by the shared
+    OT keyword classifier."""
+    from ._ot import ot_report
 
-    total_packets = getattr(summary, "total_packets", 0)
-    protocol_packets = getattr(summary, "protocol_packets", 0)
-    duration = getattr(summary, "duration", 0.0)
-    src_ips = getattr(summary, "src_ips", Counter())
-    dst_ips = getattr(summary, "dst_ips", Counter())
-    # Direction-aware role counters (clients = requesters, servers = responders),
-    # populated by the shared analyze loop. Fall back to raw src/dst when a
-    # protocol analyzer ran without enrichment.
-    client_ips = getattr(summary, "client_ips", Counter()) or Counter()
-    server_ips = getattr(summary, "server_ips", Counter()) or Counter()
-    sessions = getattr(summary, "sessions", Counter())
-    commands = getattr(summary, "commands", Counter())
-    artifacts = getattr(summary, "artifacts", [])
-    anomalies = getattr(summary, "anomalies", [])
-    errors = getattr(summary, "errors", [])
-
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"{title.upper()} ANALYSIS :: {summary.path.name}"))
-    lines.append(SECTION_BAR)
-    # Triage lead, consistent with the dedicated OT renderers (modbus/enip/cip/
-    # s7/goose/...). Silent on benign captures; fires only on warning+ anomalies.
-    _render_ot_verdict(lines, title, anomalies)
-
-    if errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        for err in errors:
-            lines.append(danger(f"- {err}"))
-
-    # Prefer the direction-aware role split; fall back to raw src/dst counters.
-    directional_roles = bool(client_ips or server_ips)
-    top_clients = client_ips if directional_roles else src_ips
-    top_servers = server_ips if directional_roles else dst_ips
-
-    lines.append(_format_kv("Scan Duration", f"{duration:.2f}s"))
-    lines.append(_format_kv("Total Packets", str(total_packets)))
-    lines.append(_format_kv(packet_label, str(protocol_packets)))
-    lines.append(_format_kv("Unique Clients", str(len(top_clients))))
-    lines.append(_format_kv("Unique Servers", str(len(top_servers))))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Top Clients / Servers"))
-    if not top_clients and not top_servers:
-        lines.append(muted("No endpoints detected."))
-    else:
-        col_width = 45
-        c_hdr = "Clients (requesters)" if directional_roles else "Clients"
-        s_hdr = "Servers (responders)" if directional_roles else "Servers"
-        lines.append(highlight(f"{c_hdr:<{col_width}} | {s_hdr}"))
-        lines.append(muted("-" * 90))
-        clients = top_clients.most_common(_limit_value(10))
-        servers = top_servers.most_common(_limit_value(10))
-        max_rows = max(len(clients), len(servers))
-        for i in range(max_rows):
-            c_str = ""
-            s_str = ""
-            if i < len(clients):
-                ip, cnt = clients[i]
-                c_str = f"{ip} ({cnt})"
-            if i < len(servers):
-                ip, cnt = servers[i]
-                s_str = f"{ip} ({cnt})"
-            lines.append(f"{c_str:<{col_width}} | {s_str}")
-
-    if commands:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Observed OT Commands"))
-        rows = [["Command", "Count", "Class"]]
-        n_control = 0
-        for cmd, count in commands.most_common(_limit_value(16)):
-            risk = _ot_command_risk(str(cmd))
-            disp = (
-                danger(str(cmd)) if risk == "CONTROL"
-                else warn(str(cmd)) if risk == "REVIEW"
-                else str(cmd)
-            )
-            if risk == "CONTROL":
-                n_control += 1
-            rows.append([disp, str(count), risk])
-        lines.append(_format_table(rows))
-        if n_control:
-            lines.append(muted(
-                f"  {n_control} distinct control/state-changing command type(s) "
-                "observed — confirm authorized source + change window."
-            ))
-
-    if sessions:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Sessions"))
-        rows = [["Session", "Packets"]]
-        # Capped even in OT full-output mode: a UDP flood or one-packet-per-
-        # session protocol (HART-IP CTF: 3,590 sessions) printed 178 KB here.
-        for sess, count in sessions.most_common(_FULL_OUTPUT_LIMIT if _verbose_output() else 25):
-            rows.append([str(sess), str(count)])
-        lines.append(_format_table(rows))
-
-    if artifacts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Artifacts & Observations"))
-        rows = [["Type", "Detail", "Src", "Dst"]]
-        for artifact in artifacts[: _limit_value(12)]:
-            rows.append(
-                [
-                    str(getattr(artifact, "kind", "artifact")),
-                    str(getattr(artifact, "detail", ""))[: _limit_value(80)],
-                    str(getattr(artifact, "src", "?")),
-                    str(getattr(artifact, "dst", "?")),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    if anomalies:
-        # Sort by severity BEFORE truncating so a late HIGH "Write to PLC" /
-        # "Control Command" isn't cut while early LOW Test-Frame entries show.
-        # (The verdict itself was rendered once at the top by _render_ot_verdict;
-        # this section used to print a second, differently-worded one.)
-        _ot_rank = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "WARNING": 1, "LOW": 0, "INFO": 0}
-        ranked_anoms = sorted(
-            anomalies,
-            key=lambda a: _ot_rank.get(str(getattr(a, "severity", "INFO")).upper(), 0),
-            reverse=True,
-        )
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Anomalies & Events (severity-ranked)"))
-        _attack_ids: list[str] = []
-        for anomaly in ranked_anoms[: _limit_value(12)]:
-            sev = getattr(anomaly, "severity", "INFO")
-            sev_color = danger if sev in ("CRITICAL", "HIGH") else warn
-            a_title = getattr(anomaly, "title", "Event")
-            lines.append(
-                sev_color(
-                    f"[{sev}] {a_title}: {getattr(anomaly, 'description', '')}"
-                )
-            )
-            lines.append(
-                muted(
-                    f"  Src: {getattr(anomaly, 'src', '?')} -> Dst: {getattr(anomaly, 'dst', '?')}"
-                )
-            )
-            for ev in getattr(anomaly, "evidence", None) or []:
-                lines.append(muted(f"  Evidence: {ev}"))
-            # Prefer an explicit ATT&CK id set by the analyzer; fall back to
-            # title-keyword inference only when the analyzer left it blank.
-            tech = getattr(anomaly, "attack", "") or _ot_attack_for_title(a_title)
-            if tech:
-                lines.append(muted(f"  ATT&CK ICS: {tech}"))
-                if tech not in _attack_ids:
-                    _attack_ids.append(tech)
-        # Collect ATT&CK across ALL anomalies (not just the shown top-12).
-        for anomaly in ranked_anoms:
-            tech = getattr(anomaly, "attack", "") or _ot_attack_for_title(
-                getattr(anomaly, "title", "")
-            )
-            if tech and tech not in _attack_ids:
-                _attack_ids.append(tech)
-        if _attack_ids:
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("ATT&CK for ICS Mapping"))
-            for tid in _attack_ids[: _limit_value(12)]:
-                lines.append(muted(f"- {tid}"))
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    return ot_report(title, summary, packet_label=packet_label)
 
 
-@_ot_full_render
 def _render_ot_protocol_summary(
     title: str,
     summary: object,
@@ -1242,346 +1080,15 @@ def _render_ot_protocol_summary(
     suspicious_tokens: set[str] | None = None,
     include_detected_devices: bool = False,
 ) -> str:
-    if not summary:
-        return ""
+    """The shared OT report (see :mod:`._ot`), commands classed by the
+    protocol's own danger/suspicion tokens."""
+    from ._ot import ot_report
 
-    total_packets = getattr(summary, "total_packets", 0)
-    protocol_packets = getattr(summary, "protocol_packets", 0)
-    total_bytes = getattr(summary, "total_bytes", 0)
-    protocol_bytes = getattr(summary, "protocol_bytes", 0)
-    duration = getattr(summary, "duration", 0.0)
-    src_ips = getattr(summary, "src_ips", Counter())
-    dst_ips = getattr(summary, "dst_ips", Counter())
-    client_ips = getattr(summary, "client_ips", Counter())
-    server_ips = getattr(summary, "server_ips", Counter())
-    sessions = getattr(summary, "sessions", Counter())
-    commands = getattr(summary, "commands", Counter())
-    service_endpoints = getattr(summary, "service_endpoints", {})
-    packet_buckets = getattr(summary, "packet_size_buckets", [])
-    payload_buckets = getattr(summary, "payload_size_buckets", [])
-    artifacts = getattr(summary, "artifacts", [])
-    anomalies = getattr(summary, "anomalies", [])
-    errors = getattr(summary, "errors", [])
-    is_rollup = str(getattr(getattr(summary, "path", None), "name", "")) == "ALL_PCAPS"
-
-    def _collapse_artifacts_for_display(
-        values: list[object],
-    ) -> list[tuple[object, int]]:
-        if not is_rollup:
-            return [(item, 1) for item in values]
-        buckets: dict[tuple[str, str, str, str], tuple[object, int]] = {}
-        order: list[tuple[str, str, str, str]] = []
-        for item in values:
-            key = (
-                str(getattr(item, "kind", "") or ""),
-                str(getattr(item, "detail", "") or ""),
-                str(getattr(item, "src", "") or ""),
-                str(getattr(item, "dst", "") or ""),
-            )
-            existing = buckets.get(key)
-            if existing is None:
-                buckets[key] = (item, 1)
-                order.append(key)
-            else:
-                buckets[key] = (existing[0], existing[1] + 1)
-        return [buckets[key] for key in order]
-
-    def _collapse_anomalies_for_display(
-        values: list[object],
-    ) -> list[tuple[object, int]]:
-        if not is_rollup:
-            return [(item, 1) for item in values]
-        buckets: dict[tuple[str, str, str, str, str], tuple[object, int]] = {}
-        order: list[tuple[str, str, str, str, str]] = []
-        for item in values:
-            key = (
-                str(getattr(item, "severity", "") or ""),
-                str(getattr(item, "title", "") or ""),
-                str(getattr(item, "description", "") or ""),
-                str(getattr(item, "src", "") or ""),
-                str(getattr(item, "dst", "") or ""),
-            )
-            existing = buckets.get(key)
-            if existing is None:
-                buckets[key] = (item, 1)
-                order.append(key)
-            else:
-                buckets[key] = (existing[0], existing[1] + 1)
-        return [buckets[key] for key in order]
-
-    def _summarize_buckets(
-        buckets: list[_SizeBucketLike],
-    ) -> tuple[int, float, int, int]:
-        total = sum(bucket.count for bucket in buckets)
-        if not total:
-            return 0, 0.0, 0, 0
-        avg = sum(bucket.avg * bucket.count for bucket in buckets) / total
-        min_val = min(bucket.min for bucket in buckets if bucket.count)
-        max_val = max(bucket.max for bucket in buckets if bucket.count)
-        return total, avg, min_val, max_val
-
-    dangerous_tokens = dangerous_tokens or set()
-    suspicious_tokens = suspicious_tokens or set()
-
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"{title.upper()} ANALYSIS :: {summary.path.name}"))
-    lines.append(SECTION_BAR)
-    _render_ot_verdict(lines, title, getattr(summary, "anomalies", []))
-
-    if errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        for err in errors:
-            lines.append(danger(f"- {err}"))
-
-    lines.append(_format_kv("Scan Duration", f"{duration:.2f}s"))
-    lines.append(_format_kv("Total Packets", str(total_packets)))
-    lines.append(_format_kv(packet_label, str(protocol_packets)))
-    lines.append(_format_kv("Total Bytes", str(total_bytes)))
-    lines.append(_format_kv(f"{title} Bytes", str(protocol_bytes)))
-    if protocol_packets:
-        lines.append(
-            _format_kv("Avg Packet Size", f"{protocol_bytes / protocol_packets:.1f}")
-        )
-
-    if packet_buckets or payload_buckets:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Packet/Payload Size Analysis"))
-        if packet_buckets:
-            total, avg, min_val, max_val = _summarize_buckets(packet_buckets)
-            counts = [bucket.count for bucket in packet_buckets]
-            lines.append(label("Packet Sizes"))
-            lines.append(_format_kv("Count", str(total)))
-            lines.append(_format_kv("Min/Avg/Max", f"{min_val}/{avg:.1f}/{max_val}"))
-            lines.append(_format_kv("Distribution", sparkline(counts)))
-        if payload_buckets:
-            total, avg, min_val, max_val = _summarize_buckets(payload_buckets)
-            counts = [bucket.count for bucket in payload_buckets]
-            lines.append(label("Payload Sizes"))
-            lines.append(_format_kv("Count", str(total)))
-            lines.append(_format_kv("Min/Avg/Max", f"{min_val}/{avg:.1f}/{max_val}"))
-            lines.append(_format_kv("Distribution", sparkline(counts)))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Top Clients / Servers"))
-    _dir_roles = bool(client_ips or server_ips)
-    lines.append(_format_kv("Unique Clients", str(len(client_ips) or len(src_ips))))
-    lines.append(_format_kv("Unique Servers", str(len(server_ips) or len(dst_ips))))
-    col_width = 45
-    _c_hdr = "Clients (requesters)" if _dir_roles else "Clients"
-    _s_hdr = "Servers (responders)" if _dir_roles else "Servers"
-    lines.append(highlight(f"{_c_hdr:<{col_width}} | {_s_hdr}"))
-    lines.append(muted("-" * 90))
-    clients = (client_ips or src_ips).most_common(_limit_value(10))
-    servers = (server_ips or dst_ips).most_common(_limit_value(10))
-    max_rows = max(len(clients), len(servers))
-    for i in range(max_rows):
-        c_str = ""
-        s_str = ""
-        if i < len(clients):
-            ip, cnt = clients[i]
-            c_str = f"{ip} ({cnt})"
-        if i < len(servers):
-            ip, cnt = servers[i]
-            s_str = f"{ip} ({cnt})"
-        lines.append(f"{c_str:<{col_width}} | {s_str}")
-
-    if sessions:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Sessions"))
-        rows = [["Session", "Packets"]]
-        # Capped even in OT full-output mode: a UDP flood or one-packet-per-
-        # session protocol (HART-IP CTF: 3,590 sessions) printed 178 KB here.
-        for sess, count in sessions.most_common(_FULL_OUTPUT_LIMIT if _verbose_output() else 25):
-            rows.append([str(sess), str(count)])
-        lines.append(_format_table(rows))
-
-    if commands:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Observed Commands/Operations"))
-        rows = [["Command", "Count", "Risk"]]
-        for cmd, count in commands.most_common(_limit_value(16)):
-            cmd_text = str(cmd)
-            lowered = cmd_text.lower()
-            risk = "Normal"
-            display = cmd_text
-            if any(token in lowered for token in dangerous_tokens):
-                risk = "Dangerous"
-                display = danger(cmd_text)
-            elif any(token in lowered for token in suspicious_tokens):
-                risk = "Suspicious"
-                display = warn(cmd_text)
-            rows.append([display, str(count), risk])
-        lines.append(_format_table(rows))
-
-    if service_endpoints:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Service Endpoints (client -> server)"))
-        rows = [["Service", "Top Endpoints"]]
-        for service, _count in commands.most_common(_limit_value(10)):
-            endpoints = service_endpoints.get(str(service), Counter())
-            top_eps = ", ".join(
-                f"{ep} ({cnt})" for ep, cnt in endpoints.most_common(_limit_value(3))
-            )
-            rows.append([str(service), top_eps or "-"])
-        lines.append(_format_table(rows))
-
-    if artifacts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Artifacts & Observations"))
-        rows = [["Type", "Detail", "Src", "Dst"]]
-        collapsed_artifacts = _collapse_artifacts_for_display(list(artifacts))
-        if is_rollup and len(collapsed_artifacts) < len(list(artifacts)):
-            lines.append(
-                muted(
-                    f"Summarized view collapsed {len(list(artifacts)) - len(collapsed_artifacts)} duplicate artifact observation(s)."
-                )
-            )
-        for artifact, seen_count in collapsed_artifacts[: _limit_value(16)]:
-            detail_text = str(getattr(artifact, "detail", ""))[: _limit_value(80)]
-            if seen_count > 1:
-                detail_text = f"{detail_text} [x{seen_count}]"
-            rows.append(
-                [
-                    str(getattr(artifact, "kind", "artifact")),
-                    detail_text,
-                    str(getattr(artifact, "src", "?")),
-                    str(getattr(artifact, "dst", "?")),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-        equipment_hits = [
-            artifact
-            for artifact in artifacts
-            if str(getattr(artifact, "kind", "")) == "equipment"
-        ]
-        if equipment_hits:
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("Equipment Inventory"))
-            counts = Counter(
-                str(getattr(artifact, "detail", "")) for artifact in equipment_hits
-            )
-            endpoints: dict[str, Counter[str]] = defaultdict(Counter)
-            for artifact in equipment_hits:
-                detail = str(getattr(artifact, "detail", ""))
-                src = str(getattr(artifact, "src", "?"))
-                dst = str(getattr(artifact, "dst", "?"))
-                endpoints[detail][f"{src} -> {dst}"] += 1
-            rows = [["Equipment", "Count", "Top Endpoints"]]
-            for detail, count in counts.most_common(_limit_value(12)):
-                top_eps = ", ".join(
-                    f"{ep} ({cnt})"
-                    for ep, cnt in endpoints[detail].most_common(_limit_value(3))
-                )
-                rows.append([detail, str(count), top_eps or "-"])
-            lines.append(_format_table(rows))
-
-    if include_detected_devices:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Detected Devices Information"))
-        device_counts: Counter[str] = Counter()
-        device_endpoints: dict[str, Counter[str]] = defaultdict(Counter)
-
-        for artifact in artifacts:
-            kind = str(getattr(artifact, "kind", "")).strip().lower()
-            detail = str(getattr(artifact, "detail", "")).strip()
-            if not detail:
-                continue
-            include_artifact = kind in {
-                "equipment",
-                "device",
-                "software",
-                "firmware",
-                "system",
-                "identity",
-            }
-            if not include_artifact:
-                lowered = detail.lower()
-                include_artifact = any(
-                    token in lowered
-                    for token in (
-                        "vendor=",
-                        "model=",
-                        "product=",
-                        "software=",
-                        "firmware=",
-                        "simatic",
-                        "siemens",
-                        "plc",
-                        "hmi",
-                        "scada",
-                        "dcs",
-                        "rtu",
-                    )
-                )
-            if not include_artifact:
-                continue
-            src = str(getattr(artifact, "src", "?"))
-            dst = str(getattr(artifact, "dst", "?"))
-            device_counts[detail] += 1
-            device_endpoints[detail][f"{src} -> {dst}"] += 1
-
-        for command, count in commands.items():
-            cmd_text = str(command)
-            if "SrcTSAP=" not in cmd_text or "DstTSAP=" not in cmd_text:
-                continue
-            profile = cmd_text.replace("COTP:CR:", "COTP CR ").replace(
-                "COTP:CC:", "COTP CC "
-            )
-            device_counts[profile] += int(count)
-            for endpoint, ep_count in service_endpoints.get(cmd_text, Counter()).items():
-                device_endpoints[profile][endpoint] += int(ep_count)
-
-        if not device_counts:
-            lines.append(
-                muted(
-                    "No device/system/equipment/software details were discovered in S7 communications."
-                )
-            )
-        else:
-            rows = [["Detail", "Count", "Top Endpoints"]]
-            for detail, count in device_counts.most_common(_limit_value(16)):
-                top_eps = ", ".join(
-                    f"{ep} ({cnt})"
-                    for ep, cnt in device_endpoints[detail].most_common(_limit_value(3))
-                )
-                rows.append(
-                    [
-                        _truncate_text(detail, _limit_value(72)),
-                        str(count),
-                        _truncate_text(top_eps or "-", _limit_value(64)),
-                    ]
-                )
-            lines.append(_format_table(rows))
-
-    if anomalies:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Anomalies & Threat Indicators"))
-        collapsed_anomalies = _collapse_anomalies_for_display(list(anomalies))
-        if is_rollup and len(collapsed_anomalies) < len(list(anomalies)):
-            lines.append(
-                muted(
-                    f"Summarized view collapsed {len(list(anomalies)) - len(collapsed_anomalies)} duplicate anomaly signal(s)."
-                )
-            )
-        for anomaly, seen_count in collapsed_anomalies[: _limit_value(16)]:
-            sev = getattr(anomaly, "severity", "INFO")
-            sev_color = danger if sev in ("CRITICAL", "HIGH") else warn
-            title_text = str(getattr(anomaly, "title", "Event"))
-            if seen_count > 1:
-                title_text = f"{title_text} [x{seen_count}]"
-            lines.append(
-                sev_color(
-                    f"[{sev}] {title_text}: {getattr(anomaly, 'description', '')}"
-                )
-            )
-            lines.append(
-                muted(
-                    f"  Src: {getattr(anomaly, 'src', '?')} -> Dst: {getattr(anomaly, 'dst', '?')}"
-                )
-            )
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    return ot_report(
+        title,
+        summary,
+        packet_label=packet_label,
+        dangerous_tokens=set(dangerous_tokens or ()),
+        suspicious_tokens=set(suspicious_tokens or ()),
+        include_detected_devices=include_detected_devices,
+    )

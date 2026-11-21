@@ -588,7 +588,9 @@ class TestTlsFixture:
         cert = summary.cert_artifacts[0]
         assert cert.src_ip == "192.168.10.10"  # the service that presented it
         assert cert.sni == "shop.example.net"  # attributed from the client hello
-        assert summary.self_signed_certs == 1 and summary.expired_certs == 1
+        # Valid 2021-01-01..2022-01-01 and presented on 2021-01-01: expiry is
+        # judged at capture time, not against the date of the analysis.
+        assert summary.self_signed_certs == 1 and summary.expired_certs == 0
         assert summary.weak_certs == 0  # Ed25519 is not a weak key
         assert any("Cert SHA256:" in a and "service=shop.example.net" in a for a in summary.artifacts)
 

@@ -12,7 +12,7 @@ from typing import Optional
 from .pcap_cache import PcapMeta, iter_packets
 from .openvpn import iter_openvpn_tcp_control_payloads
 from .utils import x509_names
-from .utils import extract_packet_endpoints, memoize_analysis
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy import error as scapy_error  # type: ignore
@@ -340,6 +340,10 @@ def analyze_certificates(
             retained_buffer_bytes -= removed
 
     now_utc = datetime.now(timezone.utc)
+    # Validity is judged at the moment the certificate was presented (the
+    # packet time), not at analysis time: a certificate valid during a 2017
+    # incident is not "expired" evidence because it lapsed in 2018.
+    seen_at: list[datetime] = [now_utc]
     suspicious_tlds = (".ru", ".cn", ".top", ".xyz", ".gq", ".tk", ".ml", ".ga")
     brand_markers = (
         "microsoft",
@@ -570,11 +574,11 @@ def analyze_certificates(
                     "dst": dst_ip,
                 }
             )
-        if now_utc > not_after_dt:
+        if seen_at[0] > not_after_dt:
             expired.append(
                 {"subject": subject, "reason": "expired", "src": src_ip, "dst": dst_ip}
             )
-        if now_utc < not_before_dt:
+        if seen_at[0] < not_before_dt:
             validity_outliers.append(
                 {
                     "subject": subject,
@@ -813,6 +817,9 @@ def analyze_certificates(
 
     try:
         for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+            packet_time = safe_float(getattr(pkt, "time", None))
+            seen_at[0] = (datetime.fromtimestamp(packet_time, timezone.utc)
+                          if packet_time is not None and packet_time > 0 else now_utc)
             total_packets += 1
             tcp_layer = pkt.getlayer(TCP) if TCP is not None else None
             tls_layer = pkt.getlayer(TLS) if TLS is not None else None

@@ -9,9 +9,10 @@ from .equipment import equipment_artifacts
 from .industrial_helpers import (
     IndustrialAnalysis,
     IndustrialAnomaly,
-    analyze_ethertype_protocol,
-    analyze_port_protocol,
+    analyze_protocols_together,
     default_artifacts,
+    ethertype_protocol_spec,
+    port_protocol_spec,
 )
 from .utils import memoize_analysis
 
@@ -651,27 +652,32 @@ def _merge_size_buckets(left: list, right: list) -> list:
 
 @memoize_analysis
 def analyze_profinet(path: Path, show_status: bool = True) -> IndustrialAnalysis:
-    port_analysis = analyze_port_protocol(
-        port_key="profinet",
-        path=path,
-        protocol_name="Profinet",
-        tcp_ports=PROFINET_PORTS,
-        udp_ports=PROFINET_PORTS,
-        signature_matcher=_is_pnio_rpc,
-        command_parser=_parse_port_commands,
-        artifact_parser=_parse_port_artifacts,
-        anomaly_detector=_detect_anomalies,
-        enable_enrichment=True,
-        show_status=show_status,
-    )
-    eth_analysis = analyze_ethertype_protocol(
-        path=path,
-        protocol_name="Profinet RT",
-        ethertype=PROFINET_ETHERTYPE,
-        command_parser=_parse_commands,
-        artifact_parser=_parse_artifacts,
-        anomaly_detector=_detect_anomalies,
-        enable_enrichment=True,
+    # PNIO-CM on its ports and PROFINET RT on its EtherType, in one read.
+    port_analysis, eth_analysis = analyze_protocols_together(
+        path,
+        [
+            port_protocol_spec(
+                path,
+                "Profinet",
+                port_key="profinet",
+                tcp_ports=PROFINET_PORTS,
+                udp_ports=PROFINET_PORTS,
+                signature_matcher=_is_pnio_rpc,
+                command_parser=_parse_port_commands,
+                artifact_parser=_parse_port_artifacts,
+                anomaly_detector=_detect_anomalies,
+                enable_enrichment=True,
+            ),
+            ethertype_protocol_spec(
+                path,
+                "Profinet RT",
+                PROFINET_ETHERTYPE,
+                command_parser=_parse_commands,
+                artifact_parser=_parse_artifacts,
+                anomaly_detector=_detect_anomalies,
+                enable_enrichment=True,
+            ),
+        ],
         show_status=show_status,
     )
     merged = _merge(port_analysis, eth_analysis)

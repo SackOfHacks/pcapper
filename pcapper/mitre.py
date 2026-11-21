@@ -12,6 +12,7 @@ from typing import Optional
 
 from .ioc import analyze_iocs
 from .threats import analyze_threats
+from .utils import fan_out
 
 _TECHNIQUE_ID_RE = re.compile(r"\bT\d{4}(?:\.\d{3})?\b", re.IGNORECASE)
 _TACTIC_ID_RE = re.compile(r"\bTA\d{4}\b", re.IGNORECASE)
@@ -791,7 +792,9 @@ def _executive_assessment(
 
     distinct_tactics = {hit.tactic for hit in hits}
     high_impact = distinct_tactics & _HIGH_IMPACT_TACTICS
-    ot_impact = distinct_tactics & _OT_IMPACT_TACTICS
+    # Only ICS-framework hits are OT process/safety impact: enterprise
+    # "Impact" (e.g. T1498 network DoS) is not a process-control effect.
+    ot_impact = {hit.tactic for hit in hits if str(hit.framework).lower() == "ics"} & _OT_IMPACT_TACTICS
 
     # Objective-stage tactics are the strongest intrusion signal.
     if len(high_impact) >= 2:
@@ -1042,6 +1045,7 @@ def merge_mitre_summaries(summaries: list[MitreSummary]) -> MitreSummary:
     )
 
 
+@fan_out
 def analyze_mitre(
     path: Path,
     show_status: bool = True,

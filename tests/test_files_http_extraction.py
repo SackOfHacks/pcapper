@@ -125,3 +125,95 @@ def test_named_internal_server_is_not_staging(tmp_path) -> None:
     assert any(a.filename == "setup.exe" for a in summary.artifacts)
     assert not summary.deterministic_checks.get("internal_executable_staging")
     assert not summary.deterministic_checks.get("known_malware_filename")
+
+
+def _analyze_files_disk_and_memory(pcap, monkeypatch):
+    from pcapper import pcap_cache, utils
+    from pcapper.files import analyze_files
+
+    monkeypatch.setenv("PCAPPER_CACHE_ENABLED", "0")
+    utils.clear_analysis_memo()
+    disk = analyze_files(pcap, show_status=False)
+    reader = pcap_cache._open_single_capture(pcap)
+    try:
+        packets = list(reader)
+    finally:
+        reader.close()
+    utils.clear_analysis_memo()
+    memory = analyze_files(pcap, show_status=False, packets=packets)
+    return disk, memory
+
+
+def _files_view(summary):
+    return (
+        [(a.protocol, a.filename, a.size_bytes, a.packet_index, a.file_type) for a in summary.artifacts],
+        [d.get("summary") for d in summary.detections],
+        summary.total_candidates,
+    )
+
+
+def test_files_same_from_disk_and_memory(tmp_path, monkeypatch) -> None:
+    """The stream pass ran only for packets in memory (or from disk only when
+    dpkt found nothing), so --overview from memory reported a "Files extracted
+    via Scapy fallback" detection that --overview from disk did not, although
+    the pass found nothing new. Both now run it and agree."""
+    pytest.importorskip("scapy.all")
+    exe = b"MZ" + b"\x90" * 3000
+    pcap = _write(tmp_path, "download.pcap", [
+        _tcp(CLIENT, SERVER, 50003, 80, _get("/a.exe"), seq=100),
+        *_segments(SERVER, CLIENT, 80, 50003, _response("200 OK", exe), seq=700),
+    ])
+    disk, memory = _analyze_files_disk_and_memory(pcap, monkeypatch)
+    assert _files_view(disk) == _files_view(memory)
+    assert [a.filename for a in disk.artifacts] == ["a.exe"]
+    assert "Files extracted via Scapy fallback" not in _files_view(disk)[1]
+
+
+def test_stream_pass_file_already_found_by_dpkt_is_listed_once() -> None:
+    """dpkt names an HTTP body after its URL (Cerber's "404.bin"), the stream
+    pass after its content ("extracted_pe_http.exe"): one file, listed once."""
+    from pathlib import Path
+
+    from pcapper.files import FileArtifact, FileTransferSummary, _reconcile_scapy_pass
+
+    def artifact(name: str, index: int = 8, size: int = 522922) -> FileArtifact:
+        return FileArtifact(
+            protocol="HTTP", src_ip=SERVER, dst_ip=CLIENT, src_port=80, dst_port=49182,
+            filename=name, size_bytes=size, packet_index=index,
+            note="HTTP Response Body", file_type="EXE/DLL", payload=None,
+        )
+
+    def summary(*arts: FileArtifact) -> FileTransferSummary:
+        return FileTransferSummary(Path("x.pcap"), 0, [], list(arts), [], [], [], [])
+
+    dpkt_pass = summary(artifact("404.bin"))
+    stream_pass = summary(artifact("extracted_pe_http.exe"))
+    _reconcile_scapy_pass(dpkt_pass, stream_pass)
+    assert stream_pass.artifacts == [] and stream_pass.detections == []
+
+    stream_pass = summary(artifact("extracted_pe_http.exe"), artifact("tftp_file.bin", index=30, size=99))
+    _reconcile_scapy_pass(dpkt_pass, stream_pass)
+    assert [a.filename for a in stream_pass.artifacts] == ["tftp_file.bin"]
+    assert [d["summary"] for d in stream_pass.detections] == ["Files extracted via Scapy fallback"]
+
+
+def test_stream_pass_retained_payload_is_budgeted(tmp_path, monkeypatch) -> None:
+    """Streamed from disk, the stream pass held every TCP payload of the
+    capture; it now keeps the same budget as the dpkt pass."""
+    pytest.importorskip("scapy.all")
+    from pcapper import files
+    from pcapper.pcap_cache import iter_packets
+
+    monkeypatch.setattr(files, "FILES_TOTAL_STREAM_BYTES", 1000)
+    exe = b"MZ" + b"\x90" * 5000
+    pcap = _write(tmp_path, "budget.pcap", [
+        _tcp(CLIENT, SERVER, 50004, 80, _get("/big.exe"), seq=100),
+        *_segments(SERVER, CLIENT, 80, 50004, _response("200 OK", exe), seq=700),
+    ])
+    for lite in (False, True):
+        extractor = files.FileExtractor(pcap)
+        for idx, pkt in enumerate(iter_packets(pcap, show_status=False, lite=lite), start=1):
+            extractor.process_packet(pkt, idx)
+        retained = sum(len(chunk[1]) for chunks in extractor.tcp_streams.values() for chunk in chunks)
+        assert retained == 1000
+        assert any("Stream reconstruction budget of 1000 bytes" in e for e in extractor.errors)

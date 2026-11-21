@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Optional
 
 from .industrial_helpers import IndustrialCommandEvent, _strip_padding
-from .pcap_cache import PcapMeta, iter_packets
+from .lite import UNSUPPORTED, LitePacket
+from .pcap_cache import PassStats, PcapMeta, iter_packets
 from .tristation import (
     CONFIG_CHANGE,
     MODE_CHANGE,
@@ -150,6 +151,19 @@ def _safety_service(
     return None
 
 
+def _safety_prefilter(extra: frozenset[int]):  # type: ignore[no-untyped-def]
+    """Records whose transport ports name a safety service (or that only
+    scapy can settle); the rest count toward the capture totals alone."""
+
+    def keep(record: LitePacket) -> bool:
+        l4 = record.lite_l4()
+        if l4 is UNSUPPORTED:
+            return True
+        return l4 is not None and _safety_service(l4[1], l4[2], extra) is not None
+
+    return keep
+
+
 @memoize_analysis
 def analyze_safety(
     path: Path,
@@ -243,7 +257,18 @@ def analyze_safety(
 
     skipped = 0
     first_error = None
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    # Read from disk, only packets on a safety port are handed over (the
+    # totals come from the pass), as lite records parsed from their bytes.
+    stats = PassStats()
+    for pkt in iter_packets(
+        path,
+        packets=packets,
+        meta=meta,
+        show_status=show_status,
+        lite=True,
+        prefilter=_safety_prefilter(frozenset(tristation_extra)),
+        stats=stats,
+    ):
         try:
             total_packets += 1
             ts = safe_float(getattr(pkt, "time", None))
@@ -251,6 +276,32 @@ def analyze_safety(
             src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
+
+            lite = pkt.lite_l4() if type(pkt) is LitePacket else UNSUPPORTED
+            if lite is None:
+                continue  # no TCP/UDP layer anywhere
+            if lite is not UNSUPPORTED:
+                # The packet's only transport layer: TCP or UDP, not both.
+                sport, dport = lite[1], lite[2]  # type: ignore[index]
+                service = _safety_service(sport, dport, tristation_extra)
+                if service:
+                    record_hit(
+                        SafetyHit(
+                            ts=ts, protocol="TCP" if lite[0] else "UDP",  # type: ignore[index]
+                            src=src_ip, dst=dst_ip,
+                            src_port=sport, dst_port=dport, service=service,
+                        )
+                    )
+                    if service == "Triconex/TriStation":
+                        if lite[5] >= 0:  # type: ignore[index]
+                            payload = pkt.original[lite[5] : lite[6]]  # type: ignore[index]
+                        else:  # scapy dissects that port's payload into a layer
+                            layer = pkt.materialize().getlayer(TCP if lite[0] else UDP)  # type: ignore[index]
+                            payload = _strip_padding(layer.payload)
+                        decode_tristation(payload, src_ip, dst_ip, ts)
+                continue
+            if type(pkt) is LitePacket:
+                pkt = pkt.materialize()
 
             if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
                 tcp = pkt[TCP]  # type: ignore[index]
@@ -285,6 +336,8 @@ def analyze_safety(
             skipped += 1
             if first_error is None:
                 first_error = f"{type(exc).__name__}: {exc}"
+    if stats.active:
+        total_packets = stats.packets
     if skipped:
         errors.append(
             f"{skipped} packet(s) skipped by the safety parser (first error: {first_error})."

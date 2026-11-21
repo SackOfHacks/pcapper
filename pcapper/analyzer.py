@@ -159,6 +159,13 @@ def _as_int(value: object | None) -> Optional[int]:
         return None
 
 
+def _capture_meta(path: Path) -> PcapMeta | None:
+    try:
+        return load_capture_meta(path)
+    except Exception:
+        return None
+
+
 @memoize_analysis
 def analyze_pcap(
     path: Path,
@@ -167,15 +174,14 @@ def analyze_pcap(
     meta: PcapMeta | None = None,
 ) -> PcapSummary:
     capture_meta = meta
-    if capture_meta is None:
-        try:
-            capture_meta = load_capture_meta(path)
-        except Exception:
-            capture_meta = None
+    if capture_meta is None and packets is not None:
+        capture_meta = _capture_meta(path)
+    # Read from disk, the capture's metadata is taken after the loop: a
+    # pcapng's interfaces and section options come from the loop's own read
+    # of the file then, not a walk of the whole file before it.
 
     file_type = capture_meta.file_type if capture_meta else detect_file_type(path)
     size_bytes = capture_meta.size_bytes if capture_meta else capture_size(path)
-    hash_sha256, hash_sha1 = capture_hashes(path)
     packet_count = 0
     truncated_packets = 0
     start_ts: Optional[float] = None
@@ -267,6 +273,9 @@ def analyze_pcap(
                             seen_seq[key].clear()
                 except Exception:
                     pass
+
+    if capture_meta is None:
+        capture_meta = _capture_meta(path)
 
     duration_seconds = None
     if start_ts is not None and end_ts is not None:
@@ -375,6 +384,9 @@ def analyze_pcap(
                 )
             )
 
+    # After the loop: a whole read of the capture that the run wanted hashes
+    # for has computed them on the way (pcap_cache.capture_file).
+    hash_sha256, hash_sha1 = capture_hashes(path)
     return PcapSummary(
         path=path,
         file_type=file_type,
@@ -399,6 +411,11 @@ def analyze_pcap(
         hash_sha1=hash_sha1,
         truncated_packets=truncated_packets,
     )
+
+
+# It reports the capture's hashes, which come from the read the run makes in
+# its own process: a --jobs plan keeps it there.
+analyze_pcap.reports_hashes = True  # type: ignore[attr-defined]
 
 
 def merge_pcap_summaries(summaries: list[PcapSummary]) -> PcapSummary:

@@ -1,474 +1,169 @@
-"""Rendered output for arp analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for ARP: poisoning and MITM first -- the gateway's MAC
+bindings, addresses claimed by more than one MAC, the attack timeline -- then
+sweep sources; conversations, rates and fingerprints are -v detail."""
 
 from __future__ import annotations
+
 from ..arp import ArpSummary
-from ..coloring import (
-    danger,
-    header,
-    label,
-    muted,
-    ok,
-    warn,
-)
-from ..utils import (
-    format_ts,
-)
-
-from ._common import (
-    SECTION_BAR,
-    SUBSECTION_BAR,
-    _apply_verbose_limit,
-    _counter_table,
-    _finalize_output,
-    _format_kv,
-    _format_table,
-    _highlight_public_ips,
-    _limit_value,
-    _redact_in_text,
-    _truncate_text,
-)
+from ..ipmac import mac_manufacturer
+from . import _style as st
+from ._common import _redact_in_text, _render_deterministic_checks
+from ._kv import counter_line, findings_for
 
 
-def render_arp_summary(
-    summary: ArpSummary, limit: int = 15, verbose: bool = False
-) -> str:
-    limit = _apply_verbose_limit(limit)
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"ARP ANALYSIS :: {summary.path.name}"))
-    lines.append(SECTION_BAR)
+def _assessment(summary: ArpSummary) -> tuple[str, str, int, list[str]]:
+    score = 0
+    reasons: list[str] = []
+    high = sum(1 for a in summary.anomalies if a.severity in {"HIGH", "CRITICAL"})
+    medium = sum(1 for a in summary.anomalies if a.severity == "MEDIUM")
+    if high:
+        score += min(5, high * 2)
+        reasons.append(f"high-severity ARP anomalies ({high})")
+    if medium >= 2:
+        score += 1
+        reasons.append(f"multiple medium-severity ARP anomalies ({medium})")
+    if summary.unsolicited_replies >= 20:
+        score += 2
+        reasons.append(f"elevated unsolicited ARP replies ({summary.unsolicited_replies})")
+    if summary.gateway_ip and len(summary.gateway_mac_candidates or {}) > 1:
+        score += 2
+        reasons.append("gateway ARP MAC mapping changed")
+    if summary.gratuitous_arp >= 25:
+        score += 1
+        reasons.append(f"excess gratuitous ARP ({summary.gratuitous_arp})")
+    if (summary.threats or {}).get("ARP Sweep") or (summary.deterministic_checks or {}).get("arp_recon_sweep"):
+        score += 2
+        reasons.append("ARP host-sweep reconnaissance (subnet mapping)")
+    if score >= 7:
+        verdict, confidence = "YES - high-confidence ARP poisoning or MITM behavior", "High"
+    elif score >= 4:
+        verdict, confidence = "LIKELY - suspicious ARP behavior with attack indicators", "Medium"
+    elif score >= 2:
+        verdict, confidence = "POSSIBLE - potentially malicious ARP behavior; corroborate", "Low"
+    else:
+        verdict, confidence = "NO STRONG SIGNAL from the current heuristics", "Low"
+    return verdict, confidence, score, reasons
 
+
+def _mac(mac: object) -> str:
+    vendor = mac_manufacturer(str(mac))
+    return f"{mac} ({vendor})" if vendor and vendor != "-" else str(mac)
+
+
+def render_arp_summary(summary: ArpSummary, limit: int = 15, verbose: bool = False) -> str:
+    rep = st.Report("ARP", summary.path)
+    findings = findings_for(summary, ot=False)
+    if not summary.arp_packets and not st.material(findings):
+        return rep.absent("ARP traffic", summary.errors)
+    severity, text = st.verdict(findings, high="ARP poisoning / MITM indicators: investigate",
+                                medium="ARP activity to review")
+    rep.headline(severity, text, st.join([
+        f"{st.count(summary.arp_packets)} ARP packets",
+        f"{summary.arp_requests} requests · {summary.arp_replies} replies",
+        f"{summary.gratuitous_arp} gratuitous" if summary.gratuitous_arp else "",
+        f"{summary.arp_probes} probes" if summary.arp_probes else "",
+        st.caution(st.plural(summary.unsolicited_replies, "unsolicited reply", "unsolicited replies"))
+        if summary.unsolicited_replies else "",
+    ]))
+    rep.scope(st.join([
+        st.duration(summary.duration) if summary.duration else "",
+        f"gateway {summary.gateway_ip}" if summary.gateway_ip else "",
+        f"{st.plural(len(summary.src_macs), 'MAC')} · {st.plural(len(summary.src_ips), 'sender address', 'sender addresses')}",
+    ]))
     if summary.errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        for err in summary.errors:
-            lines.append(danger(f"- {err}"))
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Findings", st.findings_block(findings))
 
-    lines.append(_format_kv("Scan Duration", f"{summary.duration:.2f}s"))
-    lines.append(_format_kv("Total Packets", str(summary.total_packets)))
-    lines.append(_format_kv("ARP Packets", str(summary.arp_packets)))
-    lines.append(_format_kv("ARP Requests", str(summary.arp_requests)))
-    lines.append(_format_kv("ARP Replies", str(summary.arp_replies)))
-    lines.append(_format_kv("Gratuitous ARP", str(summary.gratuitous_arp)))
-    lines.append(_format_kv("ARP Probes", str(summary.arp_probes)))
-    lines.append(_format_kv("Unsolicited Replies", str(summary.unsolicited_replies)))
+    gw_macs = summary.gateway_mac_candidates or {}
+    rep.section("Gateway", st.table(
+        ["Gateway", "MAC", "Replies"],
+        [[summary.gateway_ip or "-", (st.bad(_mac(m)) if len(gw_macs) > 1 else _mac(m)), st.count(n)]
+         for m, n in sorted(gw_macs.items(), key=lambda kv: -kv[1])],
+        align="llr", noun="MAC",
+    ))
+    conflicts = sorted((summary.victim_conflicts or {}).items(), key=lambda kv: sum(kv[1].values()), reverse=True)
+    rep.section("Address conflicts", st.table(
+        ["Address", "Claimed by", "Claims"],
+        [[ip, ", ".join(f"{_mac(m)} ×{n}" for m, n in macs.most_common()), st.count(sum(macs.values()))] for ip, macs in conflicts],
+        align="llr", max_rows=10, noun="address",
+    ))
+    rep.section("Timeline", st.table(
+        ["Time", "Event", "Source", "Destination"],
+        [[st.ts(t.ts), _redact_in_text(t.detail), t.src, t.dst] for t in (summary.timeline or [])],
+        widths=(None, 80), max_rows=10, noun="event",
+    ))
+    rep.section("Proxy ARP", st.table(
+        ["MAC", "Destination targets", "Claimed addresses"],
+        [[_mac(p.get("mac", "-")), p.get("dst_targets", "-"), p.get("claimed_ips", "-")] for p in (summary.proxy_arp_candidates or [])],
+        max_rows=10,
+    ))
+    rep.section("Activity", st.kv([
+        counter_line("Top requesters", summary.client_details, 6),
+        counter_line("Top responders", summary.server_details, 6),
+        counter_line("Threats", summary.threats, 6),
+    ]))
 
-    def _arp_verdict() -> tuple[str, str, list[str], int]:
-        score = 0
-        reasons: list[str] = []
-        high_anomalies = sum(
-            1 for item in summary.anomalies if item.severity in {"HIGH", "CRITICAL"}
-        )
-        med_anomalies = sum(
-            1 for item in summary.anomalies if item.severity == "MEDIUM"
-        )
-        if high_anomalies:
-            score += min(5, high_anomalies * 2)
-            reasons.append(f"High-severity ARP anomalies observed ({high_anomalies})")
-        if med_anomalies >= 2:
-            score += 1
-            reasons.append(
-                f"Multiple medium-severity ARP anomalies observed ({med_anomalies})"
-            )
-        if summary.unsolicited_replies >= 20:
-            score += 2
-            reasons.append(
-                f"Unsolicited ARP replies are elevated ({summary.unsolicited_replies})"
-            )
-        if (
-            getattr(summary, "gateway_ip", "")
-            and len(getattr(summary, "gateway_mac_candidates", {})) > 1
-        ):
-            score += 2
-            reasons.append("Gateway ARP MAC mapping changed")
-        if summary.gratuitous_arp >= 25:
-            score += 1
-            reasons.append(
-                f"Excess gratuitous ARP frames observed ({summary.gratuitous_arp})"
-            )
-        # An ARP host-sweep is reconnaissance / network mapping (often pre-attack
-        # or lateral-movement scoping). It can be benign (admin scanners), so it
-        # lifts the verdict to "POSSIBLE — corroborate", not a definitive attack.
-        threats = getattr(summary, "threats", {}) or {}
-        if threats.get("ARP Sweep") or (
-            getattr(summary, "deterministic_checks", {}) or {}
-        ).get("arp_recon_sweep"):
-            score += 2
-            reasons.append(
-                "ARP host-sweep reconnaissance observed (subnet/network mapping)"
-            )
+    # ---- reference (-v) --------------------------------------------------
+    verdict, confidence, score, reasons = _assessment(summary)
+    rep.section("Assessment", st.kv([("Verdict", verdict), ("Confidence", f"{confidence} (score={score})")])
+                + st.bullets(reasons, max_items=None), detail=True)
+    latency = summary.reply_latency_summary or {}
+    rep.section("Reply timing", st.kv([
+        ("Median reply latency", f"{float(latency.get('median_s', 0.0)) * 1000.0:.2f} ms" if latency else ""),
+        ("p95 reply latency", f"{float(latency.get('p95_s', 0.0)) * 1000.0:.2f} ms" if latency else ""),
+        ("Samples", str(int(float(latency.get("samples", 0.0)))) if latency else ""),
+    ]), detail=True)
+    rep.section("Request rates", st.table(
+        ["Source", "Requests", "Packets/s"],
+        [[src, st.count(n), f"{float((summary.pps_by_source or {}).get(src, 0.0)):.2f}"] for src, n in summary.client_details.most_common()],
+        align="lrr", max_rows=None,
+    ), detail=True)
+    rep.section("Conversations", st.table(
+        ["Source IP", "Destination IP", "Source MAC", "Destination MAC", "Opcode", "Packets", "First", "Last"],
+        [[c.src_ip, c.dst_ip, c.src_mac, c.dst_mac, c.opcode, st.count(c.packets), st.ts(c.first_seen), st.ts(c.last_seen)]
+         for c in summary.conversations], align="lllllrll", max_rows=None,
+    ), detail=True)
+    rep.section("Request/reply pairs", st.table(
+        ["Client", "Server", "Requests", "Replies", "First", "Last"],
+        [[s.client_ip, s.server_ip, s.requests, s.replies, st.ts(s.first_seen), st.ts(s.last_seen)] for s in summary.sessions],
+        align="llrrll", max_rows=None,
+    ), detail=True)
+    rep.section("Counters", st.kv([
+        counter_line("Opcodes", summary.opcode_counts, None),
+        counter_line("Response types", summary.response_codes, None),
+        counter_line("Request types", summary.request_summary, None),
+        counter_line("Source IPs", summary.src_ips, None),
+        counter_line("Destination IPs", summary.dst_ips, None),
+        counter_line("Source MACs", summary.src_macs, None),
+        counter_line("Destination MACs", summary.dst_macs, None),
+        counter_line("Client fingerprints", summary.client_versions, None),
+        counter_line("Server fingerprints", summary.server_versions, None),
+        counter_line("Rate peaks", getattr(summary, "rate_peaks", None), None),
+        ("Anomalies dropped", str(getattr(summary, "anomalies_dropped", 0) or "")),
+    ]), detail=True)
+    rep.section("Context", st.bullets([_redact_in_text(str(x)) for x in (summary.benign_indicators or [])]
+                                      + [_redact_in_text(str(x)) for x in (summary.risk_factors or [])], max_items=None),
+                detail=True)
+    rep.section("Artifacts", st.table(
+        ["Kind", "Detail", "Flow", "Time"],
+        [[a.kind, _redact_in_text(str(a.detail)), st.flow(a.src, a.dst), st.ts(a.ts)] for a in summary.artifacts], max_rows=None,
+    ), detail=True)
+    rep.section("Plaintext", st.table(["String", "Count"], [[t, st.count(n)] for t, n in summary.plaintext_observed.most_common()],
+                                      align="lr", max_rows=None), detail=True)
+    rep.section("Files", st.bullets([str(f) for f in summary.files_discovered or []], max_items=None), detail=True)
+    rep.section("Traffic", st.kv([("Duration", f"{summary.duration:.2f}s"),
+                                  ("Packets", f"{summary.total_packets} total · {summary.arp_packets} ARP")]), detail=True)
 
-        if score >= 7:
-            verdict = (
-                "YES - high-confidence ARP poisoning or MITM-style behavior is present."
-            )
-            confidence = "High"
-        elif score >= 4:
-            verdict = (
-                "LIKELY - suspicious ARP behavior with attack indicators is present."
-            )
-            confidence = "Medium"
-        elif score >= 2:
-            verdict = "POSSIBLE - potentially malicious ARP behavior observed; corroboration recommended."
-            confidence = "Low"
-        else:
-            verdict = "NO STRONG SIGNAL - no convincing high-risk ARP attack pattern from current heuristics."
-            confidence = "Low"
-
-        if not reasons:
-            reasons.append("No high-confidence ARP attack heuristic crossed threshold")
-        return verdict, confidence, reasons, score
-
-    verdict, confidence, verdict_reasons, verdict_score = _arp_verdict()
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Analyst Verdict"))
-    if verdict.startswith("YES"):
-        lines.append(danger(verdict))
-    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
-        lines.append(warn(verdict))
-    else:
-        lines.append(ok(verdict))
-    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
-    lines.append(muted("Why confidence:"))
-    for reason in verdict_reasons[: _limit_value(10)]:
-        lines.append(muted(f"- {_redact_in_text(reason)}"))
-
-    # Add concrete context for immediate triage.
-    if summary.gateway_ip:
-        lines.append(muted("Where:"))
-        lines.append(
-            muted(
-                f"- Gateway under observation: {_highlight_public_ips(summary.gateway_ip)}"
-            )
-        )
-    if summary.gateway_mac_candidates:
-        lines.append(muted("What:"))
-        lines.append(muted("- Gateway MAC candidates"))
-        for mac, count in summary.gateway_mac_candidates.most_common(_limit_value(6)):
-            lines.append(muted(f"- {mac}: {int(count)} replies"))
-    if summary.victim_conflicts:
-        lines.append(muted("Who:"))
-        lines.append(muted("- Victim conflict highlights"))
-        for ip_value, mac_counter in sorted(
-            summary.victim_conflicts.items(),
-            key=lambda item: sum(item[1].values()),
-            reverse=True,
-        )[: _limit_value(6)]:
-            claims = ", ".join(
-                f"{mac}({cnt})" for mac, cnt in mac_counter.most_common(4)
-            )
-            lines.append(
-                muted(f"- {_highlight_public_ips(ip_value)} claimed by {claims}")
-            )
-    if summary.anomalies:
-        lines.append(muted("When:"))
-        lines.append(muted("- Top ARP anomalies"))
-        for item in summary.anomalies[: _limit_value(6)]:
-            lines.append(
-                muted(
-                    f"- [{item.severity}] {_redact_in_text(item.title)}: {_redact_in_text(item.description)}"
-                )
-            )
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Deterministic ARP Security Checks"))
-
-    # Render the analyzer's own computed deterministic checks (authoritative,
-    # with per-finding evidence) rather than re-deriving via free-text keyword
-    # matching on threats/anomalies, which both under-covered the categories and
-    # discarded the evidence the ARP analyzer already built.
-    arp_checks = getattr(summary, "deterministic_checks", {}) or {}
-    arp_check_labels = [
-        ("gateway_integrity", "Gateway ARP Integrity"),
-        ("poisoning_pair_pattern", "Poisoning Pair Pattern"),
-        ("unsolicited_reply_abuse", "Unsolicited Reply Abuse"),
-        ("broadcast_unsolicited_reply", "Broadcast Unsolicited Replies"),
-        ("rapid_gateway_mac_flip", "Rapid Gateway MAC Flip"),
-        ("recon_to_poison_progression", "Recon-to-Poison Progression"),
-        ("arp_recon_sweep", "ARP Recon/Sweep Activity"),
-        ("probe_spray", "ARP Probe Spray"),
-        ("arp_storm_flood", "ARP Flood/Storm"),
-        ("duplicate_ip_ownership", "Duplicate IP Ownership"),
-        ("proxy_arp_misuse", "Proxy ARP Misuse"),
-        ("timing_automation_signal", "Timing/Automation Signal"),
-        ("likely_benign_failover", "Likely Benign Failover"),
-    ]
-    cleared_arp: list[str] = []
-    fired_arp = False
-    for key, label_text in arp_check_labels:
-        evidence = [
-            str(v) for v in list(arp_checks.get(key, []) or []) if str(v).strip()
-        ]
-        if evidence:
-            fired_arp = True
-            lines.append(label(label_text))
-            lines.append(
-                warn(
-                    f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
-                )
-            )
-            for item in evidence[: _limit_value(6)]:
-                lines.append(muted(f"- {_redact_in_text(item)}"))
-        else:
-            cleared_arp.append(label_text)
-    # Collapse the cleared checks into one line.
-    if not fired_arp:
-        lines.append(ok("No ARP attack checks crossed threshold in this capture."))
-    elif cleared_arp:
-        lines.append(muted(f"Cleared (no evidence): {', '.join(cleared_arp)}"))
-
-    if getattr(summary, "gateway_mac_candidates", None):
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Gateway Mapping Integrity"))
-        rows = [["Gateway IP", "Observed MAC", "Replies"]]
-        gateway_ip = getattr(summary, "gateway_ip", "-") or "-"
-        for mac, count in summary.gateway_mac_candidates.most_common(limit):
-            rows.append([gateway_ip, mac, str(count)])
-        lines.append(_format_table(rows))
-
-    if getattr(summary, "victim_conflicts", None):
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Victim-Centric Conflict View"))
-        rows = [["Victim IP", "Claiming MACs", "Conflict Count"]]
-        for victim_ip, mac_counter in sorted(
-            summary.victim_conflicts.items(),
-            key=lambda item: sum(item[1].values()),
-            reverse=True,
-        )[:limit]:
-            mac_text = ", ".join(
-                f"{mac}({count})"
-                for mac, count in mac_counter.most_common(_limit_value(3))
-            )
-            rows.append([victim_ip, mac_text or "-", str(sum(mac_counter.values()))])
-        lines.append(_format_table(rows))
-
-    if getattr(summary, "timeline", None):
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Attack Chain Timeline"))
-        rows = [["Timestamp", "Event", "Source", "Destination"]]
-        for item in summary.timeline[:limit]:
-            rows.append(
-                [
-                    format_ts(item.ts),
-                    _truncate_text(_redact_in_text(item.detail), 88),
-                    item.src,
-                    item.dst,
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    if getattr(summary, "proxy_arp_candidates", None):
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Proxy ARP Candidates"))
-        rows = [["MAC", "Dst Targets", "Claimed IPs"]]
-        for item in summary.proxy_arp_candidates[:limit]:
-            rows.append(
-                [
-                    str(item.get("mac", "-")),
-                    str(item.get("dst_targets", "-")),
-                    str(item.get("claimed_ips", "-")),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    if getattr(summary, "reply_latency_summary", None):
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Reply Timing"))
-        lines.append(
-            _format_kv(
-                "Median Reply Latency",
-                f"{float(summary.reply_latency_summary.get('median_s', 0.0)) * 1000.0:.2f} ms",
-            )
-        )
-        lines.append(
-            _format_kv(
-                "p95 Reply Latency",
-                f"{float(summary.reply_latency_summary.get('p95_s', 0.0)) * 1000.0:.2f} ms",
-            )
-        )
-        lines.append(
-            _format_kv(
-                "Samples",
-                str(int(float(summary.reply_latency_summary.get("samples", 0.0)))),
-            )
-        )
-
-    if getattr(summary, "pps_by_source", None):
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("ARP Rate Baseline"))
-        rows = [["Source", "Requests", "Packets/sec"]]
-        for src, count in summary.client_details.most_common(limit):
-            pps = float(summary.pps_by_source.get(src, 0.0))
-            rows.append([src, str(count), f"{pps:.2f}"])
-        lines.append(_format_table(rows))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("ARP Conversations"))
-    if not summary.conversations:
-        lines.append(muted("No ARP conversations identified."))
-    else:
-        rows = [
-            [
-                "Src IP",
-                "Dst IP",
-                "Src MAC",
-                "Dst MAC",
-                "Opcode",
-                "Packets",
-                "First",
-                "Last",
-            ]
-        ]
-        for item in summary.conversations[:limit]:
-            rows.append(
-                [
-                    item.src_ip,
-                    item.dst_ip,
-                    item.src_mac,
-                    item.dst_mac,
-                    item.opcode,
-                    str(item.packets),
-                    format_ts(item.first_seen),
-                    format_ts(item.last_seen),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Source/Destination IP Statistics"))
-    if summary.src_ips:
-        rows = [["Source IP", "Packets"]]
-        for ip, count in summary.src_ips.most_common(limit):
-            rows.append([ip, str(count)])
-        lines.append(_format_table(rows))
-    if summary.dst_ips:
-        rows = [["Destination IP", "Packets"]]
-        for ip, count in summary.dst_ips.most_common(limit):
-            rows.append([ip, str(count)])
-        lines.append(_format_table(rows))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("ARP Server/Service Details"))
-    if not summary.server_details:
-        lines.append(muted("No ARP server behavior identified."))
-    else:
-        rows = [["Responder IP", "Replies"]]
-        for ip, count in summary.server_details.most_common(limit):
-            rows.append([ip, str(count)])
-        lines.append(_format_table(rows))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("ARP Client Details"))
-    if not summary.client_details:
-        lines.append(muted("No ARP client behavior identified."))
-    else:
-        rows = [["Requester IP", "Requests"]]
-        for ip, count in summary.client_details.most_common(limit):
-            rows.append([ip, str(count)])
-        lines.append(_format_table(rows))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Observed Plaintext"))
-    if not summary.plaintext_observed:
-        lines.append(muted("No plaintext content observed in ARP-adjacent payloads."))
-    else:
-        rows = [["String", "Count"]]
-        for value, count in summary.plaintext_observed.most_common(limit):
-            rows.append([_truncate_text(value, 96), str(count)])
-        lines.append(_format_table(rows))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Client/Server Versions"))
-    if not summary.client_versions and not summary.server_versions:
-        lines.append(
-            muted(
-                "No explicit ARP stack versions available; using hw/proto tuple fingerprints."
-            )
-        )
-    else:
-        if summary.client_versions:
-            lines.append(_counter_table(summary.client_versions, "Client Fingerprint", limit=limit))
-        if summary.server_versions:
-            lines.append(_counter_table(summary.server_versions, "Server Fingerprint", limit=limit))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("ARP Response Code Summary"))
-    if not summary.response_codes:
-        lines.append(muted("No ARP response codes/opcodes recorded."))
-    else:
-        lines.append(_counter_table(summary.response_codes, "Response Type", limit=limit))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("ARP Requests Summary"))
-    if not summary.request_summary:
-        lines.append(muted("No ARP request categories recorded."))
-    else:
-        lines.append(_counter_table(summary.request_summary, "Request Type", limit=limit))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Files Discovered"))
-    if not summary.files_discovered:
-        lines.append(muted("No file indicators discovered."))
-    else:
-        for name in summary.files_discovered[:limit]:
-            lines.append(f"  - {name}")
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Observed Session Statistics"))
-    if not summary.sessions:
-        lines.append(muted("No ARP request/reply session pairs identified."))
-    else:
-        rows = [["Client", "Server", "Requests", "Replies", "First", "Last"]]
-        for sess in summary.sessions[:limit]:
-            rows.append(
-                [
-                    sess.client_ip,
-                    sess.server_ip,
-                    str(sess.requests),
-                    str(sess.replies),
-                    format_ts(sess.first_seen),
-                    format_ts(sess.last_seen),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Threats / Attacks / Anomalies"))
-    if not summary.threats and not summary.anomalies:
-        lines.append(ok("No high-confidence ARP threats detected."))
-    else:
-        if summary.threats:
-            lines.append(_counter_table(summary.threats, "Threat", limit=limit))
-        for item in summary.anomalies[:limit]:
-            sev = danger if item.severity in {"HIGH", "CRITICAL"} else warn
-            lines.append(sev(f"[{item.severity}] {item.title}: {item.description}"))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Artifacts"))
-    if not summary.artifacts:
-        lines.append(muted("No ARP artifacts recorded."))
-    else:
-        rows = [["Kind", "Detail", "Src", "Dst", "TS"]]
-        for item in summary.artifacts[:limit]:
-            rows.append(
-                [
-                    item.kind,
-                    _truncate_text(item.detail, 72),
-                    item.src,
-                    item.dst,
-                    format_ts(item.ts),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    if verbose and summary.opcode_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Opcode Frequency"))
-        lines.append(_counter_table(summary.opcode_counts, "Opcode", limit=limit))
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    if st.analysis_sections():
+        legacy: list[str] = []
+        _render_deterministic_checks(legacy, summary, "Deterministic ARP Security Checks", [
+            ("gateway_integrity", "Gateway ARP Integrity"), ("poisoning_pair_pattern", "Poisoning Pair Pattern"),
+            ("unsolicited_reply_abuse", "Unsolicited Reply Abuse"), ("broadcast_unsolicited_reply", "Broadcast Unsolicited Replies"),
+            ("rapid_gateway_mac_flip", "Rapid Gateway MAC Flip"), ("recon_to_poison_progression", "Recon-to-Poison Progression"),
+            ("arp_recon_sweep", "ARP Recon/Sweep Activity"), ("probe_spray", "ARP Probe Spray"),
+            ("arp_storm_flood", "ARP Flood/Storm"), ("duplicate_ip_ownership", "Duplicate IP Ownership"),
+            ("proxy_arp_misuse", "Proxy ARP Misuse"), ("timing_automation_signal", "Timing/Automation Signal"),
+            ("likely_benign_failover", "Likely Benign Failover"),
+        ])
+        rep.section("Deterministic checks", legacy[2:])
+    return rep.render()

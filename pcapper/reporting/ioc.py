@@ -1,76 +1,40 @@
-"""Rendered output for ioc analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for IOC matching: traffic that matched a supplied
+indicator list (IPs, domains, hashes), with the indicators' context."""
 
 from __future__ import annotations
-from ..coloring import (
-    danger,
-    header,
-    muted,
-    warn,
-)
-from ..ioc import IocSummary
 
-from ._common import (
-    SUBSECTION_BAR,
-    _finalize_output,
-    _format_counter,
-    _format_kv,
-    _limit_value,
-    _truncate_text,
-)
+from ..ioc import IocSummary
+from . import _style as st
+from ._kv import counter_line, findings_for
 
 
 def render_ioc_summary(summary: IocSummary) -> str:
-    lines = [header("IOC ANALYSIS")]
-
-    # The match detections (severity-tagged IP/domain/hash hits) are the whole
-    # point of this analyzer — render them with an Analyst Verdict instead of
-    # dropping them and showing only raw hit counters.
-    detections = list(getattr(summary, "detections", []) or [])
-    if detections:
-        sev_rank = {"critical": 3, "high": 2, "warning": 1, "medium": 1, "info": 0}
-        worst = max(sev_rank.get(str(d.get("severity", "info")).lower(), 0) for d in detections)
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Analyst Verdict"))
-        if worst >= 3:
-            lines.append(danger("CRITICAL - known-malicious indicator (hash) observed in capture."))
-        elif worst >= 2:
-            lines.append(danger("HIGH - traffic matched a known-bad IP/domain/hash IOC."))
-        else:
-            lines.append(warn("Indicator matches present — review below."))
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("IOC Matches"))
-        for det in sorted(
-            detections,
-            key=lambda d: sev_rank.get(str(d.get("severity", "info")).lower(), 0),
-            reverse=True,
-        )[: _limit_value(15)]:
-            sev = str(det.get("severity", "info")).upper()
-            marker = danger(f"[{sev}]") if worst >= 2 else warn(f"[{sev}]")
-            lines.append(f"{marker} {det.get('summary', '-')}")
-            details = str(det.get("details", "") or "")
-            if details:
-                lines.append(muted(f"  {_truncate_text(details, 220)}"))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Indicator Hit Counts"))
-    lines.append(_format_kv("IP Hits", _format_counter(summary.ip_hits, 6)))
-    lines.append(_format_kv("Domain Hits", _format_counter(summary.domain_hits, 6)))
-    lines.append(_format_kv("Hash Hits", _format_counter(summary.hash_hits, 6)))
-    if getattr(summary, "source_counts", None):
-        if summary.source_counts:
-            lines.append(
-                _format_kv("Sources", _format_counter(summary.source_counts, 6))
-            )
-    if getattr(summary, "tag_counts", None):
-        if summary.tag_counts:
-            lines.append(_format_kv("Tags", _format_counter(summary.tag_counts, 6)))
-    if getattr(summary, "mitre_counts", None):
-        if summary.mitre_counts:
-            lines.append(_format_kv("MITRE", _format_counter(summary.mitre_counts, 6)))
-    if getattr(summary, "avg_confidence", None) is not None:
-        lines.append(_format_kv("Avg Confidence", f"{summary.avg_confidence:.1f}"))
-    return _finalize_output(lines)
+    rep = st.Report("IOC matches", summary.path)
+    findings = findings_for(summary, ot=False)
+    hits = len(summary.ip_hits or {}) + len(summary.domain_hits or {}) + len(summary.hash_hits or {})
+    severity, text = st.verdict(
+        findings,
+        high=("known-malicious file hash in the capture" if st.worst(findings) >= 4 else
+              "traffic matched known-bad indicators: scope the hosts involved"),
+        medium="indicator matches to review",
+        clean="no indicator matched",
+    )
+    rep.headline(severity, text, st.join([
+        f"{st.plural(len(summary.ip_hits or {}), 'IP')}, {st.plural(len(summary.domain_hits or {}), 'domain')}, "
+        f"{st.plural(len(summary.hash_hits or {}), 'hash', 'hashes')} matched" if hits else "",
+        f"{st.count(summary.total_packets)} packets checked",
+    ]))
+    if summary.errors:
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Matches", st.findings_block(findings, max_groups=15))
+    rep.section("Indicators", st.kv([
+        counter_line("IP hits", summary.ip_hits, 6), counter_line("Domain hits", summary.domain_hits, 6),
+        counter_line("Hash hits", summary.hash_hits, 6), counter_line("Sources", summary.source_counts, 6),
+        counter_line("Tags", summary.tag_counts, 6), counter_line("MITRE", summary.mitre_counts, 6),
+        ("Avg confidence", f"{summary.avg_confidence:.1f}" if getattr(summary, "avg_confidence", None) is not None else ""),
+    ]))
+    meta = getattr(summary, "indicator_meta", None) or {}
+    rep.section("Indicator context", st.table(
+        ["Indicator", "Context"], [[k, str(v)] for k, v in (meta.items() if isinstance(meta, dict) else [])], max_rows=None,
+    ), detail=True)
+    return rep.render()

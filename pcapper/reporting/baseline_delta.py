@@ -1,92 +1,86 @@
-"""Rendered output for baseline_delta analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for --baseline-compare: what changed against a saved
+baseline -- new or missing hosts, services, OT commands and control
+targets, and changed services. Additions lead (a new host, service or
+control target is the rogue-device / new-access cue); full per-host
+change detail is -v."""
 
 from __future__ import annotations
-from ..coloring import (
-    header,
-    muted,
-)
 
-from ._common import (
-    _finalize_output,
-    _format_kv,
-    _format_table,
-    _limit_value,
-)
+from . import _style as st
+
+
+def _service(item: dict) -> str:
+    return f"{item.get('ip', '-')}:{item.get('port', '-')}/{item.get('protocol', '-')}"
+
+
+def _value(value: object) -> str:
+    """A baseline port key (port, protocol, service, software) as 139/tcp NetBIOS."""
+    if isinstance(value, (list, tuple)) and len(value) >= 2 and str(value[0]).isdigit():
+        return st.join([f"{value[0]}/{str(value[1]).lower()}", *(str(v) for v in value[2:] if v and v != "-")], " ")
+    return str(value)
+
+
+def _host_change(item: dict) -> str:
+    parts = []
+    for key, label in (("new_hostnames", "+name"), ("missing_hostnames", "-name"), ("new_macs", "+MAC"), ("missing_macs", "-MAC"),
+                       ("new_ports", "+port"), ("missing_ports", "-port")):
+        values = [_value(v) for v in (item.get(key) or [])]
+        if values:
+            parts.append(f"{label} {st.listing(values, 4)}" if st.verbose() or len(values) <= 4 else f"{label} {len(values)}")
+    for change in item.get("port_changes") or []:
+        if isinstance(change, dict):
+            label = st.join([str(v) for v in change.get("from") or [] if v and v != "-"], " ") or "-"
+            now = st.join([str(v) for v in change.get("to") or [] if v and v != "-"], " ") or "-"
+            parts.append(f"{change.get('port', '?')}/{str(change.get('protocol', '?')).lower()} {label} -> {now}")
+    os_change = item.get("os_change")
+    if isinstance(os_change, dict):
+        parts.append(f"OS {os_change.get('from', '?')} -> {os_change.get('to', '?')}")
+    return "; ".join(parts) or "-"
 
 
 def render_baseline_delta(delta) -> str:
     if not delta:
         return ""
-    lines = [header("BASELINE DRIFT")]
-    lines.append(_format_kv("Baseline Version", delta.baseline_version or "-"))
-    lines.append(_format_kv("Current Version", delta.current_version or "-"))
-    if delta.notes:
-        lines.append(_format_kv("Notes", "; ".join(delta.notes)))
-    lines.append(_format_kv("New Hosts", str(len(delta.new_hosts))))
-    lines.append(_format_kv("Missing Hosts", str(len(delta.missing_hosts))))
-    lines.append(_format_kv("Host Changes", str(len(delta.host_changes))))
-    lines.append(_format_kv("New Services", str(len(delta.new_services))))
-    lines.append(_format_kv("Missing Services", str(len(delta.missing_services))))
-    lines.append(_format_kv("Service Changes", str(len(delta.service_changes))))
-    lines.append(_format_kv("New OT Commands", str(len(delta.new_ot_commands))))
-    lines.append(_format_kv("Missing OT Commands", str(len(delta.missing_ot_commands))))
-    lines.append(_format_kv("OT Command Changes", str(len(delta.ot_command_changes))))
-    lines.append(_format_kv("New Control Targets", str(len(delta.new_control_targets))))
-    lines.append(
-        _format_kv("Missing Control Targets", str(len(delta.missing_control_targets)))
-    )
-
-    if delta.new_hosts:
-        lines.append(header("New Hosts"))
-        lines.append(muted(", ".join(delta.new_hosts[: _limit_value(10)])))
-    if delta.missing_hosts:
-        lines.append(header("Missing Hosts"))
-        lines.append(muted(", ".join(delta.missing_hosts[: _limit_value(10)])))
-    if delta.host_changes:
-        lines.append(header("Host Changes"))
-        rows = [["Host", "Change"]]
-        for item in delta.host_changes[: _limit_value(8)]:
-            ip = item.get("ip", "")
-            changes = []
-            if item.get("new_hostnames"):
-                changes.append(f"new_hostnames={len(item.get('new_hostnames'))}")
-            if item.get("missing_hostnames"):
-                changes.append(
-                    f"missing_hostnames={len(item.get('missing_hostnames'))}"
-                )
-            if item.get("new_ports"):
-                changes.append(f"new_ports={len(item.get('new_ports'))}")
-            if item.get("missing_ports"):
-                changes.append(f"missing_ports={len(item.get('missing_ports'))}")
-            if item.get("os_change"):
-                changes.append("os_change")
-            rows.append([str(ip), ", ".join(changes)])
-        lines.append(_format_table(rows))
-    if delta.service_changes:
-        lines.append(header("Service Changes"))
-        rows = [["Service", "Change"]]
-        for item in delta.service_changes[: _limit_value(8)]:
-            label = f"{item.get('ip')}:{item.get('port')}/{item.get('protocol')}"
-            change = f"{item.get('from_service')} -> {item.get('to_service')}"
-            if item.get("from_software") or item.get("to_software"):
-                change = f"{change} ({item.get('from_software')} -> {item.get('to_software')})"
-            rows.append([label, change])
-        lines.append(_format_table(rows))
-    if delta.ot_command_changes:
-        lines.append(header("OT Command Drift"))
-        rows = [["Command", "Baseline", "Current", "Delta"]]
-        for item in delta.ot_command_changes[: _limit_value(8)]:
-            rows.append(
-                [
-                    str(item.get("command", "")),
-                    str(item.get("baseline", "")),
-                    str(item.get("current", "")),
-                    str(item.get("delta", "")),
-                ]
-            )
-        lines.append(_format_table(rows))
-    return _finalize_output(lines)
+    rep = st.Report("Baseline drift", "baseline vs current")
+    added = len(delta.new_hosts) + len(delta.new_services) + len(delta.new_ot_commands) + len(delta.new_control_targets)
+    removed = len(delta.missing_hosts) + len(delta.missing_services) + len(delta.missing_ot_commands) + len(delta.missing_control_targets)
+    changed = len(delta.host_changes) + len(delta.service_changes) + len(delta.ot_command_changes)
+    if added:
+        severity, text = "medium", "new hosts, services or OT activity since the baseline: review"
+    elif removed or changed:
+        severity, text = "low", "drift from the baseline"
+    else:
+        severity, text = None, "matches the baseline"
+    rep.headline(severity, text, st.join([f"{added} added", f"{removed} missing", f"{changed} changed"]) if added + removed + changed else "")
+    rep.scope(f"baseline {delta.baseline_version or '-'} · current {delta.current_version or '-'}")
+    for note in delta.notes or []:
+        rep.scope(str(note))
+    rep.section("Hosts", st.kv([("New", st.bad(st.listing(delta.new_hosts)) if delta.new_hosts else ""),
+                                ("Missing", st.listing(delta.missing_hosts))])
+                + st.table(["Host", "Change"], [[i.get("ip", "-"), _host_change(i)] for i in delta.host_changes],
+                           widths=(None, 100), max_rows=10, noun="host"))
+    rep.section("New services", st.table(
+        ["Service", "Name", "Software"],
+        [[st.bad(_service(i)), i.get("service") or "-", i.get("software") or "-"] for i in delta.new_services],
+        max_rows=10, noun="service",
+    ))
+    rep.section("Missing services", st.table(
+        ["Service", "Name", "Software"], [[_service(i), i.get("service") or "-", i.get("software") or "-"] for i in delta.missing_services],
+        max_rows=10, noun="service",
+    ))
+    rep.section("Changed services", st.table(
+        ["Service", "Was", "Now"],
+        [[_service(i), st.join([i.get("from_service"), i.get("from_software")], " ") or "-",
+          st.join([i.get("to_service"), i.get("to_software")], " ") or "-"] for i in delta.service_changes],
+        max_rows=10, noun="service",
+    ))
+    rep.section("OT commands", st.kv([("New", st.bad(st.listing(delta.new_ot_commands)) if delta.new_ot_commands else ""),
+                                      ("Missing", st.listing(delta.missing_ot_commands))])
+                + st.table(["Command", "Baseline", "Current", "Delta"],
+                           [[i.get("command", "-"), st.count(i.get("baseline", 0)), st.count(i.get("current", 0)), f"{int(i.get('delta', 0)):+d}"]
+                            for i in delta.ot_command_changes], align="lrrr", max_rows=10, noun="command"))
+    rep.section("Control targets", st.table(
+        ["", "Target"], [[st.bad("new"), t] for t in delta.new_control_targets] + [["missing", t] for t in delta.missing_control_targets],
+        max_rows=10, noun="target",
+    ))
+    return rep.render()

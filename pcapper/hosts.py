@@ -1,8 +1,5 @@
 from __future__ import annotations
 
-from .utils import is_valid_ip as _valid_ip
-from .utils import is_private_ip as _is_private_ip
-from .utils import is_public_ip as _is_public_ip
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -22,7 +19,10 @@ from .pcap_cache import PcapMeta, iter_packets
 from .progress import run_with_busy_status
 from .services import ServiceAsset, analyze_services
 from .smb import analyze_smb
-from .utils import env_int, extract_packet_endpoints, memoize_analysis, tcp_flags_int
+from .utils import env_int, extract_packet_endpoints, gateway_macs, memoize_analysis, tcp_flags_int
+from .utils import is_private_ip as _is_private_ip
+from .utils import is_public_ip as _is_public_ip
+from .utils import is_valid_ip as _valid_ip
 
 try:  # pragma: no cover - guarded for environments without scapy
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -165,9 +165,16 @@ def _build_hosts_enrichment(hosts: list[HostRecord]) -> dict[str, object]:
     }
 
 def _normalize_mac(value: str) -> str | None:
+    """A host's own MAC, or None: a group address (the broadcast an ARP
+    request is sent to, multicast) is never one host's address."""
     mac = value.strip().lower()
     if not mac or mac == "00:00:00:00:00:00":
         return None
+    try:
+        if int(mac.split(":")[0], 16) & 0x01:
+            return None
+    except ValueError:
+        pass
     return mac
 
 
@@ -510,35 +517,46 @@ def _build_services(services_summary) -> dict[str, list[ServiceAsset]]:
 def _build_macs(ips_summary, arp_summary, dhcp_summary) -> dict[str, Counter[str]]:
     macs_by_ip: dict[str, Counter[str]] = defaultdict(Counter)
 
-    for ip_value, counter in getattr(ips_summary, "ip_mac_counts", {}).items():
+    arp_pairs: list[tuple[str, str]] = []
+    for convo in getattr(arp_summary, "conversations", []) or []:
+        for ip_name, mac_name in (("src_ip", "src_mac"), ("dst_ip", "dst_mac")):
+            ip_value = str(getattr(convo, ip_name, "") or "")
+            mac_norm = _normalize_mac(str(getattr(convo, mac_name, "") or ""))
+            if ip_value and _valid_ip(ip_value) and mac_norm:
+                arp_pairs.append((ip_value, mac_norm))
+    dhcp_pairs: list[tuple[str, str]] = []
+    for session in getattr(dhcp_summary, "sessions", []) or []:
+        client_ip = str(getattr(session, "client_ip", "") or "")
+        client_mac = _normalize_mac(str(getattr(session, "client_mac", "") or ""))
+        if client_ip and _valid_ip(client_ip) and client_mac:
+            dhcp_pairs.append((client_ip, client_mac))
+    bound: dict[str, set[str]] = defaultdict(set)  # ARP / DHCP: the address owner's own MAC
+    for ip_value, mac_norm in arp_pairs + dhcp_pairs:
+        bound[ip_value].add(mac_norm)
+
+    # Frame addresses: the MAC on a frame to or from an off-link address is
+    # the gateway's, so a gateway MAC is not that address's unless ARP or
+    # DHCP binds them. Private addresses keep it (the router's own LAN
+    # address is usually one of them).
+    ip_mac_counts = getattr(ips_summary, "ip_mac_counts", {}) or {}
+    gateways = gateway_macs(ip_mac_counts)
+    for ip_value, counter in ip_mac_counts.items():
         if not _valid_ip(ip_value):
             continue
+        off_link = _is_public_ip(str(ip_value))
         for mac, count in counter.items():
             mac_norm = _normalize_mac(str(mac))
             if not mac_norm:
+                continue
+            if off_link and mac_norm in gateways and mac_norm not in bound.get(ip_value, ()):
                 continue
             try:
                 macs_by_ip[ip_value][mac_norm] += int(count)
             except Exception:
                 macs_by_ip[ip_value][mac_norm] += 1
 
-    for convo in getattr(arp_summary, "conversations", []) or []:
-        src_ip = str(getattr(convo, "src_ip", "") or "")
-        dst_ip = str(getattr(convo, "dst_ip", "") or "")
-        if src_ip and _valid_ip(src_ip):
-            src_mac = _normalize_mac(str(getattr(convo, "src_mac", "") or ""))
-            if src_mac:
-                macs_by_ip[src_ip][src_mac] += 1
-        if dst_ip and _valid_ip(dst_ip):
-            dst_mac = _normalize_mac(str(getattr(convo, "dst_mac", "") or ""))
-            if dst_mac:
-                macs_by_ip[dst_ip][dst_mac] += 1
-
-    for session in getattr(dhcp_summary, "sessions", []) or []:
-        client_ip = str(getattr(session, "client_ip", "") or "")
-        client_mac = _normalize_mac(str(getattr(session, "client_mac", "") or ""))
-        if client_ip and _valid_ip(client_ip) and client_mac:
-            macs_by_ip[client_ip][client_mac] += 1
+    for ip_value, mac_norm in arp_pairs + dhcp_pairs:
+        macs_by_ip[ip_value][mac_norm] += 1
 
     return macs_by_ip
 
@@ -720,13 +738,19 @@ def analyze_hosts(
     # Analyzers that accept the shared packet view get it; the others serve
     # from the forced view registered by the CLI.
     view = {"packets": packets, "meta": meta}
-    ips_summary = analyze_ips(path, show_status=show_status, **view)
 
     def _busy(desc: str, func, *args, **kwargs):
         return run_with_busy_status(
             path, show_status, f"Hosts: {desc}", func, *args, **kwargs
         )
 
+    # This analysis's own pass over the capture comes first: inside a shared
+    # pass it then reads in the round that computes the analyses below
+    # instead of a round of its own after them. It needs none of their results.
+    fp_hints, fp_evidence = _busy(
+        "TCP fingerprints", _collect_os_fingerprints, path, show_status=False, **view
+    )
+    ips_summary = analyze_ips(path, show_status=show_status, **view)
     hostname_summary = _busy(
         "Hostnames", analyze_hostname, path, None, show_status=False
     )
@@ -737,9 +761,6 @@ def analyze_hosts(
     ldap_summary = _busy("LDAP", analyze_ldap, path, show_status=False, **view)
     netbios_summary = _busy("NetBIOS", analyze_netbios, path, show_status=False)
     smb_summary = _busy("SMB", analyze_smb, path, show_status=False, **view)
-    fp_hints, fp_evidence = _busy(
-        "TCP fingerprints", _collect_os_fingerprints, path, show_status=False, **view
-    )
 
     errors.extend(getattr(ips_summary, "errors", []) or [])
     errors.extend(getattr(hostname_summary, "errors", []) or [])

@@ -114,7 +114,7 @@ class TestCliTargets:
         shutil.copy(pcap("modbus.pcap"), target)
         assert _run_cli(monkeypatch, str(target), "--modbus") == 0
         out = capfd.readouterr().out
-        assert "MODBUS ANALYSIS" in out
+        assert "MODBUS · cap_00001_20210318035345" in out
 
     def test_misnamed_target_is_refused_with_reason(
         self, tmp_path: Path, monkeypatch, capfd
@@ -133,7 +133,7 @@ class TestCliTargets:
         errors: list[str] = []
         assert _run_cli(monkeypatch, str(tmp_path), "--modbus", errors=errors) == 0
         assert any("Skipped 1 file(s)" in e for e in errors)
-        assert "MODBUS ANALYSIS" in capfd.readouterr().out
+        assert "MODBUS · cap_00001" in capfd.readouterr().out
 
 
 class TestModifiedPcap:

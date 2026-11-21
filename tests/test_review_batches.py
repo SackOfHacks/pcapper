@@ -446,6 +446,36 @@ class TestHostnameSsdp:
         assert not [f for f in summary.findings if f.hostname == "192.168.10.20"]
 
 
+
+class TestHostnameDnsRecords:
+    def test_every_record_of_a_response_is_read(self, tmp_path) -> None:
+        """scapy >= 2.6 keeps a DNS section's records in a list. Walked as the
+        old payload chain, only the first record of each section was seen: the
+        A record behind a CNAME never mapped its name to the address (and
+        every DNS packet raised a DeprecationWarning)."""
+        import warnings
+
+        from scapy.layers.dns import DNS, DNSQR, DNSRR  # type: ignore
+        from scapy.layers.inet import IP, UDP  # type: ignore
+        from scapy.layers.l2 import Ether  # type: ignore
+
+        from pcapper.hostname import analyze_hostname
+
+        response = (
+            Ether() / IP(src="192.168.10.10", dst="192.168.10.50") / UDP(sport=53, dport=53000)
+            / DNS(id=7, qr=1, qd=DNSQR(qname="www.example.com"), an=[
+                DNSRR(rrname="www.example.com", type="CNAME", rdata="edge.example.net"),
+                DNSRR(rrname="edge.example.net", type="A", rdata="93.184.216.34"),
+            ])
+        )
+        pcap = _write(tmp_path, "cname.pcap", [response])
+        with warnings.catch_warnings():
+            warnings.simplefilter("error", DeprecationWarning)
+            summary = analyze_hostname(pcap, None, show_status=False)
+        mapped = {(f.hostname, f.mapped_ip) for f in summary.findings}
+        assert ("edge.example.net", "93.184.216.34") in mapped
+
+
 # --- health -----------------------------------------------------------------------------
 
 

@@ -35,9 +35,12 @@ def compute_ot_risk_posture(
     if high_sev_ot:
         score += OT_RISK_THRESHOLDS["ot_high_weight"]
         findings.append(f"High-severity OT detections ({high_sev_ot}).")
-    if high_sev_general:
+    # IT detections raise OT risk only where there is OT to put at risk: on
+    # an IT-only capture they used to yield "OT risk 5/100: High-severity IT
+    # detections" with no OT traffic at all.
+    if high_sev_general and score:
         score += OT_RISK_THRESHOLDS["general_high_weight"]
-        findings.append(f"High-severity IT detections ({high_sev_general}).")
+        findings.append(f"High-severity IT detections alongside the OT activity ({high_sev_general}).")
 
     score = min(OT_RISK_THRESHOLDS["max_score"], score)
     return score, findings

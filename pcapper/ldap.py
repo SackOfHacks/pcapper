@@ -1,13 +1,15 @@
 from __future__ import annotations
 
 from .utils import is_public_ip as _is_public_ip, extract_ascii_strings as _extract_ascii_strings
+from .utils import extract_utf16le_strings
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from .dns import analyze_dns
+from .ldap_ber import iter_ldap_messages
 from .files import analyze_files
 from .pcap_cache import PcapMeta, iter_packets
 from .progress import run_with_busy_status
@@ -106,31 +108,6 @@ def _ldap_result_codes_from_payload(payload: bytes) -> list[int]:
     """Decode LDAP response result codes from raw BER bytes."""
     return [m.group(1)[0] for m in _LDAP_RESP_RE.finditer(payload)]
 
-DN_TOKEN_RE = re.compile(
-    r"(?i)\b(?:cn|ou|dc|uid|sn|givenname|displayname|o|c|l|st|samaccountname|userprincipalname|mail|member|memberof|dnshostname|serviceprincipalname)\s*=\s*[^,;]+"
-)
-FILTER_HINTS = (
-    "(objectclass=",
-    "(objectcategory=",
-    "(samaccountname=",
-    "(userprincipalname=",
-    "(member=",
-    "(memberof=",
-    "givenname",
-    "sn=",
-    "mail=",
-)
-
-LDAP_USER_ATTRS = {
-    "cn",
-    "uid",
-    "samaccountname",
-    "userprincipalname",
-    "givenname",
-    "sn",
-    "mail",
-    "displayname",
-}
 
 SECRET_PATTERNS = [
     re.compile(
@@ -139,6 +116,27 @@ SECRET_PATTERNS = [
     re.compile(r"(?i)\b(token|api[_-]?key|secret)\b\s*[:=]\s*([^\s'\";]{6,})"),
 ]
 
+
+# Decoded request operations, under the names the checks below count.
+REQUEST_KEYS = {
+    "BindRequest": "Bind", "SearchRequest": "Search", "ModifyRequest": "Modify", "AddRequest": "Add",
+    "DelRequest": "Delete", "CompareRequest": "Compare", "ExtendedRequest": "Extended",
+    "UnbindRequest": "Unbind", "ModifyDNRequest": "ModifyDN", "AbandonRequest": "Abandon",
+}
+# Attributes whose request (or use in a filter) is credential access or the
+# recon that precedes it.
+SENSITIVE_ATTRS = {
+    "unicodepwd": "unicodePwd", "userpassword": "userPassword", "ms-mcs-admpwd": "ms-Mcs-AdmPwd",
+    "mslaps-password": "msLAPS-Password", "mslaps-encryptedpassword": "msLAPS-EncryptedPassword",
+    "msds-managedpassword": "msDS-ManagedPassword", "supplementalcredentials": "supplementalCredentials",
+    "msds-keycredentiallink": "msDS-KeyCredentialLink", "serviceprincipalname": "servicePrincipalName",
+    "msds-allowedtodelegateto": "msDS-AllowedToDelegateTo",
+    "msds-allowedtoactonbehalfofotheridentity": "msDS-AllowedToActOnBehalfOfOtherIdentity",
+    "sidhistory": "sIDHistory",
+}
+PASSWORD_ATTRS = {"unicodePwd", "userPassword", "ms-Mcs-AdmPwd", "msLAPS-Password", "msLAPS-EncryptedPassword",
+                  "msDS-ManagedPassword", "supplementalCredentials"}
+MAX_LDAP_RECORDS = 1000  # search requests / writes kept for the report
 
 @dataclass(frozen=True)
 class LdapConversation:
@@ -188,6 +186,13 @@ class LdapAnalysis:
     deterministic_checks: Dict[str, List[str]]
     threat_hypotheses: List[Dict[str, object]]
     benign_context: List[str]
+    # Decoded from the BER messages (cleartext LDAP only).
+    operations: Counter[str] = field(default_factory=Counter)
+    search_requests: List[Dict[str, object]] = field(default_factory=list)
+    writes: List[Dict[str, object]] = field(default_factory=list)
+    entries_returned: int = 0
+    spns: Counter[str] = field(default_factory=Counter)
+    diagnostics: Counter[str] = field(default_factory=Counter)
 
 
 def _parse_http_request(
@@ -228,41 +233,7 @@ def _parse_http_request(
 def _extract_utf16le_strings(
     data: bytes, min_len: int = 4, max_len: int = 200
 ) -> List[str]:
-    results: List[str] = []
-    current = bytearray()
-    i = 0
-    while i + 1 < len(data):
-        ch = data[i]
-        if 32 <= ch <= 126 and data[i + 1] == 0x00:
-            current.append(ch)
-            i += 2
-        else:
-            if len(current) >= min_len:
-                value = decode_payload(current, encoding="latin-1")
-                results.append(value[:max_len])
-            current = bytearray()
-            i += 2
-    if len(current) >= min_len:
-        value = decode_payload(current, encoding="latin-1")
-        results.append(value[:max_len])
-    return results
-
-
-def _extract_ldap_strings(payload: bytes) -> List[str]:
-    try:
-        text = decode_payload(payload, encoding="utf-8")
-    except Exception:
-        return []
-    tokens: List[str] = []
-    for token in text.split("\x00"):
-        if (
-            "=" in token
-            or token.lower().startswith("cn=")
-            or token.lower().startswith("dc=")
-        ):
-            if len(token) > 3:
-                tokens.append(token)
-    return tokens
+    return extract_utf16le_strings(data, min_len, max_len)
 
 
 def _ldap_filter_type(query: str) -> Optional[str]:
@@ -292,21 +263,6 @@ def _ldap_filter_type(query: str) -> Optional[str]:
     return None
 
 
-def _extract_bind_identities(text: str) -> list[str]:
-    identities: list[str] = []
-    for match in DN_TOKEN_RE.findall(text):
-        identities.append(match)
-    if not identities:
-        lower = text.lower()
-        if (
-            lower.startswith("cn=")
-            or lower.startswith("uid=")
-            or lower.startswith("dn=")
-        ):
-            identities.append(text)
-    return identities
-
-
 @memoize_analysis
 def analyze_ldap(
     path: Path,
@@ -323,22 +279,6 @@ def analyze_ldap(
             path, show_status, f"LDAP: {desc}", func, *args, **kwargs
         )
 
-    dns_summary = _busy(
-        "DNS", analyze_dns, path, show_status=False, packets=packets, meta=meta
-    )
-    files_summary = _busy(
-        "Files", analyze_files, path, show_status=False, packets=packets, meta=meta
-    )
-    errors.extend(getattr(dns_summary, "errors", []) or [])
-    errors.extend(getattr(files_summary, "errors", []) or [])
-
-    ldap_domains = Counter()
-    for qname, count in dns_summary.qname_counts.items():
-        qname_lower = qname.lower()
-        if any(token in qname_lower for token in LDAP_DNS_HINTS):
-            ldap_domains[qname_lower] += count
-
-    files = [art.filename for art in files_summary.artifacts]
 
 
     total_packets = 0
@@ -369,6 +309,12 @@ def analyze_ldap(
     user_evidence_seen: set[tuple[str, str, int, str, str, str]] = set()
     cleartext_packets = 0
     ldaps_packets = 0
+    operations: Counter[str] = Counter()
+    search_requests: List[Dict[str, object]] = []
+    writes: List[Dict[str, object]] = []
+    entries_returned = 0
+    spns: Counter[str] = Counter()
+    diagnostics: Counter[str] = Counter()
     convos: Dict[Tuple[str, str, int, str], int] = defaultdict(int)
     artifacts: set[str] = set()
     cleartext_ldap_seen = False
@@ -392,12 +338,10 @@ def analyze_ldap(
         if not src_ip or not dst_ip:
             continue
 
-        proto = None
         if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
             tcp_layer = pkt[TCP]  # type: ignore[index]
             sport = int(getattr(tcp_layer, "sport", 0) or 0)
             dport = int(getattr(tcp_layer, "dport", 0) or 0)
-            proto = "TCP"
             ldap_roles = _ldap_roles(src_ip, dst_ip, sport, dport)
             if ldap_roles is not None:
                 client_ip, server_ip, server_port = ldap_roles
@@ -431,54 +375,94 @@ def analyze_ldap(
                 counter_inc(http_clients, src_ip)
 
             if payload and ldap_roles is not None:
-                for token in _extract_ldap_strings(payload):
-                    if token:
-                        counter_inc(ldap_queries, token)
-                        filter_type = _ldap_filter_type(token)
+                decoded = False
+                for msg in iter_ldap_messages(payload):
+                    decoded = True
+                    counter_inc(operations, f"{msg.op} ({msg.name})" if msg.name else msg.op)
+                    key = REQUEST_KEYS.get(msg.op)
+                    if key:
+                        counter_inc(request_counts, key)
+                    where = {"ts": ts, "client": client_ip, "server": server_ip, "port": server_port}
+                    if msg.op == "BindRequest":
+                        # An empty name is anonymous only for a simple bind; a SASL
+                        # bind (GSS-SPNEGO, Windows' default) carries the account
+                        # inside its token, not in the bind name.
+                        identity = msg.dn or ("(anonymous)" if msg.auth == "simple" else "(in SASL token)")
+                        counter_inc(ldap_binds, f"{identity} [{msg.auth}]" if msg.auth else identity)
+                        bind_key = (client_ip, server_ip, server_port, identity, msg.auth)
+                        if bind_key not in bind_identity_seen:
+                            bind_identity_seen.add(bind_key)
+                            bind_identities.append({
+                                "src_ip": client_ip, "dst_ip": server_ip, "dst_port": server_port,
+                                "protocol": "TCP", "identity": identity, "auth": msg.auth, "ts": ts,
+                            })
+                        if msg.password:
+                            counter_inc(secrets, f"simple bind {identity}: {msg.password}")
+                        if ts is not None:
+                            counter_inc(bind_buckets, (client_ip, int(ts // 60)))
+                    elif msg.op == "SearchRequest":
+                        query = msg.filter or "(objectClass=*)"
+                        counter_inc(ldap_queries, query)
+                        filter_type = _ldap_filter_type(query)
                         if filter_type:
                             counter_inc(ldap_filter_types, filter_type)
-                        lower_token = token.lower()
-                        if "unicodepwd" in lower_token:
-                            counter_inc(suspicious_attributes, "unicodePwd")
-                        if "ms-mcs-admpwd" in lower_token:
-                            counter_inc(suspicious_attributes, "ms-Mcs-AdmPwd")
-                        if "userpassword" in lower_token:
-                            counter_inc(suspicious_attributes, "userPassword")
-                        if token.lower().startswith("cn="):
-                            counter_inc(ldap_users, token)
-                            set_add_cap(artifacts, token)
-                            key = (
-                                src_ip,
-                                dst_ip,
-                                server_port,
-                                proto or "TCP",
-                                "cn",
-                                token,
-                            )
-                            if key not in user_evidence_seen:
-                                user_evidence_seen.add(key)
-                                user_evidence.append(
-                                    {
-                                        "src_ip": src_ip,
-                                        "dst_ip": dst_ip,
-                                        "dst_port": server_port,
-                                        "protocol": proto or "TCP",
-                                        "attr": "cn",
-                                        "value": token.partition("=")[2].strip()
-                                        if "=" in token
-                                        else token,
-                                    }
-                                )
+                        if len(search_requests) < MAX_LDAP_RECORDS:
+                            search_requests.append({**where, "base": msg.dn, "scope": msg.scope,
+                                                    "filter": query, "attributes": list(msg.attributes)})
+                        named = {a.lower() for a in msg.attributes} | {
+                            a for a in SENSITIVE_ATTRS if a in query.lower()}
+                        for attr in sorted(named):
+                            if attr in SENSITIVE_ATTRS:
+                                counter_inc(suspicious_attributes, SENSITIVE_ATTRS[attr])
+                    elif msg.op in ("ModifyRequest", "AddRequest", "DelRequest", "ModifyDNRequest"):
+                        if len(writes) < MAX_LDAP_RECORDS:
+                            writes.append({**where, "op": msg.op, "dn": msg.dn,
+                                           "changes": list(msg.changes or msg.attributes)})
+                        for attr, values in msg.values.items():
+                            if SENSITIVE_ATTRS.get(attr.lower()) in PASSWORD_ATTRS:
+                                for value in values:
+                                    counter_inc(secrets, f"{msg.op} {msg.dn} {attr}: {value}")
+                    elif msg.op == "SearchResultEntry":
+                        entries_returned += 1
+                        lowered = {k.lower(): v for k, v in msg.values.items()}
+                        classes = {c.lower() for c in lowered.get("objectclass", [])}
+                        for value in lowered.get("samaccountname", []):
+                            if "computer" in classes or value.endswith("$"):
+                                counter_inc(ldap_systems, value)
+                            elif "group" not in classes:  # groups carry a sAMAccountName too
+                                counter_inc(ldap_users, value)
+                        for value in lowered.get("dnshostname", []):
+                            counter_inc(ldap_systems, value)
+                        for value in lowered.get("serviceprincipalname", []):
+                            counter_inc(spns, value)
+                        for attr in ("samaccountname", "userprincipalname", "mail"):
+                            for value in lowered.get(attr, []):
+                                ev_key = (client_ip, server_ip, server_port, "TCP", attr, value)
+                                if ev_key not in user_evidence_seen and len(user_evidence) < MAX_LDAP_RECORDS:
+                                    user_evidence_seen.add(ev_key)
+                                    user_evidence.append({"src_ip": server_ip, "dst_ip": client_ip,
+                                                          "dst_port": server_port, "protocol": "TCP",
+                                                          "attr": attr, "value": value})
+                        if msg.dn:
+                            set_add_cap(artifacts, msg.dn)
+                    if msg.result_code is not None:
+                        name = LDAP_RESULT_CODES.get(msg.result_code, str(msg.result_code))
+                        counter_inc(response_codes, f"{msg.result_code} ({name})")
+                        # 0=success, 5/6=compareFalse/True, 14=saslBindInProgress
+                        # are normal results, not errors.
+                        if msg.result_code not in (0, 5, 6, 14):
+                            counter_inc(ldap_error_codes, f"{msg.result_code} ({name})")
+                            if msg.diagnostic:
+                                counter_inc(diagnostics, msg.diagnostic.strip("\x00 ")[:200])
 
-                # Recover result codes from the binary BER (the ASCII
-                # heuristics below never match real LDAP responses).
-                for code in _ldap_result_codes_from_payload(payload):
-                    name = LDAP_RESULT_CODES.get(code, str(code))
-                    counter_inc(response_codes, f"{code} ({name})")
-                    # 0=success, 5/6=compareFalse/True, 14=saslBindInProgress
-                    # are normal results, not errors.
-                    if code not in (0, 5, 6, 14):
-                        counter_inc(ldap_error_codes, f"{code} ({name})")
+                if not decoded:
+                    # SASL-sealed or mid-message segments: only the result-code
+                    # byte scan and the string scans below apply.
+                    for code in _ldap_result_codes_from_payload(payload):
+                        name = LDAP_RESULT_CODES.get(code, str(code))
+                        counter_inc(response_codes, f"{code} ({name})")
+                        if code not in (0, 5, 6, 14):
+                            counter_inc(ldap_error_codes, f"{code} ({name})")
 
                 for value in _extract_ascii_strings(
                     payload
@@ -486,111 +470,10 @@ def analyze_ldap(
                     if not value:
                         continue
                     lower = value.lower()
-
-                    if (
-                        any(hint in lower for hint in FILTER_HINTS)
-                        or "(objectclass" in lower
-                    ):
-                        counter_inc(ldap_queries, value)
-                        set_add_cap(artifacts, value)
-                        filter_type = _ldap_filter_type(value)
-                        if filter_type:
-                            counter_inc(ldap_filter_types, filter_type)
-                        if "unicodepwd" in lower:
-                            counter_inc(suspicious_attributes, "unicodePwd")
-                        if "ms-mcs-admpwd" in lower:
-                            counter_inc(suspicious_attributes, "ms-Mcs-AdmPwd")
-                        if "userpassword" in lower:
-                            counter_inc(suspicious_attributes, "userPassword")
-
-                    for match in DN_TOKEN_RE.findall(value):
-                        counter_inc(ldap_queries, match)
-                        set_add_cap(artifacts, match)
-                        key, _, val = match.partition("=")
-                        key_lower = key.strip().lower()
-                        val = val.strip()
-                        if key_lower in LDAP_USER_ATTRS or key_lower in {
-                            "cn",
-                            "sn",
-                        }:
-                            ev_key = (
-                                src_ip,
-                                dst_ip,
-                                server_port,
-                                proto or "TCP",
-                                key_lower,
-                                val,
-                            )
-                            if ev_key not in user_evidence_seen:
-                                user_evidence_seen.add(ev_key)
-                                user_evidence.append(
-                                    {
-                                        "src_ip": src_ip,
-                                        "dst_ip": dst_ip,
-                                        "dst_port": server_port,
-                                        "protocol": proto or "TCP",
-                                        "attr": key_lower,
-                                        "value": val,
-                                    }
-                                )
-                        if key_lower in LDAP_USER_ATTRS:
-                            counter_inc(ldap_users, val)
-                        elif key_lower == "cn":
-                            if val.endswith("$"):
-                                counter_inc(ldap_systems, val)
-                            else:
-                                counter_inc(ldap_users, val)
-                        if key_lower in {"dnshostname", "serviceprincipalname"}:
-                            counter_inc(ldap_systems, val)
-
-                    if any(
-                        word in lower
-                        for word in (
-                            "bind",
-                            "search",
-                            "modify",
-                            "add",
-                            "delete",
-                            "compare",
-                            "extended",
-                            "unbind",
-                        )
-                    ):
-                        if "bind" in lower:
-                            counter_inc(request_counts, "Bind")
-                            for identity in _extract_bind_identities(value):
-                                if identity:
-                                    counter_inc(ldap_binds, identity)
-                                    key = (client_ip, server_ip, server_port, identity)
-                                    if key not in bind_identity_seen:
-                                        bind_identity_seen.add(key)
-                                        bind_identities.append(
-                                            {
-                                                "src_ip": src_ip,
-                                                "dst_ip": dst_ip,
-                                                "dst_port": server_port,
-                                                "protocol": "TCP",
-                                                "identity": identity,
-                                            }
-                                        )
-                            if ts is not None:
-                                minute_bucket = int(ts // 60)
-                                counter_inc(bind_buckets, (client_ip, minute_bucket))
-                        if "search" in lower:
-                            counter_inc(request_counts, "Search")
-                        if "modify" in lower:
-                            counter_inc(request_counts, "Modify")
-                        if "add" in lower:
-                            counter_inc(request_counts, "Add")
-                        if "delete" in lower:
-                            counter_inc(request_counts, "Delete")
-                        if "compare" in lower:
-                            counter_inc(request_counts, "Compare")
-                        if "extended" in lower:
-                            counter_inc(request_counts, "Extended")
-                        if "unbind" in lower:
-                            counter_inc(request_counts, "Unbind")
-
+                    if not decoded:
+                        for attr, label_name in SENSITIVE_ATTRS.items():
+                            if attr in lower and label_name in PASSWORD_ATTRS:
+                                counter_inc(suspicious_attributes, label_name)
                     for pattern in SECRET_PATTERNS:
                         match = pattern.search(value)
                         if match:
@@ -640,6 +523,25 @@ def analyze_ldap(
                 if _is_public_ip(dst_ip):
                     counter_inc(public_endpoints, dst_ip)
 
+    # DNS and file results are only read after the packet loop: computing
+    # them first made LDAP wait for both before it could read the capture
+    # (one more full read in a shared --threats pass).
+    dns_summary = _busy(
+        "DNS", analyze_dns, path, show_status=False, packets=packets, meta=meta
+    )
+    files_summary = _busy(
+        "Files", analyze_files, path, show_status=False, packets=packets, meta=meta
+    )
+    errors.extend(getattr(dns_summary, "errors", []) or [])
+    errors.extend(getattr(files_summary, "errors", []) or [])
+
+    ldap_domains = Counter()
+    for qname, count in dns_summary.qname_counts.items():
+        qname_lower = qname.lower()
+        if any(token in qname_lower for token in LDAP_DNS_HINTS):
+            ldap_domains[qname_lower] += count
+
+    files = [art.filename for art in files_summary.artifacts]
 
     duration = 0.0
     if first_seen is not None and last_seen is not None:
@@ -686,6 +588,20 @@ def analyze_ldap(
             }
         )
 
+    cleartext_binds = [k for k in secrets if k.startswith("simple bind ")]
+    if cleartext_binds:
+        identities = sorted({k[len("simple bind "):].rsplit(": ", 1)[0] for k in cleartext_binds})
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "Cleartext LDAP simple-bind credentials",
+                "details": (
+                    f"{len(identities)} account(s) bound with a password in the clear: {', '.join(identities[:10])} "
+                    "(ATT&CK T1040 Network Sniffing)."
+                ),
+                "source": "LDAP",
+            }
+        )
     if secrets:
         detections.append(
             {
@@ -714,15 +630,32 @@ def analyze_ldap(
             }
         )
 
-    if any(
-        "ms-mcs-admpwd" in query.lower() or "unicodepwd" in query.lower()
-        for query in ldap_queries.keys()
-    ):
+    password_attrs = sorted(a for a in suspicious_attributes if a in PASSWORD_ATTRS)
+    if password_attrs:
         detections.append(
             {
                 "severity": "critical",
                 "summary": "LDAP queries for password attributes",
-                "details": "Queries include ms-Mcs-AdmPwd or unicodePwd.",
+                "details": f"Requested or filtered: {', '.join(password_attrs)} (LAPS / gMSA / password material).",
+                "source": "LDAP",
+            }
+        )
+    writes_by_attr = Counter(
+        change.split(":", 1)[-1] for item in writes for change in item.get("changes", []) or []
+    )
+    risky_writes = sorted(a for a in writes_by_attr if a.lower() in {
+        "msds-allowedtoactonbehalfofotheridentity", "msds-keycredentiallink", "serviceprincipalname",
+        "member", "useraccountcontrol", "scriptpath", "msds-allowedtodelegateto", "ntsecuritydescriptor",
+        "gpcfilesyspath", "sidhistory", "unicodepwd", "userpassword"})
+    if risky_writes:
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "LDAP writes to security-sensitive attributes",
+                "details": (
+                    f"Modified: {', '.join(risky_writes)} (RBCD, shadow credentials, targeted kerberoast, "
+                    "group membership or logon-script abuse)."
+                ),
                 "source": "LDAP",
             }
         )
@@ -763,12 +696,15 @@ def analyze_ldap(
             )
 
     search_count = request_counts.get("Search", 0)
-    if search_count >= 50 or len(ldap_queries) >= 50:
+    if search_count >= 50 or len(ldap_queries) >= 50 or entries_returned >= 200:
         detections.append(
             {
                 "severity": "warning",
                 "summary": "LDAP enumeration indicators",
-                "details": f"Search requests: {search_count}, unique queries: {len(ldap_queries)}.",
+                "details": (
+                    f"Search requests: {search_count}, distinct filters: {len(ldap_queries)}, "
+                    f"entries returned: {entries_returned}."
+                ),
                 "source": "LDAP",
             }
         )
@@ -870,9 +806,9 @@ def analyze_ldap(
 
     search_count = int(request_counts.get("Search", 0))
     unique_queries = len(ldap_queries)
-    if search_count >= 50 or unique_queries >= 50:
+    if search_count >= 50 or unique_queries >= 50 or entries_returned >= 200:
         deterministic_checks["enumeration_burst_activity"].append(
-            f"LDAP search burst search_ops={search_count} unique_queries={unique_queries}"
+            f"LDAP search burst search_ops={search_count} unique_queries={unique_queries} entries={entries_returned}"
         )
     for attr, count in suspicious_attributes.most_common(8):
         deterministic_checks["sensitive_attribute_access"].append(
@@ -1004,4 +940,10 @@ def analyze_ldap(
         deterministic_checks=deterministic_checks,
         threat_hypotheses=threat_hypotheses,
         benign_context=benign_context[:20],
+        operations=operations,
+        search_requests=search_requests,
+        writes=writes,
+        entries_returned=entries_returned,
+        spns=spns,
+        diagnostics=diagnostics,
     )

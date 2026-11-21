@@ -3,6 +3,7 @@ from __future__ import annotations
 from .utils import read_ber_length as _read_ber_length
 import ipaddress
 import os
+from array import array
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -28,8 +29,10 @@ from .progress import build_statusbar, run_with_busy_status
 from .s7 import S7_PORT, analyze_s7
 from .telnet import TELNET_PORTS
 from .utils import (
+    fan_out,
     decode_payload,
     dns_questions,
+    env_int,
     extract_packet_endpoints,
     memoize_analysis,
     network_egress_allowed,
@@ -1495,6 +1498,50 @@ def _netbios_session_hint(payload: bytes | None) -> str | None:
     return None
 
 
+# Records whose capture time the timeline keeps for the file-artifact lookup
+# (8 bytes each); past them the times come from a scan of the record headers.
+_TIMELINE_TIMES_MAX = env_int("PCAPPER_TIMELINE_TIMES_MAX", 16_000_000, minimum=0)
+
+
+def _artifact_times(
+    path: Path,
+    indices: set[int],
+    packet_times: "array[float]",
+    untimed: set[int],
+    total_packets: int,
+    *,
+    packets: list[object] | None,
+    meta: PcapMeta | None,
+) -> dict[int, float]:
+    """Capture times of the packets at ``indices`` (1-based), in index order:
+    from the times the packet pass kept, and -- only when the capture held more
+    than _TIMELINE_TIMES_MAX packets -- from a scan of the record times."""
+    times: dict[int, float] = {}
+    kept = len(packet_times)
+    beyond: set[int] = set()
+    for index in sorted(indices):
+        if index <= 0:
+            continue
+        if index <= kept:
+            if index not in untimed:
+                times[index] = packet_times[index - 1]
+        elif total_packets > kept:
+            beyond.add(index)
+    if beyond:
+        last = max(beyond)
+        for position, pkt in enumerate(
+            iter_packets(path, packets=packets, meta=meta, show_status=False, lite=True), start=1
+        ):
+            if position > last:
+                break
+            if position in beyond:
+                ts = safe_float(getattr(pkt, "time", None))
+                if ts is not None:
+                    times[position] = ts
+    return times
+
+
+@fan_out
 @memoize_analysis
 def analyze_timeline(
     path: Path,
@@ -1517,20 +1564,19 @@ def analyze_timeline(
         )
 
     view = {"packets": packets, "meta": meta}
-    file_summary = _busy("Files", analyze_files, path, show_status=False)
-    artifacts_for_ip = [
-        art
-        for art in file_summary.artifacts
-        if art.src_ip == target_ip or art.dst_ip == target_ip
-    ]
-    artifact_indices = {
-        art.packet_index for art in artifacts_for_ip if art.packet_index
-    }
-    creds_summary = _busy("Credentials", analyze_creds, path, show_status=False, **view)
 
+    # This analysis's own pass over the capture comes first: inside a shared
+    # pass it then reads in the round that computes the file and credential
+    # analyses below instead of a round of its own after them (a second full
+    # dissection of the capture). It needs none of their results.
     total_packets = 0
     idx = 0
-    index_ts: dict[int, float] = {}
+    # Every record's capture time, by position (8 bytes a record, up to
+    # _TIMELINE_TIMES_MAX): the file artifacts' times are looked up after the
+    # loop, once the file analysis -- which this pass no longer waits for --
+    # has said which packets carry them.
+    packet_times = array("d")
+    untimed: set[int] = set()
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
     ot_protocol_counts: Counter[str] = Counter()
@@ -1686,8 +1732,10 @@ def analyze_timeline(
 
         src_ip, dst_ip = extract_packet_endpoints(pkt)
 
-        if idx in artifact_indices and ts is not None:
-            index_ts[idx] = ts
+        if idx <= _TIMELINE_TIMES_MAX:
+            if ts is None:
+                untimed.add(idx)
+            packet_times.append(ts if ts is not None else 0.0)
 
         if not src_ip or not dst_ip:
             continue
@@ -2752,6 +2800,20 @@ def analyze_timeline(
                             summary="Domain service activity",
                             details=f"{src_ip} -> {target_ip}:{sport}",
                         )
+
+    file_summary = _busy("Files", analyze_files, path, show_status=False)
+    artifacts_for_ip = [
+        art
+        for art in file_summary.artifacts
+        if art.src_ip == target_ip or art.dst_ip == target_ip
+    ]
+    artifact_indices = {
+        art.packet_index for art in artifacts_for_ip if art.packet_index
+    }
+    creds_summary = _busy("Credentials", analyze_creds, path, show_status=False, **view)
+    index_ts = _artifact_times(
+        path, artifact_indices, packet_times, untimed, total_packets, packets=packets, meta=meta
+    )
 
     for art in artifacts_for_ip:
         ts = index_ts.get(art.packet_index)

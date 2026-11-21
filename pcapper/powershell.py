@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .utils import is_valid_ip as _valid_ip, packet_length, extract_ascii_strings as _extract_ascii_strings
 from .utils import beacon_score as _beaconing_score
+from .utils import extract_utf16le_strings
 import hashlib
 import re
 from collections import Counter, defaultdict
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import PcapMeta, iter_packets
-from .utils import extract_packet_endpoints, memoize_analysis, safe_float
+from .utils import domain_user_pairs, extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP
@@ -113,7 +114,6 @@ MAC_RE = re.compile(r"\b([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})\b")
 HOST_VALUE_RE = re.compile(
     r"(?:hostname|computername|name)\s*[:=]\s*([A-Za-z0-9_.-]{2,64})", re.IGNORECASE
 )
-DOMAIN_USER_RE = re.compile(r"\b([A-Za-z0-9_.-]{1,64})\\([A-Za-z0-9_.-]{1,64})\b")
 
 MAX_PLAINTEXT_UNIQUES = 1200
 MAX_INDICATOR_UNIQUES = 3000
@@ -133,6 +133,10 @@ SUSPICIOUS_PATTERNS = [
     (PS_CRED_RE, "Credential handling"),
     (PS_EXFIL_RE, "Potential staging/exfil"),
 ]
+
+# Whether any string matches any of the patterns, in one search per string
+# (eight per string was 5.3M searches in a --threats run).
+_SUSPICIOUS_ANY = re.compile("|".join(f"(?:{p.pattern})" for p, _label in SUSPICIOUS_PATTERNS), re.IGNORECASE)
 
 
 @dataclass(frozen=True)
@@ -279,26 +283,7 @@ class _SessionState:
 def _extract_utf16le_strings(
     data: bytes, min_len: int = 4, max_len: int = 200
 ) -> list[str]:
-    results: list[str] = []
-    if not data:
-        return results
-    current = bytearray()
-    i = 0
-    while i + 1 < len(data):
-        ch = data[i]
-        if 32 <= ch <= 126 and data[i + 1] == 0x00:
-            current.append(ch)
-            i += 2
-        else:
-            if len(current) >= min_len:
-                value = current.decode("latin-1", errors="ignore")
-                results.append(value[:max_len])
-            current = bytearray()
-            i += 2
-    if len(current) >= min_len:
-        value = current.decode("latin-1", errors="ignore")
-        results.append(value[:max_len])
-    return results
+    return extract_utf16le_strings(data, min_len, max_len)
 
 
 def _direction(
@@ -473,11 +458,7 @@ def analyze_powershell(
             has_hint = any(POWERSHELL_HINT_RE.search(value) for value in strings)
             has_winrm_context = any(PS_WINRM_RE.search(value) for value in strings)
             has_command_shape = any(PS_COMMAND_RE.search(value) for value in strings)
-            has_suspicious_pattern = any(
-                pattern.search(value)
-                for value in strings
-                for pattern, _label in SUSPICIOUS_PATTERNS
-            )
+            has_suspicious_pattern = any(_SUSPICIOUS_ANY.search(value) for value in strings)
 
             confidence = 0
             if has_port_context:
@@ -619,7 +600,7 @@ def analyze_powershell(
                         hostnames, host_match.group(1).lower(), MAX_INDICATOR_UNIQUES
                     )
 
-                for dom, user in DOMAIN_USER_RE.findall(value):
+                for dom, user in domain_user_pairs(value):
                     _record_bounded(domains, dom.lower(), MAX_INDICATOR_UNIQUES)
                     _record_bounded(usernames, user.lower(), MAX_INDICATOR_UNIQUES)
 

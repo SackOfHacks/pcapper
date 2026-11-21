@@ -14,8 +14,10 @@ try:
 except ImportError:
     Padding = TCP = UDP = Raw = None
 
+from .lite import UNSUPPORTED, LitePacket
+from .ot_ports import foreign_service_reply
 from .pcap_cache import PcapMeta, iter_packets
-from .utils import extract_packet_endpoints, safe_float, memoize_analysis
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 # --- Constants ---
 
@@ -685,6 +687,42 @@ class Dnp3Analysis:
         return [ip for ip, c in self.master_ips.items() if c > 0]
 
 
+
+_NO_TCP = object()
+
+
+def _ipv4_frame(data: bytes, protos: tuple[int, ...]) -> bool:
+    """The byte test of the raw-bytes fallback below (untagged Ethernet +
+    IPv4 + one of ``protos``): only such frames can get ports from it."""
+    return len(data) >= 34 and data[12:14] == b"\x08\x00" and data[23] in protos
+
+
+def _lite_fields(pkt: object, protos: tuple[int, ...], strip_raw_padding: bool):  # type: ignore[no-untyped-def]
+    """Transport fields of a lite record exactly as the scapy code below
+    derives them: ``(is_tcp, sport, dport, seq, flags, payload)``, _NO_TCP
+    when neither scapy nor the raw fallback finds a transport, or None when
+    only the dissected packet can answer."""
+    if type(pkt) is not LitePacket:
+        return None
+    l4 = pkt.lite_ports()
+    if l4 is UNSUPPORTED:
+        return None
+    if l4 is None or (not l4[0] and 17 not in protos):
+        return None if _ipv4_frame(pkt.original, protos) else _NO_TCP
+    if l4[5] < 0:  # payload dissected into a non-Raw layer by scapy
+        return None
+    data = pkt.original
+    payload = data[l4[5] : l4[6]]
+    if payload:
+        # scapy: Raw.load, then (Modbus) cut a trailing copy of the padding
+        padding = data[l4[6] :]
+        if strip_raw_padding and padding and payload.endswith(padding):
+            payload = payload[: -len(padding)]
+    else:
+        payload = b""  # no Raw layer: the padding-only payload strips to nothing
+    return (l4[0], l4[1], l4[2], l4[3], l4[4], payload)
+
+
 @memoize_analysis
 def analyze_dnp3(
     path: Path,
@@ -752,6 +790,10 @@ def analyze_dnp3(
     ] = OrderedDict()
     transport_buffered_bytes = 0
     tcp_gap_reported = False
+    # TCP-stream notes about streams tracked only because a payload looked
+    # like DNP3 (05 64 start bytes) on a non-DNP3 port; reported only when
+    # DNP3 was actually decoded, so IT traffic does not raise DNP3 errors.
+    tcp_stream_notes: list[str] = []
     transport_error_reported = False
     message_limit_reported = False
     control_limit_reported = False
@@ -765,7 +807,9 @@ def analyze_dnp3(
     last_time: float | None = None
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             total_packets += 1
             ts = safe_float(getattr(pkt, "time", 0))
             # Check ports
@@ -775,87 +819,102 @@ def analyze_dnp3(
             tcp_flags = 0
             payload = b""
 
-            if pkt.haslayer(TCP):
+            is_tcp_layer = False
+            fast = _lite_fields(pkt, (6, 17), strip_raw_padding=False)
+            if fast is _NO_TCP:
+                pass
+            elif fast is not None:
                 has_transport = True
-                tcp_layer = pkt[TCP]
-                sport = int(tcp_layer.sport)
-                dport = int(tcp_layer.dport)
-                tcp_seq = int(tcp_layer.seq)
-                tcp_flags = int(tcp_layer.flags)
-                payload_obj = tcp_layer.payload
-                if Raw is not None and pkt.haslayer(Raw):
-                    payload = bytes(pkt[Raw].load)
-                else:
-                    payload = bytes(payload_obj) if payload_obj else b""
-                    if Padding is not None and pkt.haslayer(Padding):
-                        padding = bytes(pkt[Padding])
-                        if padding and payload.endswith(padding):
-                            payload = payload[: -len(padding)]
-            elif pkt.haslayer(UDP):
-                has_transport = True
-                sport = int(pkt[UDP].sport)
-                dport = int(pkt[UDP].dport)
-                payload_obj = pkt[UDP].payload
-                if Raw is not None and pkt.haslayer(Raw):
-                    payload = bytes(pkt[Raw].load)
-                else:
-                    payload = bytes(payload_obj) if payload_obj else b""
-                    if Padding is not None and pkt.haslayer(Padding):
-                        padding = bytes(pkt[Padding])
-                        if padding and payload.endswith(padding):
-                            payload = payload[: -len(padding)]
+                is_tcp_layer, sport, dport, lite_seq, lite_flags, payload = fast
+                if is_tcp_layer:
+                    tcp_seq, tcp_flags = lite_seq, lite_flags
             else:
-                # Fallback: parse TCP/UDP from raw bytes if scapy didn't dissect layers
-                try:
-                    raw = bytes(pkt)
-                    if (
-                        len(raw) >= 34 and raw[12:14] == b"\x08\x00"
-                    ):  # Ethernet + IPv4
-                        ihl = (raw[14] & 0x0F) * 4
-                        proto = raw[23]
-                        ip_start = 14
-                        total_len = int.from_bytes(raw[16:18], "big")
-                        transport_start = ip_start + ihl
-                        if proto == 6 and len(raw) >= transport_start + 20:
-                            data_offset = (raw[transport_start + 12] >> 4) * 4
-                            sport = int.from_bytes(
-                                raw[transport_start : transport_start + 2], "big"
-                            )
-                            dport = int.from_bytes(
-                                raw[transport_start + 2 : transport_start + 4],
-                                "big",
-                            )
-                            payload_start = transport_start + data_offset
-                            ip_end = ip_start + total_len
-                            payload = (
-                                raw[payload_start:ip_end]
-                                if ip_end <= len(raw)
-                                else raw[payload_start:]
-                            )
-                            has_transport = True
-                        elif proto == 17 and len(raw) >= transport_start + 8:
-                            sport = int.from_bytes(
-                                raw[transport_start : transport_start + 2], "big"
-                            )
-                            dport = int.from_bytes(
-                                raw[transport_start + 2 : transport_start + 4],
-                                "big",
-                            )
-                            payload_start = transport_start + 8
-                            ip_end = ip_start + total_len
-                            payload = (
-                                raw[payload_start:ip_end]
-                                if ip_end <= len(raw)
-                                else raw[payload_start:]
-                            )
-                            has_transport = True
-                except Exception:
-                    pass
+                if type(pkt) is LitePacket:
+                    pkt = pkt.materialize()
+                is_tcp_layer = pkt.haslayer(TCP)
+                if pkt.haslayer(TCP):
+                    has_transport = True
+                    tcp_layer = pkt[TCP]
+                    sport = int(tcp_layer.sport)
+                    dport = int(tcp_layer.dport)
+                    tcp_seq = int(tcp_layer.seq)
+                    tcp_flags = int(tcp_layer.flags)
+                    payload_obj = tcp_layer.payload
+                    if Raw is not None and pkt.haslayer(Raw):
+                        payload = bytes(pkt[Raw].load)
+                    else:
+                        payload = bytes(payload_obj) if payload_obj else b""
+                        if Padding is not None and pkt.haslayer(Padding):
+                            padding = bytes(pkt[Padding])
+                            if padding and payload.endswith(padding):
+                                payload = payload[: -len(padding)]
+                elif pkt.haslayer(UDP):
+                    has_transport = True
+                    sport = int(pkt[UDP].sport)
+                    dport = int(pkt[UDP].dport)
+                    payload_obj = pkt[UDP].payload
+                    if Raw is not None and pkt.haslayer(Raw):
+                        payload = bytes(pkt[Raw].load)
+                    else:
+                        payload = bytes(payload_obj) if payload_obj else b""
+                        if Padding is not None and pkt.haslayer(Padding):
+                            padding = bytes(pkt[Padding])
+                            if padding and payload.endswith(padding):
+                                payload = payload[: -len(padding)]
+                else:
+                    # Fallback: parse TCP/UDP from raw bytes if scapy didn't dissect layers
+                    try:
+                        raw = bytes(pkt)
+                        if (
+                            len(raw) >= 34 and raw[12:14] == b"\x08\x00"
+                        ):  # Ethernet + IPv4
+                            ihl = (raw[14] & 0x0F) * 4
+                            proto = raw[23]
+                            ip_start = 14
+                            total_len = int.from_bytes(raw[16:18], "big")
+                            transport_start = ip_start + ihl
+                            if proto == 6 and len(raw) >= transport_start + 20:
+                                data_offset = (raw[transport_start + 12] >> 4) * 4
+                                sport = int.from_bytes(
+                                    raw[transport_start : transport_start + 2], "big"
+                                )
+                                dport = int.from_bytes(
+                                    raw[transport_start + 2 : transport_start + 4],
+                                    "big",
+                                )
+                                payload_start = transport_start + data_offset
+                                ip_end = ip_start + total_len
+                                payload = (
+                                    raw[payload_start:ip_end]
+                                    if ip_end <= len(raw)
+                                    else raw[payload_start:]
+                                )
+                                has_transport = True
+                            elif proto == 17 and len(raw) >= transport_start + 8:
+                                sport = int.from_bytes(
+                                    raw[transport_start : transport_start + 2], "big"
+                                )
+                                dport = int.from_bytes(
+                                    raw[transport_start + 2 : transport_start + 4],
+                                    "big",
+                                )
+                                payload_start = transport_start + 8
+                                ip_end = ip_start + total_len
+                                payload = (
+                                    raw[payload_start:ip_end]
+                                    if ip_end <= len(raw)
+                                    else raw[payload_start:]
+                                )
+                                has_transport = True
+                    except Exception:
+                        pass
 
             if not has_transport:
                 continue
 
-            on_dnp3_port = dport in dnp3_ports or (sport in dnp3_ports and dport >= 1024)
+            on_dnp3_port = (dport in dnp3_ports and not foreign_service_reply(sport, dnp3_ports)) or (
+                sport in dnp3_ports and dport >= 1024
+            )
             src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip:
                 src_ip = pkt[0].src if hasattr(pkt[0], "src") else "?"
@@ -864,7 +923,7 @@ def analyze_dnp3(
 
             frames: list[tuple[int, int, int, bytes, bool]] = []
             if payload:
-                if pkt.haslayer(TCP) and tcp_seq is not None:
+                if is_tcp_layer and tcp_seq is not None:
                     stream_key = (src_ip, dst_ip, sport, dport)
                     if (
                         on_dnp3_port
@@ -882,7 +941,7 @@ def analyze_dnp3(
                             if 0 < delta < 0x80000000:
                                 stream_tail = b""
                                 if not tcp_gap_reported:
-                                    errors.append(
+                                    tcp_stream_notes.append(
                                         "DNP3 TCP sequence gap observed; incomplete frame data was discarded."
                                     )
                                     tcp_gap_reported = True
@@ -904,7 +963,7 @@ def analyze_dnp3(
                             if len(tcp_streams) >= MAX_DNP3_TCP_STREAMS:
                                 tcp_streams.popitem(last=False)
                                 if not tcp_gap_reported:
-                                    errors.append(
+                                    tcp_stream_notes.append(
                                         "DNP3 TCP stream state limit reached; oldest incomplete stream was discarded."
                                     )
                                     tcp_gap_reported = True
@@ -1595,6 +1654,9 @@ def analyze_dnp3(
         _seen.add(_k)
         _deduped.append(_a)
     anomalies = _deduped
+
+    if dnp3_packets:
+        errors.extend(tcp_stream_notes)
 
     return Dnp3Analysis(
         path=path,

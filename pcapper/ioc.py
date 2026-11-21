@@ -9,7 +9,7 @@ from typing import Optional
 
 from .files import analyze_files
 from .pcap_cache import PcapMeta, iter_packets
-from .utils import safe_float, safe_read_text, extract_packet_endpoints
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float, safe_read_text
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -210,6 +210,7 @@ def _compile_domain_patterns(domains: set[str]) -> list[tuple[str, "re.Pattern[s
     return patterns
 
 
+@memoize_analysis
 def analyze_iocs(
     path: Path,
     ioc_path: Path,
@@ -224,15 +225,6 @@ def analyze_iocs(
     domain_hits: Counter[str] = Counter()
     hash_hits: Counter[str] = Counter()
     detections: list[dict[str, object]] = []
-
-    files_summary = analyze_files(path, show_status=show_status)
-    for artifact in files_summary.artifacts:
-        sha = getattr(artifact, "sha256", None)
-        md5 = getattr(artifact, "md5", None)
-        if sha and sha.lower() in hashes:
-            hash_hits[sha.lower()] += 1
-        if md5 and md5.lower() in hashes:
-            hash_hits[md5.lower()] += 1
 
     total_packets = 0
     first_seen: Optional[float] = None
@@ -270,6 +262,18 @@ def analyze_iocs(
                 for domain, _pattern in domain_patterns:
                     if domain == dns_name or dns_name.endswith("." + domain):
                         domain_hits[domain] += 1
+
+    # The file hashes come after the packet pass (which needs none of them):
+    # inside a shared pass the pass then reads in the round that computes the
+    # file analysis instead of in a round of its own after it.
+    files_summary = analyze_files(path, show_status=show_status)
+    for artifact in files_summary.artifacts:
+        sha = getattr(artifact, "sha256", None)
+        md5 = getattr(artifact, "md5", None)
+        if sha and sha.lower() in hashes:
+            hash_hits[sha.lower()] += 1
+        if md5 and md5.lower() in hashes:
+            hash_hits[md5.lower()] += 1
 
 
     if ip_hits:

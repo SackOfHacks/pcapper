@@ -1,212 +1,100 @@
-"""Rendered output for strings analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for --strings: cleartext strings carved from payloads,
+led by the suspicious ones (credentials, commands, stagers, OT writes) and
+the URLs, emails and domains they contain."""
 
 from __future__ import annotations
-from ..coloring import (
-    danger,
-    header,
-    label,
-    muted,
-    ok,
-    warn,
-)
-from ..strings import StringsSummary
 
-from ._common import (
-    SECTION_BAR,
-    SUBSECTION_BAR,
-    _finalize_output,
-    _format_kv,
-    _format_table,
-    _limit_value,
-    _render_deterministic_checks,
-)
+from ..strings import StringsSummary
+from . import _style as st
+from ._common import _render_deterministic_checks
+
+
+def _checks(summary: StringsSummary, key: str) -> list[str]:
+    dc = summary.deterministic_checks or {}
+    return [str(v) for v in (dc.get(key, []) or []) if str(v).strip()]
+
+
+def _values(items: list, label_text: str, total: int | None = None) -> list[str]:
+    """A ranked value/count table: the top 10 and the bottom 10."""
+    return st.ranked([label_text, "Count"], [[i.value, st.count(i.count)] for i in items], align="lr",
+                     widths=(100,), noun=label_text if label_text.isupper() else label_text.lower(), total=total)
 
 
 def render_strings_summary(summary: StringsSummary) -> str:
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"STRINGS ANALYSIS :: {summary.path.name}"))
-    lines.append(SECTION_BAR)
-
-    if summary.errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        for err in summary.errors:
-            lines.append(danger(f"- {err}"))
-
-    lines.append(_format_kv("Strings Found", str(summary.strings_found)))
-    lines.append(_format_kv("Unique Strings", str(summary.unique_strings)))
-
-    # ---- Analyst Verdict -------------------------------------------------
-    dc = summary.deterministic_checks or {}
-
-    def _sdc(key: str) -> list[str]:
-        return [str(v) for v in (dc.get(key, []) or []) if str(v).strip()]
-
-    s_creds = _sdc("cleartext_credentials")
-    s_lolbin = _sdc("command_execution_or_lolbin")
-    s_exfil = _sdc("download_stager_or_exfil")
-    s_otwrite = _sdc("ot_ics_control_write_ops")
-    s_ctf = _sdc("ctf_flag_or_challenge_markers")
-    reasons: list[str] = []
-    if s_creds:
-        reasons.append(f"cleartext credentials in {len(s_creds)} string(s)")
-    if s_lolbin:
-        reasons.append(f"command/LOLBin execution strings ({len(s_lolbin)})")
-    if s_exfil:
-        reasons.append(f"download-stager / exfil strings ({len(s_exfil)})")
-    if s_otwrite:
-        reasons.append(f"OT/ICS control-write operation markers ({len(s_otwrite)})")
-    if s_ctf:
-        reasons.append(f"CTF flag / challenge markers ({len(s_ctf)})")
-    if s_creds or s_lolbin or s_exfil:
-        v_text, v_fn = "MALICIOUS / SENSITIVE STRINGS PRESENT", danger
-    elif s_otwrite:
-        v_text, v_fn = "OT/ICS CONTROL-WRITE STRINGS PRESENT", warn
-    elif s_ctf:
-        v_text, v_fn = "CTF FLAG MARKERS IN STRINGS", warn
+    rep = st.Report("Strings", summary.path)
+    creds = _checks(summary, "cleartext_credentials")
+    lolbin = _checks(summary, "command_execution_or_lolbin")
+    exfil = _checks(summary, "download_stager_or_exfil")
+    otwrite = _checks(summary, "ot_ics_control_write_ops")
+    ctf = _checks(summary, "ctf_flag_or_challenge_markers")
+    reasons = [text for hits, text in (
+        (creds, f"cleartext credentials in {len(creds)} string(s)"),
+        (lolbin, f"command/LOLBin execution strings ({len(lolbin)})"),
+        (exfil, f"download-stager / exfil strings ({len(exfil)})"),
+        (otwrite, f"OT/ICS control-write operation markers ({len(otwrite)})"),
+        (ctf, f"CTF flag / challenge markers ({len(ctf)})"),
+    ) if hits]
+    if creds or lolbin or exfil:
+        severity, text = "high", "malicious or sensitive strings present"
+    elif otwrite:
+        severity, text = "medium", "OT/ICS control-write strings present"
+    elif ctf:
+        severity, text = "medium", "CTF flag markers in strings"
     elif summary.suspicious_strings:
-        v_text, v_fn = "SUSPICIOUS STRINGS PRESENT", warn
+        severity, text = "medium", "suspicious strings present"
     else:
-        v_text, v_fn = "NO HIGH-RISK STRINGS DETECTED", ok
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Analyst Verdict"))
-    lines.append(v_fn(f"[VERDICT] {v_text}"))
+        severity, text = None, "no high-risk strings"
+    rep.headline(severity, text, st.join([f"{st.count(summary.strings_found)} strings",
+                                          f"{st.count(summary.unique_strings)} unique"]))
     for reason in reasons:
-        lines.append(warn(f"- {reason}"))
+        rep.scope(reason)
+    if summary.errors:
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Top Cleartext Strings"))
-    if not summary.top_strings:
-        lines.append(muted("No cleartext strings extracted."))
+    def _pairs(pairs: list) -> str:
+        return ", ".join(f"{ip} ({n})" for ip, n in pairs) or "-"
+
+    if summary.suspicious_details:
+        rows = [[d.get("value", "-"), st.count(d.get("count", 0)), ", ".join(d.get("reasons", [])) or "-",
+                 _pairs(d.get("top_sources", [])), _pairs(d.get("top_destinations", []))] for d in summary.suspicious_details]
     else:
-        rows = [["String", "Count"]]
-        for item in summary.top_strings:
-            rows.append([item.value, str(item.count)])
-        lines.append(_format_table(rows))
-
-    if summary.urls or summary.emails or summary.domains:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Artifacts"))
-        if summary.urls:
-            rows = [["URL", "Count"]]
-            for item in summary.urls:
-                rows.append([item.value, str(item.count)])
-            lines.append(_format_table(rows))
-        if summary.emails:
-            rows = [["Email", "Count"]]
-            for item in summary.emails:
-                rows.append([item.value, str(item.count)])
-            lines.append(_format_table(rows))
-        if summary.domains:
-            rows = [["Domain", "Count"]]
-            for item in summary.domains:
-                rows.append([item.value, str(item.count)])
-            lines.append(_format_table(rows))
-
-    if summary.suspicious_strings:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Suspicious or Malicious Indicators"))
-        rows = [["String", "Count", "Reason", "Top Sources", "Top Destinations"]]
-        if summary.suspicious_details:
-            for item in summary.suspicious_details:
-                reasons = ", ".join(item.get("reasons", [])) or "-"
-                top_src = (
-                    ", ".join(
-                        f"{ip}({count})" for ip, count in item.get("top_sources", [])
-                    )
-                    or "-"
-                )
-                top_dst = (
-                    ", ".join(
-                        f"{ip}({count})"
-                        for ip, count in item.get("top_destinations", [])
-                    )
-                    or "-"
-                )
-                rows.append(
-                    [
-                        str(item.get("value", "-")),
-                        str(item.get("count", "-")),
-                        reasons,
-                        top_src,
-                        top_dst,
-                    ]
-                )
-        else:
-            for item in summary.suspicious_strings:
-                rows.append([item.value, str(item.count), "-", "-", "-"])
-        lines.append(_format_table(rows))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Client Cleartext Highlights"))
-    if not summary.client_strings:
-        lines.append(muted("No client-attributed strings."))
-    else:
-        for ip, items in summary.client_strings.items():
-            lines.append(label(f"Client {ip}"))
-            rows = [["String", "Count"]]
-            for item in items:
-                rows.append([item.value, str(item.count)])
-            lines.append(_format_table(rows))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Server Cleartext Highlights"))
-    if not summary.server_strings:
-        lines.append(muted("No server-attributed strings."))
-    else:
-        for ip, items in summary.server_strings.items():
-            lines.append(label(f"Server {ip}"))
-            rows = [["String", "Count"]]
-            for item in items:
-                rows.append([item.value, str(item.count)])
-            lines.append(_format_table(rows))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Strings Anomalies"))
-    if not summary.anomalies:
-        lines.append(ok("No string-specific anomalies detected."))
-    else:
-        for item in summary.anomalies:
-            lines.append(warn(f"[WARN] {item}"))
-
-    if summary.threat_hypotheses:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Threat Hypotheses"))
-        for hyp in summary.threat_hypotheses:
-            conf = str(hyp.get("confidence", "?"))
-            text = str(hyp.get("hypothesis", "-"))
-            ev = hyp.get("evidence", "")
-            lines.append(warn(f"- [{conf}] {text} (evidence={ev})"))
-
-    if summary.ot_findings:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("OT/ICS Markers in Strings"))
-        for item in summary.ot_findings[: _limit_value(15)]:
-            lines.append(muted(f"- {item}"))
-    if summary.ctf_indicators:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("CTF Flag / Challenge Markers"))
-        for item in summary.ctf_indicators[: _limit_value(15)]:
-            lines.append(muted(f"- {item}"))
-
-    _render_deterministic_checks(
-        lines,
-        summary,
-        "Deterministic String Security Checks",
-        [
+        rows = [[i.value, st.count(i.count), "-", "-", "-"] for i in summary.suspicious_strings]
+    rep.section("Suspicious strings", st.table(["String", "Count", "Reason", "Sources", "Destinations"], rows,
+                                               align="lrlll", widths=(64, None, 40, 40, 40), noun="string"))
+    rep.section("Anomalies", st.bullets([str(a) for a in (summary.anomalies or [])], max_items=None))
+    totals = getattr(summary, "ranking_totals", None) or {}
+    rep.section("URLs", _values(summary.urls, "URL", totals.get("urls")))
+    rep.section("Emails", _values(summary.emails, "Email", totals.get("emails")))
+    rep.section("Domains", _values(summary.domains, "Domain", totals.get("domains")))
+    rep.section("OT/ICS markers", st.bullets([str(i) for i in (summary.ot_findings or [])], max_items=15, noun="marker"))
+    rep.section("CTF markers", st.bullets([str(i) for i in (summary.ctf_indicators or [])], max_items=15, noun="marker"))
+    # The analyzer keeps the 20 most and the 20 least common strings: the
+    # top and the bottom of one ranking (bottom_strings is rarest first).
+    top_values = {i.value for i in summary.top_strings or []}
+    bottom = [i for i in reversed(getattr(summary, "bottom_strings", None) or []) if i.value not in top_values]
+    rep.section("Strings", st.ranked(
+        ["String", "Count"], [[i.value, st.count(i.count)] for i in [*(summary.top_strings or []), *bottom]],
+        align="lr", widths=(100,), noun="string", total=summary.unique_strings or None,
+        tail=len(bottom) if st.verbose() else st.TOP_ROWS,
+    ))
+    hosts: list[str] = []
+    for role, mapping in (("client", summary.client_strings), ("server", summary.server_strings)):
+        for ip, items in (mapping or {}).items():
+            hosts.append(f"  {st.strong(f'{role} {ip}')}")
+            hosts += _values(items, "String", None)
+    rep.section("Strings by host", hosts, detail=True)
+    hyp = [f"[{h.get('confidence', '?')}] {h.get('hypothesis', '-')} (evidence={h.get('evidence', '')})"
+           for h in (summary.threat_hypotheses or [])]
+    rep.section("Threat hypotheses", st.bullets(hyp, max_items=None), detail=True)
+    if st.analysis_sections():
+        legacy: list[str] = []
+        _render_deterministic_checks(legacy, summary, "Deterministic String Security Checks", [
             ("cleartext_credentials", "Cleartext Credentials"),
             ("command_execution_or_lolbin", "Command Execution / LOLBin"),
             ("download_stager_or_exfil", "Download Stager / Exfil"),
             ("ot_ics_control_write_ops", "OT/ICS Control-Write Operations"),
             ("ot_ics_protocol_markers", "OT/ICS Protocol Markers"),
             ("ctf_flag_or_challenge_markers", "CTF Flag / Challenge Markers"),
-        ],
-    )
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+        ])
+        rep.section("Deterministic checks", legacy[2:])
+    return rep.render()

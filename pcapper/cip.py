@@ -1,10 +1,13 @@
 from __future__ import annotations
 
-from .utils import is_public_ip as _is_public_ip, packet_length, memoize_analysis
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
+
+from .ot_ports import foreign_service_reply
+from .utils import is_public_ip as _is_public_ip
+from .utils import memoize_analysis, packet_length
 
 try:
     from scapy.layers.inet import IP, TCP, UDP
@@ -19,7 +22,8 @@ from .industrial_helpers import (
     _extract_transport,
     merge_size_buckets,
 )
-from .pcap_cache import PcapMeta, iter_packets
+from .lite import UNSUPPORTED, LitePacket
+from .pcap_cache import PassStats, PcapMeta, iter_packets
 from .utils import safe_float
 
 CIP_TCP_PORT = 44818
@@ -1000,6 +1004,45 @@ def _bucketize(values: list[int]) -> list[SizeBucket]:
     return buckets
 
 
+def _enip_signature(payload: bytes) -> bool:
+    """A full 24-byte ENIP encapsulation header that accounts for the whole
+    payload, so arbitrary binary/HTTP content isn't misread as ENIP/CIP on a
+    non-standard port (see _ENIP_ENCAP_STATUSES note)."""
+    if not payload or len(payload) < 24:
+        return False
+    cmd_guess = int.from_bytes(payload[0:2], "little")
+    declared_len = int.from_bytes(payload[2:4], "little")
+    enc_status = int.from_bytes(payload[8:12], "little")
+    return (
+        cmd_guess in ENIP_COMMANDS
+        and 24 + declared_len == len(payload)
+        and enc_status in _ENIP_ENCAP_STATUSES
+    )
+
+
+def _enip_prefilter(ports: frozenset[int], signature=_enip_signature):  # type: ignore[no-untyped-def]
+    """Records the CIP/ENIP loops can count (one of ``ports`` on the server
+    side, or an encapsulation header ``signature`` accepts on any port),
+    decided from the lite headers; the rest count toward the capture totals
+    alone. The loops read the transport through ``_extract_transport``, which
+    answers from the same headers."""
+
+    def keep(record: LitePacket) -> bool:
+        l4 = record.lite_ports()
+        if l4 is UNSUPPORTED:
+            return True
+        if l4 is None:
+            return False
+        sport, dport = l4[1], l4[2]
+        if dport in ports or (sport in ports and dport >= 32768):
+            return True
+        if l4[5] < 0:
+            return True  # a payload only scapy can produce
+        return signature(record.original[l4[5] : l4[6]])
+
+    return keep
+
+
 @memoize_analysis
 def analyze_cip(
     path: Path,
@@ -1105,8 +1148,19 @@ def analyze_cip(
         if is_write:
             control_events[(s_ip, d_ip, f"PCCC {name}")] += 1
 
+    # Read from disk, only CIP candidates are handed over (the totals and the
+    # time span come from the pass), as lite records parsed from their bytes.
+    stats = PassStats()
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path,
+            packets=packets,
+            meta=meta,
+            show_status=show_status,
+            lite=True,
+            prefilter=_enip_prefilter(frozenset(cip_ports)),
+            stats=stats,
+        ):
             analysis.total_packets += 1
             pkt_len = packet_length(pkt)
             analysis.total_bytes += pkt_len
@@ -1128,23 +1182,12 @@ def analyze_cip(
             # ephemeral range, so a bare port match misclassifies unrelated
             # flows whose ephemeral source port equals 44818; real CIP on a
             # nonstandard port is still caught by the signature path below.
-            matches_port = dport in cip_ports or (
+            matches_port = (dport in cip_ports and not foreign_service_reply(sport, cip_ports)) or (
                 sport in cip_ports and dport >= 32768
             )
             # Validate the full 24-byte encapsulation header for a
-            # non-standard-port match, not just the 2-byte command, so
-            # arbitrary binary/HTTP content isn't misread as ENIP/CIP (see
-            # _ENIP_ENCAP_STATUSES note).
-            matches_signature = False
-            if payload and len(payload) >= 24:
-                cmd_guess = int.from_bytes(payload[0:2], "little")
-                declared_len = int.from_bytes(payload[2:4], "little")
-                enc_status = int.from_bytes(payload[8:12], "little")
-                matches_signature = (
-                    cmd_guess in ENIP_COMMANDS
-                    and 24 + declared_len == len(payload)
-                    and enc_status in _ENIP_ENCAP_STATUSES
-                )
+            # non-standard-port match, not just the 2-byte command.
+            matches_signature = _enip_signature(payload)
 
             if not matches_port and not matches_signature:
                 continue
@@ -1870,6 +1913,12 @@ def analyze_cip(
 
     except Exception as exc:
         analysis.errors.append(f"{type(exc).__name__}: {exc}")
+    if stats.active:
+        analysis.total_packets = stats.packets
+        analysis.total_bytes = stats.bytes
+        if stats.packets:
+            start_time = safe_float(getattr(stats.first, "time", 0))
+            last_time = safe_float(getattr(stats.last, "time", 0))
 
     if start_time is not None and last_time is not None:
         analysis.duration = last_time - start_time

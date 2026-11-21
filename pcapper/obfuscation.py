@@ -52,6 +52,18 @@ DNS_PORTS = {53}
 WEB_TUNNEL_PORTS = {80, 8080, 8000, 8888}
 
 BASE64_RE = re.compile(r"[A-Za-z0-9+/]{80,}={0,2}")
+# The header in front of an HTTP Negotiate / NTLM / Kerberos credential
+# (WinRM, IIS, proxies): its base64 is an authentication token.
+_HTTP_AUTH_PREFIX_RE = re.compile(
+    r"(?:proxy-)?(?:authorization|www-authenticate|proxy-authenticate):\s*(?:negotiate|ntlm|kerberos)\s+$", re.I
+)
+
+
+def _is_http_auth_token(text: str, start: int) -> bool:
+    """True when the base64 token at ``start`` is an HTTP authentication
+    credential (``Authorization: Negotiate TlRMTVNTUA...``), not a payload."""
+    line_start = text.rfind("\n", 0, start) + 1
+    return bool(_HTTP_AUTH_PREFIX_RE.search(text[line_start:start]))
 HEX_RE = re.compile(r"[0-9A-Fa-f]{80,}")
 
 URL_RE = re.compile(r"(?i)\bhttps?://[^\s\"'<>]{6,}")
@@ -271,8 +283,11 @@ def _looks_compressed_or_media(data: bytes) -> bool:
 
 
 def _http_declares_compressed_or_media(text: str) -> bool:
-    """True if an HTTP response header block declares a compressed transfer or
-    a media/compressed content type (so its high-entropy body is expected)."""
+    """True if an HTTP header block declares a compressed transfer, a
+    media/compressed content type, or an encrypted body (so its high-entropy
+    body is expected). WinRM / PowerShell remoting on 5985 seals every SOAP
+    message: multipart/encrypted with an HTTP-SPNEGO, -Kerberos or -CredSSP
+    session-encrypted protocol."""
     head = text[:1024].lower()
     if "http/" not in head:
         return False
@@ -295,6 +310,7 @@ def _http_declares_compressed_or_media(text: str) -> bool:
             "application/x-rar",
             "application/java-archive",
             "application/x-shockwave-flash",
+            "multipart/encrypted",
         )
     ):
         return True
@@ -1096,6 +1112,8 @@ def analyze_obfuscation(
                 ) > ioc_before
                 if not (decoded_binary or gained_ioc):
                     continue
+                if not gained_ioc and _is_http_auth_token(text, match.start()):
+                    continue  # an NTLM / Kerberos token: binary by design
                 if len(base64_hits) < MAX_HITS:
                     base64_hits.append(
                         ObfuscationHit(

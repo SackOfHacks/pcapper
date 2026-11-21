@@ -1,36 +1,15 @@
-"""Rendered output for search analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for --search: every packet whose payload matched, with
+the match highlighted in its context."""
 
 from __future__ import annotations
+
 import re
 from collections import Counter
 from typing import Iterable
-from ..coloring import (
-    danger,
-    header,
-    muted,
-    ok,
-    warn,
-)
-from ..search import SearchSummary
-from ..utils import (
-    display_safe,
-    format_ts,
-)
 
-from ._common import (
-    SECTION_BAR,
-    SUBSECTION_BAR,
-    _apply_verbose_limit,
-    _finalize_output,
-    _format_kv,
-    _format_table,
-    _limit_value,
-    _truncate_text,
-)
+from ..search import SearchSummary
+from ..utils import display_safe
+from . import _style as st
 
 
 def _highlight_search_text(text: str, query: str) -> str:
@@ -40,167 +19,55 @@ def _highlight_search_text(text: str, query: str) -> str:
         pattern = re.compile(re.escape(query), re.IGNORECASE)
     except re.error:
         return text
-    return pattern.sub(lambda match: ok(match.group(0)), text)
+    return pattern.sub(lambda m: st.good(m.group(0)), text)
+
+
+def _hit_row(hit, query: str, capture: str = "") -> list:  # type: ignore[no-untyped-def]
+    context = st.cut(hit.context, 80)
+    return ([capture] if capture else []) + [
+        hit.packet_number, st.ts(hit.ts), st.flow(hit.src_ip, hit.dst_ip), hit.protocol,
+        f"{hit.src_port if hit.src_port is not None else '-'} -> {hit.dst_port if hit.dst_port is not None else '-'}",
+        hit.payload_len, _highlight_search_text(context, query) if context else "-",
+    ]
+
+
+_COLUMNS = ["Pkt", "Time", "Flow", "Proto", "Ports", "Len", "Context"]
 
 
 def render_search_summary(summary: SearchSummary) -> str:
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"SEARCH RESULTS :: {summary.path.name}"))
-    lines.append(SECTION_BAR)
-
-    if summary.errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        for err in summary.errors:
-            lines.append(danger(f"- {err}"))
-
-    safe_query = display_safe(summary.query)
-    lines.append(_format_kv("Query", ok(safe_query)))
-    lines.append(_format_kv("Packets Scanned", str(summary.total_packets)))
-    lines.append(_format_kv("Matches", str(summary.matches)))
+    rep = st.Report("Search", summary.path)
+    query = display_safe(summary.query)
+    rep.headline(False, f"{st.plural(summary.matches, 'match', 'matches')} for {st.good(query)}",
+                 f"{st.count(summary.total_packets)} packets scanned")
     if summary.truncated:
-        lines.append(warn(f"[WARN] Showing first {len(summary.hits)} matches."))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Match Details"))
-    if not summary.hits:
-        lines.append(muted("No matches found."))
-    else:
-        rows = [
-            ["Pkt", "Time", "Src", "Dst", "Proto", "Sport", "Dport", "Len", "Context"]
-        ]
-        for hit in summary.hits:
-            context_text = _truncate_text(hit.context, 80)
-            if context_text:
-                context_text = _highlight_search_text(context_text, safe_query)
-            rows.append(
-                [
-                    str(hit.packet_number),
-                    format_ts(hit.ts),
-                    hit.src_ip,
-                    hit.dst_ip,
-                    hit.protocol,
-                    str(hit.src_port) if hit.src_port is not None else "-",
-                    str(hit.dst_port) if hit.dst_port is not None else "-",
-                    str(hit.payload_len),
-                    context_text or "-",
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+        rep.note("CAPPED", f"showing the first {len(summary.hits)} matches")
+    if summary.errors:
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Matches", st.table(_COLUMNS, [_hit_row(h, query) for h in summary.hits], align="rllllrl", max_rows=None))
+    return rep.render()
 
 
 def render_search_rollup(summaries: Iterable[SearchSummary], limit: int = 20) -> str:
-    limit = _apply_verbose_limit(limit)
-    summary_list = list(summaries)
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"SEARCH RESULTS :: ALL PCAPS ({len(summary_list)})"))
-    lines.append(SECTION_BAR)
-
-    if not summary_list:
-        lines.append(muted("No search summaries to aggregate."))
-        lines.append(SECTION_BAR)
-        return _finalize_output(lines)
-
-    query_counts: Counter[str] = Counter()
-    total_packets = 0
-    total_matches = 0
-    total_hits = 0
-    truncated_pcaps = 0
-    all_errors: list[str] = []
-    rows = [["PCAP", "Matches", "Packets", "Shown Hits", "Errors"]]
-
-    for summary in summary_list:
-        query_counts.update([summary.query])
-        total_packets += summary.total_packets
-        total_matches += summary.matches
-        total_hits += len(summary.hits)
-        if summary.truncated:
-            truncated_pcaps += 1
-        err_count = len(summary.errors)
-        rows.append(
-            [
-                summary.path.name,
-                str(summary.matches),
-                str(summary.total_packets),
-                str(len(summary.hits)),
-                str(err_count),
-            ]
-        )
-        for err in summary.errors:
-            all_errors.append(f"{summary.path.name}: {err}")
-
-    query = query_counts.most_common(_limit_value(1))[0][0] if query_counts else "-"
-    safe_query = display_safe(query)
-    lines.append(_format_kv("Query", ok(safe_query) if safe_query != "-" else safe_query))
-    lines.append(_format_kv("PCAPs Analyzed", str(len(summary_list))))
-    lines.append(_format_kv("Packets Scanned", str(total_packets)))
-    lines.append(_format_kv("Total Matches", str(total_matches)))
-    lines.append(_format_kv("Shown Hits", str(total_hits)))
-    lines.append(_format_kv("Truncated PCAPs", str(truncated_pcaps)))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Per-PCAP Match Totals"))
-    lines.append(_format_table(rows))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Top Match Details"))
-    detail_rows = [
-        [
-            "PCAP",
-            "Pkt",
-            "Time",
-            "Src",
-            "Dst",
-            "Proto",
-            "Sport",
-            "Dport",
-            "Len",
-            "Context",
-        ]
-    ]
-    for summary in sorted(summary_list, key=lambda item: item.matches, reverse=True):
-        for hit in summary.hits:
-            if len(detail_rows) > limit:
-                break
-            detail_rows.append(
-                [
-                    summary.path.name,
-                    str(hit.packet_number),
-                    format_ts(hit.ts),
-                    hit.src_ip,
-                    hit.dst_ip,
-                    hit.protocol,
-                    str(hit.src_port) if hit.src_port is not None else "-",
-                    str(hit.dst_port) if hit.dst_port is not None else "-",
-                    str(hit.payload_len),
-                    _truncate_text(hit.context, 80),
-                ]
-            )
-        if len(detail_rows) > limit:
-            break
-
-    if len(detail_rows) == 1:
-        lines.append(muted("No matches found."))
-    else:
-        lines.append(_format_table(detail_rows))
-        shown = len(detail_rows) - 1
-        if shown < total_hits:
-            lines.append(
-                warn(f"[WARN] Showing first {shown} hit rows across all pcaps.")
-            )
-
-    if all_errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        for err in all_errors[: _limit_value(25)]:
-            lines.append(danger(f"- {err}"))
-        if len(all_errors) > 25:
-            lines.append(muted(f"... {len(all_errors) - 25} more errors"))
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    items = list(summaries)
+    rep = st.Report("Search", f"ALL PCAPS ({len(items)})")
+    if not items:
+        return rep.absent("search summaries to aggregate")
+    queries = Counter(s.query for s in items)
+    query = display_safe(queries.most_common(1)[0][0]) if queries else "-"
+    total_matches = sum(s.matches for s in items)
+    rep.headline(False, f"{st.plural(total_matches, 'match', 'matches')} for {st.good(query)}",
+                 st.join([f"{st.count(sum(s.total_packets for s in items))} packets scanned",
+                          st.plural(len(items), "capture"),
+                          f"{sum(1 for s in items if s.truncated)} capped" if any(s.truncated for s in items) else ""]))
+    errors = [f"{s.path.name}: {e}" for s in items for e in s.errors]
+    if errors:
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in errors])
+    rep.section("Per capture", st.table(
+        ["Capture", "Matches", "Packets", "Shown", "Errors"],
+        [[s.path.name, st.count(s.matches), st.count(s.total_packets), st.count(len(s.hits)), len(s.errors)] for s in items],
+        align="lrrrr", max_rows=None,
+    ))
+    rows = [_hit_row(h, query, s.path.name) for s in sorted(items, key=lambda x: x.matches, reverse=True) for h in s.hits]
+    rep.section("Matches", st.table(["Capture"] + _COLUMNS, rows, align="lrllllrl",
+                                    max_rows=None if st.verbose() else limit, noun="match"))
+    return rep.render()

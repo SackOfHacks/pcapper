@@ -5,40 +5,32 @@ verbatim, only its location changed.
 """
 
 from __future__ import annotations
+
 import ipaddress
 from collections import Counter
+
 from ..beacon import (
     MGMT_PORTS as _BCN_MGMT_PORTS,
-    OT_PORTS as _BCN_OT_PORTS,
-    TUNNEL_PORTS as _BCN_TUNNEL_PORTS,
-    BeaconSummary,
 )
-from ..coloring import (
-    danger,
-    header,
-    label,
-    muted,
-    ok,
-    warn,
+from ..beacon import (
+    OT_PORTS as _BCN_OT_PORTS,
+)
+from ..beacon import (
+    TUNNEL_PORTS as _BCN_TUNNEL_PORTS,
+)
+from ..beacon import (
+    BeaconSummary,
 )
 from ..services import COMMON_PORTS
 from ..utils import (
     format_duration,
     sparkline,
 )
-
+from . import _style as st
 from ._common import (
-    SECTION_BAR,
-    SUBSECTION_BAR,
-    _apply_verbose_limit,
-    _filtered_detections,
-    _finalize_output,
-    _format_kv,
-    _format_table,
-    _highlight_public_ips,
-    _limit_value,
     _redact_in_text,
 )
+from ._kv import findings_for
 
 
 def _beacon_ip_is_public(ip_text: object) -> bool:
@@ -171,525 +163,177 @@ def _beacon_classify(cand) -> dict[str, object]:
 _BEACON_SEV_RANK = {"info": 0, "warning": 1, "high": 2, "critical": 3}
 
 
-def render_beacon_summary(
-    summary: BeaconSummary, limit: int = 12, verbose: bool = False
-) -> str:
-    limit = _apply_verbose_limit(limit)
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"BEACON ANALYSIS :: {summary.path.name}"))
-    lines.append(SECTION_BAR)
+_SEV_MAP = {"critical": "critical", "high": "high", "warning": "medium", "info": "info"}
 
-    lines.append(_format_kv("Packets", str(summary.total_packets)))
-    lines.append(_format_kv("Candidates", str(summary.candidate_count)))
 
-    def _emit_campaign_rollup_tables() -> None:
-        if getattr(summary, "campaign_summaries", None):
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("Beacon Campaign Summary"))
-            rows = [
-                [
-                    "Campaign",
-                    "Host",
-                    "Cadence",
-                    "Flows",
-                    "Destinations",
-                    "Channels",
-                    "Max Score",
-                ]
-            ]
-            for item in summary.campaign_summaries[:limit]:
-                rows.append(
-                    [
-                        str(item.get("campaign_id", "-")),
-                        str(item.get("host", "-")),
-                        str(item.get("cadence_family", "-")),
-                        str(item.get("flows", "-")),
-                        str(item.get("destinations", "-")),
-                        str(item.get("channels", "-")),
-                        str(item.get("max_score", "-")),
-                    ]
-                )
-            lines.append(_format_table(rows))
+def _assessment(summary: BeaconSummary, classified: list, c2: list) -> tuple[str, str, int, list[str]]:
+    score = 0
+    reasons: list[str] = []
+    http_posts = list(getattr(summary, "http_post_beacons", []) or [])
+    det_cat = getattr(summary, "deterministic_category_checks", {}) or {}
+    det_checks = getattr(summary, "deterministic_checks", {}) or {}
+    # Internal OT-cyclic / benign-service periodicity is the expected shape of
+    # automation; campaign escalators must not inflate it.
+    baseline_only = bool(classified) and not c2
+    critical = [p for p in c2 if p[1].get("severity") == "critical"]
+    high = [p for p in c2 if p[1].get("severity") == "high"]
+    if critical:
+        score += 5
+        reasons.append(f"{len(critical)} critical external/OT beacon(s) (e.g. {critical[0][0].src_ip}->{critical[0][0].dst_ip} "
+                       f"score={critical[0][1]['score']:.2f})")
+    if high:
+        score += min(3, len(high) + 1)
+        reasons.append(f"{len(high)} high-severity external beacon(s) (e.g. {high[0][0].src_ip}->{high[0][0].dst_ip} "
+                       f"score={high[0][1]['score']:.2f})")
+    failed = [p for p in c2 if "failed/refused" in str(p[1].get("label", "")).lower() and p[1].get("is_external")
+              and int(getattr(p[0], "count", 0) or 0) >= 50 and float(getattr(p[0], "periodicity_score", 0.0) or 0.0) >= 0.7]
+    if failed:
+        score += 3
+        reasons.append(f"persistent failed C2 beaconing to a public IP ({failed[0][0].src_ip}->{failed[0][0].dst_ip}, "
+                       f"{failed[0][0].count} attempts)")
+    if not baseline_only:
+        for key, weight, text in (("multi_target_synchronized", 2, "synchronized multi-destination cadence (fan-out C2 shape)"),
+                                  ("cross_protocol_cadence", 2, "cross-protocol cadence reuse on the same pair"),
+                                  ("low_slow_persistence", 1, "low-and-slow persistent periodicity")):
+            if det_cat.get(key):
+                score += weight
+                reasons.append(text)
+    if http_posts:
+        max_risk = max((int(i.get("risk_score", 0) or 0) for i in http_posts), default=0)
+        score += 2 if max_risk >= 3 else 1
+        reasons.append(f"HTTP POST check-in channels ({len(http_posts)}; max risk {max_risk})")
+    if det_checks.get("dns_beaconing_or_tunnel_pattern"):
+        score += 1
+        reasons.append("DNS failover/tunnel semantics (elevated NXDOMAIN)")
+    mgmt = [p for p in c2 if "mgmt" in str(p[1].get("label", "")).lower()]
+    if mgmt and not critical and not high:
+        score += 1
+        reasons.append(f"{len(mgmt)} internal beacon(s) on admin/mgmt ports")
+    if baseline_only:
+        reasons.append("only internal OT-cyclic / benign-service periodicity (baseline, not C2)")
+    if score >= 7:
+        return "YES - high-confidence C2-style beaconing", "High", score, reasons
+    if score >= 4:
+        return "LIKELY - external beaconing with corroboration", "Medium", score, reasons
+    if score >= 2:
+        return "POSSIBLE - weak-to-moderate beaconing indicators", "Low", score, reasons
+    if baseline_only:
+        return "BASELINE - periodic traffic looks like automation, not C2", "Low", score, reasons
+    return "NO STRONG SIGNAL after filtering", "Low", score, reasons
 
-        if getattr(summary, "host_rollups", None):
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("Host-Centric Verdict Rollup"))
-            rows = [
-                [
-                    "Host",
-                    "Candidates",
-                    "Channels",
-                    "Destinations",
-                    "Top Cadence",
-                    "Max Score",
-                ]
-            ]
-            for item in summary.host_rollups[:limit]:
-                channels = item.get("channels", [])
-                channel_text = (
-                    ",".join(str(v) for v in channels)
-                    if isinstance(channels, list)
-                    else str(channels)
-                )
-                rows.append(
-                    [
-                        str(item.get("host", "-")),
-                        str(item.get("candidate_count", "-")),
-                        channel_text or "-",
-                        str(item.get("destinations", "-")),
-                        f"{float(item.get('top_cadence_s', 0.0) or 0.0):.2f}s",
-                        str(item.get("max_score", "-")),
-                    ]
-                )
-            lines.append(_format_table(rows))
 
+def render_beacon_summary(summary: BeaconSummary, limit: int = 12, verbose: bool = False) -> str:
+    """Beaconing (RITA-style periodicity scoring): the C2-relevant candidates
+    ranked by severity, with cadence, jitter, timeline and the next command
+    to run; OT-cyclic and service periodicity is summarized as baseline.
+    The full score table, timelines and the assessment are -v."""
+    rep = st.Report("Beacons", summary.path)
+    findings = findings_for(summary, ot=False)
     candidates = list(getattr(summary, "candidates", []) or [])
-    classified = [(cand, _beacon_classify(cand)) for cand in candidates]
-    # C2-relevant candidates, ranked by severity then score: the triage queue.
-    c2_candidates = sorted(
-        (pair for pair in classified if pair[1].get("c2_relevant")),
-        key=lambda pair: (
-            _BEACON_SEV_RANK.get(str(pair[1].get("severity")), 0),
-            float(pair[1].get("score", 0.0) or 0.0),
-            int(pair[1].get("count", 0) or 0),
-        ),
-        reverse=True,
-    )
-
-    def _beacon_verdict() -> tuple[str, str, list[str], int]:
-        score = 0
-        reasons: list[str] = []
-        http_posts = list(getattr(summary, "http_post_beacons", []) or [])
-        det_cat = getattr(summary, "deterministic_category_checks", {}) or {}
-        det_checks = getattr(summary, "deterministic_checks", {}) or {}
-
-        # If every candidate is internal OT-cyclic / benign-service periodicity,
-        # the capture is baseline automation: synchronized/low-slow cadence among
-        # those flows is the *expected* shape (a SCADA master polling its PLCs),
-        # so the campaign-level escalators below must not inflate the verdict.
-        baseline_only = bool(classified) and not c2_candidates
-
-        # The strongest C2 signal is a periodic flow crossing to a public peer.
-        critical_ext = [p for p in c2_candidates if p[1].get("severity") == "critical"]
-        high_ext = [p for p in c2_candidates if p[1].get("severity") == "high"]
-        if critical_ext:
-            score += 5
-            top = critical_ext[0]
-            reasons.append(
-                f"{len(critical_ext)} critical external/OT beacon(s) "
-                f"(e.g. {top[0].src_ip}->{top[0].dst_ip} score={top[1]['score']:.2f})"
-            )
-        if high_ext:
-            score += min(3, len(high_ext) + 1)
-            top = high_ext[0]
-            reasons.append(
-                f"{len(high_ext)} high-severity external beacon(s) "
-                f"(e.g. {top[0].src_ip}->{top[0].dst_ip} score={top[1]['score']:.2f})"
-            )
-
-        # Persistent, high-volume failed/refused beaconing to a public peer is
-        # itself strong infection evidence (an internal host calling home to a
-        # dead/blocked C2 on a fixed cadence), even though no session ever
-        # established - so it escalates the verdict on its own.
-        failed_ext_strong = [
-            p
-            for p in c2_candidates
-            if "failed/refused" in str(p[1].get("label", "")).lower()
-            and p[1].get("is_external")
-            and int(getattr(p[0], "count", 0) or 0) >= 50
-            and float(getattr(p[0], "periodicity_score", 0.0) or 0.0) >= 0.7
-        ]
-        if failed_ext_strong:
-            score += 3
-            top = failed_ext_strong[0]
-            reasons.append(
-                f"Persistent failed C2 beaconing to a public IP "
-                f"({top[0].src_ip}->{top[0].dst_ip}, {top[0].count} attempts) — "
-                "infected host calling a dead/blocked C2"
-            )
-
-        # Campaign-level escalators (suppressed when only baseline OT/service
-        # periodicity is present, since that cadence is expected automation).
-        if not baseline_only:
-            if det_cat.get("multi_target_synchronized"):
-                score += 2
-                reasons.append(
-                    "Synchronized multi-destination cadence (fan-out C2 shape)"
-                )
-            if det_cat.get("cross_protocol_cadence"):
-                score += 2
-                reasons.append("Cross-protocol cadence reuse on the same pair")
-            if det_cat.get("low_slow_persistence"):
-                score += 1
-                reasons.append("Low-and-slow persistent periodicity")
-
-        if http_posts:
-            max_http_risk = max(
-                (int(item.get("risk_score", 0) or 0) for item in http_posts), default=0
-            )
-            score += 2 if max_http_risk >= 3 else 1
-            reasons.append(
-                f"HTTP POST check-in channel(s) ({len(http_posts)}; max risk={max_http_risk})"
-            )
-        if det_checks.get("dns_beaconing_or_tunnel_pattern"):
-            score += 1
-            reasons.append("DNS failover/tunnel semantics (elevated NXDOMAIN)")
-
-        # Internal mgmt-port persistence is a lateral/persistence lead (weaker
-        # than external C2 but still actionable).
-        mgmt_internal = [p for p in c2_candidates if "mgmt" in str(p[1].get("label", "")).lower()]
-        if mgmt_internal and not critical_ext and not high_ext:
-            score += 1
-            reasons.append(
-                f"{len(mgmt_internal)} internal beacon(s) on admin/mgmt ports (lateral/persistence)"
-            )
-
-        # OT-internal cyclic and benign-service periodicity are baseline; they do
-        # NOT raise the verdict (recorded under 'Likely Benign' instead).
-        if baseline_only:
-            reasons.append(
-                "Only internal OT-cyclic / benign-service periodicity observed "
-                "(baseline, not C2)"
-            )
-
-        if score >= 7:
-            verdict = "YES - high-confidence C2-style beaconing is present."
-            confidence = "High"
-        elif score >= 4:
-            verdict = "LIKELY - external beaconing indicators with corroboration."
-            confidence = "Medium"
-        elif score >= 2:
-            verdict = "POSSIBLE - weak-to-moderate beaconing indicators present."
-            confidence = "Low"
-        elif baseline_only:
-            verdict = "BASELINE - periodic traffic looks like expected automation, not C2."
-            confidence = "Low"
-        else:
-            verdict = "NO STRONG SIGNAL - no convincing beaconing activity after filtering."
-            confidence = "Low"
-
-        if not reasons:
-            reasons.append("No beaconing heuristic crossed a high-confidence threshold")
-        return verdict, confidence, reasons, score
-
-    verdict, confidence, verdict_reasons, verdict_score = _beacon_verdict()
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Analyst Verdict"))
-    if verdict.startswith("YES"):
-        lines.append(danger(verdict))
-    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
-        lines.append(warn(verdict))
-    else:
-        lines.append(ok(verdict))
-    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
-    lines.append(muted("Why:"))
-    for reason in verdict_reasons[: _limit_value(8)]:
-        lines.append(muted(f"- {_redact_in_text(reason)}"))
-
-    # Focus Here First: the C2-relevant candidates with a per-lead action.
-    if c2_candidates:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Focus Here First (C2-relevant beacons)"))
-        for idx, (cand, info) in enumerate(c2_candidates[: _limit_value(6)], start=1):
-            sev = str(info.get("severity", "info")).upper()
-            sev_style = (
-                danger if sev in {"CRITICAL", "HIGH"} else warn if sev == "WARNING" else muted
-            )
-            port_value = cand.src_port or cand.dst_port
-            cadence = f"{cand.mean_interval:.0f}s" if cand.mean_interval else "-"
-            lines.append(
-                sev_style(
-                    f"{idx}. [{sev}] {_highlight_public_ips(cand.src_ip)} -> "
-                    f"{_highlight_public_ips(cand.dst_ip)} {cand.proto}"
-                    f"{('/' + str(port_value)) if port_value else ''} - {info['label']}"
-                )
-            )
-            lines.append(
-                muted(
-                    f"   cadence≈{cadence} jitter={cand.jitter:.2f} count={cand.count} "
-                    f"score={cand.score:.2f} {sparkline(cand.timeline)}"
-                )
-            )
-            lines.append(muted(f"   run:  pcapper <capture> {info['action']}"))
-
-    # Likely benign / don't chase: surface the baseline periodicity explicitly.
-    benign_labels: Counter[str] = Counter()
-    for _cand, info in classified:
-        if not info.get("c2_relevant"):
-            benign_labels[str(info.get("label"))] += 1
-    if benign_labels:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Likely Benign / Don't Chase"))
-        for label_text, count in benign_labels.most_common(_limit_value(5)):
-            lines.append(muted(f"- {label_text}: {count} flow(s)"))
-        lines.append(
-            muted(
-                "- OT/control periodicity and steady service traffic are the baseline; "
-                "confirm against a process/asset baseline before escalating, and treat "
-                "anything inside a change window as expected."
-            )
-        )
-
+    classified = [(c, _beacon_classify(c)) for c in candidates]
+    c2 = sorted((p for p in classified if p[1].get("c2_relevant")),
+                key=lambda p: (_BEACON_SEV_RANK.get(str(p[1].get("severity")), 0), float(p[1].get("score", 0.0) or 0.0),
+                               int(p[1].get("count", 0) or 0)), reverse=True)
+    if not candidates and not st.material(findings):
+        return rep.absent("beaconing candidates", summary.errors)
+    # The headline weighs the analyzer's detections and its candidate triage
+    # together; the candidates themselves are listed once, in "Beacons".
+    triage = [st.finding({"severity": _SEV_MAP.get(str(i.get("severity")), "info"), "title": str(i["label"])}) for _c, i in c2]
+    severity, text = st.verdict(findings + triage, high="C2-style beaconing: investigate", medium="periodic traffic to review",
+                                clean="periodic traffic looks like automation (baseline)")
+    if findings:
+        text = text.replace(st.plural(len(findings) + len(triage), "finding"), st.plural(len(findings), "finding"))
+    rep.headline(severity, text, st.join([
+        st.plural(summary.candidate_count, "candidate"), st.bad(f"{len(c2)} C2-relevant") if c2 else "0 C2-relevant",
+        f"{len(classified) - len(c2)} baseline", f"{st.count(summary.total_packets)} packets",
+    ]))
     if summary.errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        for err in summary.errors:
-            lines.append(danger(f"- {err}"))
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Findings", st.findings_block(findings))
 
-    # ---- Supporting detail (campaigns, rollups, full candidate table) -------
-    _emit_campaign_rollup_tables()
+    def _port(c: object) -> str:
+        port = c.src_port or c.dst_port
+        return f"{c.proto}/{port}" if port else str(c.proto)
 
-    if summary.candidates:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Supporting Detail :: Beacon Candidates (RITA-style scoring)"))
-        rows = [
-            [
-                "Src",
-                "Dst",
-                "Proto",
-                "Count",
-                "Duration",
-                "Mean",
-                "MAD",
-                "Avg Bytes",
-                "Size MAD",
-                "Periodicity",
-                "Size",
-                "Duration",
-                "Count",
-                "Score",
-            ]
-        ]
-        for cand in summary.candidates[:limit]:
-            if cand.src_port and cand.dst_port:
-                proto_label = f"{cand.proto}:{cand.src_port}->{cand.dst_port}"
-            elif cand.src_port:
-                proto_label = f"{cand.proto}:{cand.src_port}"
-            else:
-                proto_label = cand.proto
-            score_text = f"{cand.score:.2f}"
-            if cand.score >= 0.85:
-                score_text = danger(score_text)
-            elif cand.score >= 0.65:
-                score_text = warn(score_text)
-            else:
-                score_text = ok(score_text)
-            duration_text = (
-                format_duration(cand.duration_seconds) if cand.duration_seconds else "-"
-            )
-            rows.append(
-                [
-                    cand.src_ip,
-                    cand.dst_ip,
-                    proto_label,
-                    str(cand.count),
-                    duration_text,
-                    f"{cand.mean_interval:.2f}s",
-                    f"{cand.mad_interval:.2f}s",
-                    f"{cand.avg_bytes:.0f}",
-                    f"{cand.mad_bytes:.0f}",
-                    f"{cand.periodicity_score:.2f}",
-                    f"{cand.size_score:.2f}",
-                    f"{cand.duration_score:.2f}",
-                    f"{cand.count_score:.2f}",
-                    score_text,
-                ]
-            )
-        lines.append(_format_table(rows))
-        lines.append(
-            muted(
-                "Scores: Periodicity=1-MAD/Median interval, Size=1-MAD/Median bytes, "
-                "Duration=duration/1h, Count=connections/50. Total score is weighted."
-            )
-        )
+    rep.section("Beacons", st.table(
+        ["Severity", "Flow", "Proto", "What", "Cadence", "Jitter", "Events", "Score", "Timeline"],
+        [[st.badge(_SEV_MAP.get(str(i.get("severity")), "info")), st.flow(c.src_ip, c.dst_ip), _port(c), i["label"],
+          f"{c.mean_interval:.0f}s" if c.mean_interval else "-", f"{c.jitter:.2f}", st.count(c.count), f"{c.score:.2f}",
+          sparkline(c.timeline)] for c, i in c2],
+        align="llllrrrrl", widths=(None, None, None, 44), max_rows=8, noun="beacon",
+    ) + [f"  {st.dim('next:')} pcapper <capture> {action}" for action in list(dict.fromkeys(i["action"] for _c, i in c2))[:3]])
+    posts = list(getattr(summary, "http_post_beacons", []) or [])
+    rep.section("HTTP POST check-ins", st.table(
+        ["Source", "Destination", "Host", "URIs", "Requests", "Bytes", "Stability", "Linked", "Risk", "Why"],
+        [[i.get("src", "-"), i.get("dst", "-"), i.get("host", "-"), i.get("uri", "-"), int(i.get("requests", 0) or 0),
+          st.size(int(i.get("bytes", 0) or 0)), f"{float(i.get('size_stability', 0.0) or 0.0):.2f}",
+          f"{float(i.get('linked_beacon_score', 0.0) or 0.0):.2f}", int(i.get("risk_score", 0) or 0),
+          _redact_in_text(", ".join(str(r) for r in (i.get("risk_reasons") or [])))] for i in posts],
+        align="llllrrrrrl", widths=(None, None, 30, 40), max_rows=8, noun="channel",
+    ))
+    baseline = Counter(str(i.get("label")) for _c, i in classified if not i.get("c2_relevant"))
+    rep.section("Baseline", st.kv([("Not C2", st.top(baseline, 5, fmt=lambda k, v: f"{k} ({v} flows)"))])
+                + ([st.dim("  OT/control periodicity and steady service traffic are the baseline: confirm against a process "
+                           "baseline before escalating.")] if baseline else []))
+    campaigns = list(getattr(summary, "campaign_summaries", None) or [])
+    rep.section("Campaigns", st.table(
+        ["Campaign", "Host", "Cadence", "Flows", "Destinations", "Channels", "Max score"],
+        [[i.get("campaign_id", "-"), i.get("host", "-"), i.get("cadence_family", "-"), i.get("flows", "-"), i.get("destinations", "-"),
+          i.get("channels", "-"), i.get("max_score", "-")] for i in campaigns], max_rows=8, noun="campaign",
+    ))
+    rollups = list(getattr(summary, "host_rollups", None) or [])
+    rep.section("Hosts", st.table(
+        ["Host", "Candidates", "Channels", "Destinations", "Top cadence", "Max score"],
+        [[i.get("host", "-"), i.get("candidate_count", "-"), ",".join(str(v) for v in i.get("channels", []) or []) or "-",
+          i.get("destinations", "-"), f"{float(i.get('top_cadence_s', 0.0) or 0.0):.2f}s", i.get("max_score", "-")] for i in rollups],
+        max_rows=8, noun="host",
+    ))
 
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Beacon Timelines"))
-        for cand in summary.candidates[:limit]:
-            graph = sparkline(cand.timeline)
-            lines.append(f"{cand.src_ip} -> {cand.dst_ip}  {graph}")
-            if verbose:
-                lines.append(
-                    muted(
-                        "  Mean {mean:.2f}s | Median {median:.2f}s | MAD {mad:.2f}s | "
-                        "Avg Bytes {avg_bytes:.0f} | Size MAD {size_mad:.0f} | "
-                        "Scores P:{p:.2f} S:{s:.2f} D:{d:.2f} C:{c:.2f} | Total {score:.2f}".format(
-                            mean=cand.mean_interval,
-                            median=cand.median_interval,
-                            mad=cand.mad_interval,
-                            avg_bytes=cand.avg_bytes,
-                            size_mad=cand.mad_bytes,
-                            p=cand.periodicity_score,
-                            s=cand.size_score,
-                            d=cand.duration_score,
-                            c=cand.count_score,
-                            score=cand.score,
-                        )
-                    )
-                )
+    verdict, confidence, score, reasons = _assessment(summary, classified, c2)
+    rep.section("Assessment", st.kv([("Verdict", verdict), ("Confidence", f"{confidence} (score={score})")])
+                + st.bullets([_redact_in_text(r) for r in reasons], max_items=None), detail=True)
 
-    detections = _filtered_detections(summary, verbose)
-    if detections:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Detections"))
-        for item in detections:
-            severity = item.get("severity", "info")
-            summary_text = str(item.get("summary", ""))
-            details = str(item.get("details", ""))
-            if severity == "warning":
-                marker = warn("[WARN]")
-            elif severity == "critical":
-                marker = danger("[CRIT]")
-            else:
-                marker = ok("[INFO]")
-            lines.append(f"{marker} {summary_text}")
-            if details:
-                lines.append(muted(f"  {details}"))
-            top_sources = item.get("top_sources")
-            if isinstance(top_sources, list) and top_sources:
-                src_text = ", ".join(
-                    f"{ip}({count})" for ip, count in top_sources[: _limit_value(6)]
-                )
-                lines.append(muted(f"  Sources: {src_text}"))
-            top_destinations = item.get("top_destinations")
-            if isinstance(top_destinations, list) and top_destinations:
-                dst_text = ", ".join(
-                    f"{ip}({count})"
-                    for ip, count in top_destinations[: _limit_value(6)]
-                )
-                lines.append(muted(f"  Destinations: {dst_text}"))
-            evidence_items = item.get("evidence", [])
-            if isinstance(evidence_items, list) and evidence_items:
-                for evidence in evidence_items[: _limit_value(8)]:
-                    lines.append(muted(f"    - {_redact_in_text(str(evidence))}"))
+    def _proto_label(c: object) -> str:
+        if c.src_port and c.dst_port:
+            return f"{c.proto}:{c.src_port}->{c.dst_port}"
+        return f"{c.proto}:{c.src_port}" if c.src_port else str(c.proto)
 
-    checks = getattr(summary, "protocol_beacon_checks", {}) or {}
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Deterministic Beacon Checks"))
-    protocol_labels = [
-        ("dns", "DNS"),
-        ("http_https", "HTTP/HTTPS"),
-        ("icmp", "ICMP"),
-        ("ntp", "NTP"),
-    ]
-    for key, proto_label in protocol_labels:
-        evidence = checks.get(key) if isinstance(checks, dict) else []
-        evidence_items = [str(item) for item in (evidence or []) if str(item).strip()]
-        if evidence_items:
-            lines.append(
-                danger(
-                    f"Yes, there is evidence for {proto_label} beaconing, here is the evidence:"
-                )
-            )
-            for item in evidence_items[: _limit_value(10)]:
-                lines.append(muted(f"  - {_redact_in_text(item)}"))
-        else:
-            lines.append(
-                ok(f"No, there is no strong evidence for {proto_label} beaconing.")
-            )
+    def _score(value: float) -> str:
+        text = f"{value:.2f}"
+        return st.bad(text) if value >= 0.85 else st.caution(text) if value >= 0.65 else text
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Deterministic Beacon Category Checks"))
-    category_checks = getattr(summary, "deterministic_category_checks", {}) or {}
-    category_labels = [
-        ("single_target_periodic_c2", "Single-Target Periodic C2"),
-        ("multi_target_synchronized", "Multi-Target Synchronized Beaconing"),
-        ("cross_protocol_cadence", "Cross-Protocol Cadence Reuse"),
-        ("burst_sleep_pattern", "Burst-Sleep Beacon Profile"),
-        ("low_slow_persistence", "Low-and-Slow Persistence"),
-        ("benign_periodic_likely", "Likely Benign Periodic Pattern"),
-    ]
-
-    for key, label_text in category_labels:
-        evidence = (
-            category_checks.get(key, []) if isinstance(category_checks, dict) else []
-        )
-        evidence_items = [str(item) for item in (evidence or []) if str(item).strip()]
-        lines.append(label(label_text))
-        if evidence_items:
-            if key == "benign_periodic_likely":
-                lines.append(
-                    ok(
-                        f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
-                    )
-                )
-            else:
-                lines.append(
-                    warn(
-                        f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
-                    )
-                )
-            for item in evidence_items[: _limit_value(10 if verbose else 6)]:
-                lines.append(muted(f"- {_redact_in_text(item)}"))
-        else:
-            lines.append(
-                ok(
-                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
-                )
-            )
-
-    # (Per-candidate timeline sparklines are shown once under "Beacon Timelines"
-    # above and in the Focus Here First queue; the duplicate heatmap was removed.)
-
-    explainability = list(getattr(summary, "explainability", []) or [])
-    if explainability:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Explainability"))
-        for item in explainability[: _limit_value(12 if verbose else 8)]:
-            lines.append(muted(f"- {_redact_in_text(str(item))}"))
-
-    http_post_beacons = list(getattr(summary, "http_post_beacons", []) or [])
-    if http_post_beacons:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("HTTP POST Beacon Discovery"))
-        rows = [
-            [
-                "Source",
-                "Destination",
-                "Host",
-                "URI(s)",
-                "Req",
-                "Bytes",
-                "Stability",
-                "Linked",
-                "Risk",
-                "Packets",
-            ]
-        ]
-        for item in http_post_beacons[: _limit_value(10)]:
-            rows.append(
-                [
-                    str(item.get("src", "-")),
-                    str(item.get("dst", "-")),
-                    str(item.get("host", "-")),
-                    str(item.get("uri", "-")),
-                    str(int(item.get("requests", 0) or 0)),
-                    str(int(item.get("bytes", 0) or 0)),
-                    f"{float(item.get('size_stability', 0.0) or 0.0):.2f}",
-                    f"{float(item.get('linked_beacon_score', 0.0) or 0.0):.2f}",
-                    str(int(item.get("risk_score", 0) or 0)),
-                    str(item.get("packet_examples", "-")),
-                ]
-            )
-        lines.append(_format_table(rows))
-        lines.append(muted("HTTP POST Beacon Evidence Details:"))
-        for item in http_post_beacons[: _limit_value(10 if verbose else 6)]:
-            reason_values = item.get("risk_reasons", [])
-            reason_text = (
-                ", ".join(str(v) for v in reason_values[:3])
-                if isinstance(reason_values, list) and reason_values
-                else "-"
-            )
-            lines.append(
-                muted(
-                    f"- {item.get('src')}->{item.get('dst')} host={item.get('host')} risk={int(item.get('risk_score', 0) or 0)} "
-                    f"why={_redact_in_text(reason_text)}"
-                )
-            )
-            sample_text = str(item.get("sample", "") or "").strip()
-            if sample_text and sample_text != "-":
-                lines.append(muted(f"  sample={_redact_in_text(sample_text[:120])}"))
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    rep.section("Candidates", st.table(
+        ["Source", "Destination", "Proto", "Count", "Duration", "Mean", "MAD", "Avg bytes", "Size MAD", "Periodicity", "Size",
+         "Duration score", "Count score", "Score", "First", "Last"],
+        [[c.src_ip, c.dst_ip, _proto_label(c), c.count, format_duration(c.duration_seconds) if c.duration_seconds else "-",
+          f"{c.mean_interval:.2f}s", f"{c.mad_interval:.2f}s", f"{c.avg_bytes:.0f}", f"{c.mad_bytes:.0f}", f"{c.periodicity_score:.2f}",
+          f"{c.size_score:.2f}", f"{c.duration_score:.2f}", f"{c.count_score:.2f}", _score(c.score), st.ts(c.first_seen), st.ts(c.last_seen)]
+         for c in candidates],
+        align="lllrlrrrrrrrrrll", max_rows=None,
+    ) + [st.dim("  Periodicity = 1 - MAD/median interval · Size = 1 - MAD/median bytes · Duration = span/1h · Count = events/50 · "
+                "total is weighted")], detail=True)
+    rep.section("Timelines", [f"  {st.flow(c.src_ip, c.dst_ip)}  {sparkline(c.timeline)}  " + st.dim(
+        f"median {c.median_interval:.2f}s · events {c.count} · established {float(getattr(c, 'established_ratio', 0.0) or 0.0):.0%} "
+        f"· data {st.size(int(getattr(c, 'data_bytes', 0) or 0))}") for c in candidates], detail=True)
+    rep.section("Explainability", st.bullets([_redact_in_text(str(i)) for i in (getattr(summary, "explainability", None) or [])],
+                                             max_items=None), detail=True)
+    hyp = [f"[{h.get('confidence', '?')}] {h.get('hypothesis', '-')}" for h in (getattr(summary, "threat_hypotheses", None) or [])
+           if isinstance(h, dict)]
+    rep.section("Threat hypotheses", st.bullets(hyp, max_items=None), detail=True)
+    rep.section("Benign context", st.bullets([str(b) for b in (getattr(summary, "benign_context", None) or [])], max_items=None),
+                detail=True)
+    if st.analysis_sections():
+        proto_checks = getattr(summary, "protocol_beacon_checks", {}) or {}
+        cat_checks = getattr(summary, "deterministic_category_checks", {}) or {}
+        lines: list[str] = []
+        for key, label_text in (("dns", "DNS"), ("http_https", "HTTP/HTTPS"), ("icmp", "ICMP"), ("ntp", "NTP"),
+                                ("single_target_periodic_c2", "Single-Target Periodic C2"),
+                                ("multi_target_synchronized", "Multi-Target Synchronized Beaconing"),
+                                ("cross_protocol_cadence", "Cross-Protocol Cadence Reuse"), ("burst_sleep_pattern", "Burst-Sleep"),
+                                ("low_slow_persistence", "Low-and-Slow Persistence"), ("benign_periodic_likely", "Likely Benign Periodic")):
+            evidence = [str(v) for v in ((proto_checks.get(key) if key in proto_checks else cat_checks.get(key)) or []) if str(v).strip()]
+            if evidence:
+                lines.append(f"  {st.strong(label_text)}")
+                lines += st.bullets([_redact_in_text(e) for e in evidence], max_items=None, indent=4)
+        rep.section("Deterministic checks", lines)
+    return rep.render()

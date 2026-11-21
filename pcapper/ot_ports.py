@@ -58,3 +58,12 @@ OT_PORT_PROTOCOLS: dict[int, str] = {
     48898: "ADS/AMS",
     48899: "ADS/AMS",
 }
+
+
+def foreign_service_reply(sport: int, server_ports) -> bool:
+    """A reply from another service: the source is a well-known or OT
+    service port that is not one of ``server_ports``, so a destination equal
+    to one of them is the peer's ephemeral port by coincidence -- a Modbus
+    slave on 502 answering a master whose source port is 2222, 3671 or 20000
+    is not EtherNet/IP, KNXnet/IP or DNP3."""
+    return sport not in server_ports and (sport < 1024 or sport in OT_PORT_PROTOCOLS)

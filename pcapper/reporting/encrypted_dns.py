@@ -1,27 +1,21 @@
-"""Rendered output for encrypted_dns analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for encrypted DNS (DoT, DoH, DoQ): resolution that a
+DNS sensor cannot see, and who uses it."""
 
 from __future__ import annotations
-from ..coloring import (
-    header,
-)
-from ..encrypted_dns import EncryptedDnsSummary
 
-from ._common import (
-    _finalize_output,
-    _format_counter,
-    _format_kv,
-)
+from ..encrypted_dns import EncryptedDnsSummary
+from ._kv import counter_line, simple_report
 
 
 def render_encrypted_dns_summary(summary: EncryptedDnsSummary) -> str:
-    lines = [header("ENCRYPTED DNS ANALYSIS")]
-    lines.append(_format_kv("DoT Packets", str(summary.dot_packets)))
-    lines.append(_format_kv("DoH Packets", str(summary.doh_packets)))
-    lines.append(_format_kv("DoQ Packets", str(summary.doq_packets)))
-    lines.append(_format_kv("Top Clients", _format_counter(summary.clients, 5)))
-    lines.append(_format_kv("Top Servers", _format_counter(summary.servers, 5)))
-    return _finalize_output(lines)
+    packets = summary.dot_packets + summary.doh_packets + summary.doq_packets
+    return simple_report(
+        "Encrypted DNS", summary, packets=packets, unit="encrypted DNS packets",
+        clients=summary.clients, servers=summary.servers,
+        facts_title="Resolution",
+        facts=[("DoT / DoH / DoQ", f"{summary.dot_packets} / {summary.doh_packets} / {summary.doq_packets} packets"),
+               counter_line("Clients", summary.clients), counter_line("Resolvers", summary.servers)],
+        high="encrypted DNS that bypasses DNS monitoring: confirm the resolvers are sanctioned",
+        medium="encrypted DNS to review",
+        absent="encrypted DNS (DoT/DoH/DoQ) traffic",
+    )

@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from .capture_parts import capture_parts
+from .fifo_feed import FeedRegistry, FifoFeed, can_feed, start_part_feeds
+from .pcap_cache import forget_part_hooks
 from .utils import env_int, executable_path_warnings, open_private, restrict_dir_permissions
 
 
@@ -62,6 +64,7 @@ _STREAM_FIELDS = (
     "tcp.dstport",
     "ipv6.src",
     "ipv6.dst",
+    "frame.number",  # a stream's last one bounds the follow run (tshark -c)
 )
 
 
@@ -111,9 +114,109 @@ def _label_from_row(parts: list[str]) -> str:
     return ""
 
 
+# (tshark preference, display filter) of each protocol --decrypt follows.
+_TLS = ("tls.keylog_file", "tls")
+_SSH = ("ssh.keylog_file", "ssh")
+
+# Stream listings started on a copy of the run's read (pcapper.fifo_feed), by
+# (capture, display filter, preference), until the decryption step takes its.
+_LISTING_FEEDS = FeedRegistry()
+
+
+def _listing_command(source: str, display_filter: str, pref: str | None) -> list[str]:
+    cmd = [_tshark_path() or "tshark"]
+    if pref:
+        cmd.extend(["-o", pref])
+    cmd.extend(["-r", source, "-Y", display_filter, "-T", "fields"])
+    # occurrence=f: take the first occurrence of a field rather than joining all
+    # of them with commas, so a tunnelled packet cannot produce a "0,1" that
+    # fails int() and silently drops the stream from the listing.
+    cmd.extend(["-E", "occurrence=f"])
+    for name in _STREAM_FIELDS:
+        cmd.extend(["-e", name])
+    return cmd
+
+
+def _capture_key(path: Path) -> str:
+    try:
+        return str(Path(path).resolve())
+    except OSError:
+        return str(path)
+
+
+def start_decrypt_feeds(config: DecryptConfig | None, path: Path) -> int:
+    """Start tshark's stream listings for ``--decrypt`` on a copy of the read
+    the run makes of ``path`` -- per part of a split capture, as tshark reads
+    them, each started when the read nears its part (PCAPPER_TSHARK_FEED=0
+    turns it off) -- so they read no file of their own. The number of
+    listings per file."""
+    if config is None or not config.enabled or os.environ.get("PCAPPER_TSHARK_FEED", "1") == "0":
+        return 0
+    if not _tshark_available():
+        return 0
+    listings = [
+        (display_filter, f"{pref_key}:{keylog}")
+        for keylog, (pref_key, display_filter) in ((config.tls_keylog, _TLS), (config.ssh_keylog, _SSH))
+        if keylog
+    ]
+
+    def _start(file: Path) -> None:
+        if not can_feed(file, stdin_ok=True):  # tshark reads ``-r -`` where there are no FIFOs
+            return
+        for display_filter, pref in listings:
+            key = (_capture_key(file), display_filter, pref)
+            if key in _LISTING_FEEDS:
+                continue
+            try:
+                feed = FifoFeed(
+                    file,
+                    lambda source, _workdir, flt=display_filter, prf=pref: _listing_command(source, flt, prf),
+                    timeout=TSHARK_TIMEOUT,
+                    name="tshark",
+                    stdin_ok=True,
+                )
+            except Exception:  # noqa: BLE001 - the listing then reads the file itself
+                continue
+            _LISTING_FEEDS.add(key, feed)
+
+    if listings:
+        start_part_feeds(path, _start)
+    return len(listings)
+
+
+def discard_decrypt_feeds(path: Path | None = None) -> None:
+    """Stop the listings no decryption step took up (one capture's, or all)."""
+    if path is None:
+        _LISTING_FEEDS.discard()
+        return
+    for part in capture_parts(path):
+        _LISTING_FEEDS.discard(_capture_key(part))
+    forget_part_hooks(path)
+
+
+def _fed_listing(
+    path: Path, display_filter: str, pref: str | None
+) -> tuple[bool, subprocess.CompletedProcess[str] | None]:
+    """``(True, process)`` for the listing tshark made from a copy of the
+    run's read (process None: it timed out); ``(False, None)`` when there is
+    none -- no feed, or a copy that fell short -- and the file must be read."""
+    feed = _LISTING_FEEDS.take((_capture_key(path), display_filter, pref))
+    if feed is None:
+        return False, None
+    try:
+        fed = feed.result()
+    except subprocess.TimeoutExpired:
+        return True, None
+    finally:
+        feed.close()
+    if fed is None:
+        return False, None
+    return True, subprocess.CompletedProcess(feed.argv, fed[0], fed[1], fed[2])
+
+
 def _collect_streams(
     path: Path, display_filter: str, pref: str | None
-) -> tuple[list[int], dict[int, str], list[str]]:
+) -> tuple[list[int], dict[int, str], list[str], dict[int, int]]:
     """Enumerate matching TCP streams and label each by its endpoints.
 
     One pass over the capture yields both. The labels used to come from a
@@ -126,28 +229,21 @@ def _collect_streams(
     labelling feature effectively inert.
     """
     errors: list[str] = []
-    cmd = [_tshark_path() or "tshark"]
-    if pref:
-        cmd.extend(["-o", pref])
-    cmd.extend(["-r", str(path), "-Y", display_filter, "-T", "fields"])
-    # occurrence=f: take the first occurrence of a field rather than joining all
-    # of them with commas, so a tunnelled packet cannot produce a "0,1" that
-    # fails int() and silently drops the stream from the listing.
-    cmd.extend(["-E", "occurrence=f"])
-    for name in _STREAM_FIELDS:
-        cmd.extend(["-e", name])
-
-    proc = _run_tshark(cmd)
+    fed, proc = _fed_listing(path, display_filter, pref)
+    if not fed:
+        proc = _run_tshark(_listing_command(str(path), display_filter, pref))
     if proc is None:
         errors.append(
             f"tshark stream listing timed out after {TSHARK_TIMEOUT:.0f}s: {path.name}"
         )
-        return [], {}, errors
+        return [], {}, errors, {}
     if proc.returncode != 0:
         errors.append(proc.stderr.strip() or "tshark stream listing failed.")
-        return [], {}, errors
+        return [], {}, errors, {}
 
     labels: dict[int, str] = {}
+    last_frames: dict[int, int] = {}
+    unbounded: set[int] = set()
     for line in proc.stdout.splitlines():
         parts = _split_fields(line, len(_STREAM_FIELDS))
         if not any(parts):
@@ -158,11 +254,86 @@ def _collect_streams(
             continue
         if not labels.get(stream_id):
             labels[stream_id] = _label_from_row(parts)
-    return sorted(labels), labels, errors
+        try:
+            frame = int(parts[7])
+        except ValueError:
+            unbounded.add(stream_id)
+            continue
+        last_frames[stream_id] = max(frame, last_frames.get(stream_id, 0))
+    for stream_id in unbounded:
+        last_frames.pop(stream_id, None)
+    return sorted(labels), labels, errors, last_frames
 
 
 def _stream_label(stream_id: int, labels: dict[int, str]) -> str:
     return _sanitize_filename(labels.get(stream_id) or f"stream_{stream_id}")
+
+
+# Streams followed per tshark run (each -z adds a few dozen bytes to its
+# command line).
+_FOLLOW_BATCH = 200
+_FOLLOW_START = "\n" + "=" * 67 + "\nFollow: "
+
+
+def _split_follow_output(output: str, wanted: list[tuple[str, int]]) -> dict[tuple[str, int], str]:
+    """The per-stream blocks of one tshark run with a ``-z follow`` tap for
+    each ``(protocol, stream)`` of ``wanted`` -- tshark prints them one after
+    another (last tap first), each exactly what a run following that stream
+    alone prints -- by ``(protocol, stream)``. Empty unless the output splits
+    into exactly one block per tap: a payload that looks like a block header
+    must not cut a stream short."""
+    blocks: dict[tuple[str, int], str] = {}
+    starts = []
+    index = output.find(_FOLLOW_START)
+    while index >= 0:
+        starts.append(index)
+        index = output.find(_FOLLOW_START, index + 1)
+    if len(starts) != len(wanted) or (starts and starts[0] != 0):
+        return {}
+    for position, start in enumerate(starts):
+        end = starts[position + 1] if position + 1 < len(starts) else len(output)
+        block = output[start:end]
+        match = re.match(r"\n=+\nFollow: ([^,\n]+),[^\n]*\nFilter: [^\n]*?(\d+)\n", block)
+        if match is None:
+            return {}
+        blocks[(match.group(1), int(match.group(2)))] = block
+    if sorted(blocks) != sorted(wanted):
+        return {}
+    return blocks
+
+
+def _follow_streams(
+    path: Path, wanted: list[tuple[str, int]], prefs: list[str], last_frame: int | None = None
+) -> dict[tuple[str, int], tuple[str, str]] | None:
+    """Follow several streams -- ``(protocol, stream)``, of every protocol
+    asked for -- in one tshark run: one read of the capture for all of them,
+    not one each, and only up to ``last_frame`` (the last frame of any of
+    them; the frames after it add nothing to their text). Each gets the text
+    a run of its own prints; the run's stderr goes with the first. None when
+    tshark timed out (the caller follows them one by one, so one stalled
+    stream does not cost the others)."""
+    if not wanted:
+        return {}
+    cmd = [_tshark_path() or "tshark"]
+    for pref in prefs:
+        cmd.extend(["-o", pref])
+    cmd.extend(["-r", str(path), "-q"])
+    if last_frame:
+        cmd.extend(["-c", str(last_frame)])
+    for follow_proto, stream_id in wanted:
+        cmd.extend(["-z", f"follow,{follow_proto},ascii,{stream_id}"])
+    proc = _run_tshark(cmd)
+    if proc is None:
+        return None
+    blocks = _split_follow_output(proc.stdout or "", wanted)
+    if not blocks:
+        return {}  # nothing to trust (an error, an old tshark): each on its own
+    results: dict[tuple[str, int], tuple[str, str]] = {}
+    stderr = proc.stderr or ""
+    for item in wanted:
+        results[item] = (blocks[item], stderr)
+        stderr = ""
+    return results
 
 
 def _follow_stream(
@@ -181,119 +352,172 @@ def _follow_stream(
     return proc.stdout, proc.stderr
 
 
-def _decrypt_protocol(
-    path: Path,
-    keylog: Path,
-    output_dir: Path,
-    limit: int,
-    *,
-    protocol: str,
-    pref_key: str,
-    display_filter: str,
-    follow_protos: tuple[str, ...],
-) -> DecryptSummary:
-    """Shared body of :func:`decrypt_tls` and :func:`decrypt_ssh`.
+@dataclass
+class _Protocol:
+    """One protocol ``--decrypt`` follows, and what it found so far."""
 
-    ``follow_protos`` lists the ``-z follow,<proto>`` names to try in order;
-    TLS needs the ``ssl`` fallback for tshark builds that predate the rename.
-    """
-    errors: list[str] = []
-    notes: list[str] = []
-    outputs: list[Path] = []
-    tag = protocol.lower()
+    protocol: str
+    pref_key: str
+    display_filter: str
+    follow_protos: tuple[str, ...]
+    keylog: Path
+    output_dir: Path
+    limit: int
+    errors: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
+    outputs: list[Path] = field(default_factory=list)
+    count: int = 0
+    found_any: bool = False
+    limit_hit: bool = False
 
-    if not _tshark_available():
+    @property
+    def pref(self) -> str:
+        return f"{self.pref_key}:{self.keylog}"
+
+    def summary(self, path: Path) -> DecryptSummary:
         return DecryptSummary(
             path=path,
-            protocol=protocol,
-            keylog_path=keylog,
-            output_dir=output_dir,
-            stream_count=0,
-            outputs=[],
-            errors=["tshark not found on PATH."],
-            notes=[],
+            protocol=self.protocol,
+            keylog_path=self.keylog,
+            output_dir=self.output_dir,
+            stream_count=self.count,
+            outputs=self.outputs,
+            errors=self.errors,
+            notes=self.notes,
         )
-    tool = _tshark_path()
-    if tool:
-        for warning in executable_path_warnings(Path(tool)):
-            errors.append(f"tshark trust warning: {warning}")
 
-    pref = f"{pref_key}:{keylog}"
-    restrict_dir_permissions(output_dir)
-    count = 0
-    found_any = False
-    limit_hit = False
+
+def _tls(keylog: Path, output_dir: Path, limit: int) -> _Protocol:
+    # TLS needs the ``ssl`` fallback for tshark builds that predate the rename.
+    return _Protocol("TLS", _TLS[0], _TLS[1], ("tls", "ssl"), keylog, output_dir, limit)
+
+
+def _ssh(keylog: Path, output_dir: Path, limit: int) -> _Protocol:
+    return _Protocol("SSH", _SSH[0], _SSH[1], ("ssh",), keylog, output_dir, limit)
+
+
+def _decrypt(path: Path, protocols: list[_Protocol]) -> list[DecryptSummary]:
+    """Each protocol's streams listed (from a copy of the run's read when one
+    was started for it), then followed -- every protocol's at once, in one
+    tshark run per part (per ``_FOLLOW_BATCH`` streams), up to the last frame
+    they need -- each stream written to a file of its own. A stream that run
+    gives nothing for is followed on its own (and, for TLS, as ``ssl`` too)."""
+    if not _tshark_available():
+        for job in protocols:
+            job.errors.append("tshark not found on PATH.")
+        return [job.summary(path) for job in protocols]
+    tool = _tshark_path()
+    warnings = [f"tshark trust warning: {warning}" for warning in executable_path_warnings(Path(tool))] if tool else []
+    for job in protocols:
+        job.errors.extend(warnings)
+        restrict_dir_permissions(job.output_dir)
+    prefs = list(dict.fromkeys(job.pref for job in protocols))
     # tshark reads one file at a time: a joined split capture is decrypted
     # part by part (a stream cut by a part boundary is followed in each part).
     parts = capture_parts(path)
     for part_index, part in enumerate(parts):
-        if limit_hit:
+        active = [job for job in protocols if not job.limit_hit]
+        if not active:
             break
-        streams, labels, stream_errors = _collect_streams(part, display_filter, pref)
-        errors.extend(stream_errors)
-        found_any = found_any or bool(streams)
         part_tag = f"p{part_index:03d}_" if len(parts) > 1 else ""
-        for stream_id in streams:
-            if limit and count >= limit:
-                notes.append(f"{protocol} stream limit reached ({limit}).")
-                limit_hit = True
-                break
-            label = _stream_label(stream_id, labels)
-            filename = output_dir / f"{tag}_{part_tag}{stream_id}_{label}.txt"
-            stdout = stderr = ""
-            timed_out = False
-            for index, follow_proto in enumerate(follow_protos):
-                followed = _follow_stream(part, stream_id, pref, follow_proto)
-                if followed is None:
-                    suffix = f" as {follow_proto}" if index else ""
-                    errors.append(
-                        f"tshark timed out after {TSHARK_TIMEOUT:.0f}s following "
-                        f"{protocol} stream {stream_id}{suffix}; skipped."
-                    )
-                    timed_out = True
-                    break
-                stdout, stderr = followed
-                if stdout or not stderr:
-                    break  # got data, or a clean empty result: no fallback needed
-            if timed_out:
-                continue
-            if stderr.strip():
-                errors.append(stderr.strip())
-            if stdout:
-                with open_private(filename, "w", encoding="utf-8", errors="ignore") as handle:
-                    handle.write(stdout)
-                outputs.append(filename)
-                count += 1
-    if not found_any:
-        notes.append(f"No {protocol} streams detected for decryption.")
+        listed = []
+        wanted: list[tuple[_Protocol, int, int | None]] = []
+        for job in active:
+            streams, labels, stream_errors, last_frames = _collect_streams(part, job.display_filter, job.pref)
+            job.errors.extend(stream_errors)
+            job.found_any = job.found_any or bool(streams)
+            listed.append((job, streams, labels))
+            # The streams the limit will let through.
+            room = job.limit - job.count if job.limit else len(streams)
+            wanted.extend((job, stream_id, last_frames.get(stream_id)) for stream_id in streams[: max(room, 0)])
+        prefetched: dict[tuple[str, int], tuple[str, str]] = {}
+        for start in range(0, len(wanted), _FOLLOW_BATCH):
+            batch = wanted[start : start + _FOLLOW_BATCH]
+            frames = [frame for _job, _stream, frame in batch]
+            bound = None if any(frame is None for frame in frames) else max(frames)  # type: ignore[type-var]
+            got = _follow_streams(
+                part, [(job.follow_protos[0], stream_id) for job, stream_id, _frame in batch], prefs, bound
+            )
+            if got:
+                prefetched.update(got)
+        for job, streams, labels in listed:
+            _write_streams(job, part, part_tag, streams, labels, prefetched)
+    for job in protocols:
+        if not job.found_any:
+            job.notes.append(f"No {job.protocol} streams detected for decryption.")
+    return [job.summary(path) for job in protocols]
 
-    return DecryptSummary(
-        path=path,
-        protocol=protocol,
-        keylog_path=keylog,
-        output_dir=output_dir,
-        stream_count=count,
-        outputs=outputs,
-        errors=errors,
-        notes=notes,
-    )
+
+def _write_streams(
+    job: _Protocol,
+    part: Path,
+    part_tag: str,
+    streams: list[int],
+    labels: dict[int, str],
+    prefetched: dict[tuple[str, int], tuple[str, str]],
+) -> None:
+    tag = job.protocol.lower()
+    for stream_id in streams:
+        if job.limit and job.count >= job.limit:
+            job.notes.append(f"{job.protocol} stream limit reached ({job.limit}).")
+            job.limit_hit = True
+            break
+        label = _stream_label(stream_id, labels)
+        filename = job.output_dir / f"{tag}_{part_tag}{stream_id}_{label}.txt"
+        stdout = stderr = ""
+        timed_out = False
+        for index, follow_proto in enumerate(job.follow_protos):
+            followed = prefetched.pop((follow_proto, stream_id), None) if index == 0 else None
+            if followed is None:
+                followed = _follow_stream(part, stream_id, job.pref, follow_proto)
+            if followed is None:
+                suffix = f" as {follow_proto}" if index else ""
+                job.errors.append(
+                    f"tshark timed out after {TSHARK_TIMEOUT:.0f}s following "
+                    f"{job.protocol} stream {stream_id}{suffix}; skipped."
+                )
+                timed_out = True
+                break
+            stdout, stderr = followed
+            if stdout or not stderr:
+                break  # got data, or a clean empty result: no fallback needed
+        if timed_out:
+            continue
+        if stderr.strip():
+            job.errors.append(stderr.strip())
+        if stdout:
+            with open_private(filename, "w", encoding="utf-8", errors="ignore") as handle:
+                handle.write(stdout)
+            job.outputs.append(filename)
+            job.count += 1
 
 
 def decrypt_tls(
     path: Path, keylog: Path, output_dir: Path, limit: int
 ) -> DecryptSummary:
-    return _decrypt_protocol(
-        path, keylog, output_dir, limit,
-        protocol="TLS", pref_key="tls.keylog_file", display_filter="tls",
-        follow_protos=("tls", "ssl"),
-    )
+    return _decrypt(path, [_tls(keylog, output_dir, limit)])[0]
 
 
 def decrypt_ssh(
     path: Path, keylog: Path, output_dir: Path, limit: int
 ) -> DecryptSummary:
-    return _decrypt_protocol(
-        path, keylog, output_dir, limit,
-        protocol="SSH", pref_key="ssh.keylog_file", display_filter="ssh",
-        follow_protos=("ssh",),
-    )
+    return _decrypt(path, [_ssh(keylog, output_dir, limit)])[0]
+
+
+def decrypt_capture(
+    path: Path,
+    *,
+    tls_keylog: Path | None,
+    ssh_keylog: Path | None,
+    tls_output_dir: Path,
+    ssh_output_dir: Path,
+    limit: int,
+) -> list[DecryptSummary]:
+    """TLS and SSH (those with a key log) together: one follow run per part
+    for both. Their summaries, TLS first."""
+    protocols = []
+    if tls_keylog:
+        protocols.append(_tls(tls_keylog, tls_output_dir, limit))
+    if ssh_keylog:
+        protocols.append(_ssh(ssh_keylog, ssh_output_dir, limit))
+    return _decrypt(path, protocols) if protocols else []

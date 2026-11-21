@@ -76,8 +76,12 @@ def _run(pcap: Path, flags: list[str], seed: str) -> str:
 @pytest.mark.parametrize(
     "capture,flags", COMMANDS, ids=[f"{c}{'-'.join(f)}" for c, f in COMMANDS]
 )
-def test_output_does_not_depend_on_hash_seed(capture: str, flags: list[str], pcap) -> None:
+def test_output_does_not_depend_on_hash_seed(capture: str, flags: list[str], pcap, tmp_path: Path) -> None:
     path = pcap(capture)
+    if "--carve" in flags:
+        # The default output is ./carved, which from this cwd is the repo
+        # checkout. Both runs share one directory so the printed paths match.
+        flags = [*flags, "--carve-out", str(tmp_path / "carved")]
     first = _run(path, flags, SEEDS[0])
     second = _run(path, flags, SEEDS[1])
     assert first == second, (

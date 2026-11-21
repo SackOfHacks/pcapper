@@ -3,17 +3,20 @@ from __future__ import annotations
 import base64
 import copy
 import functools
+import gzip
 import inspect
 import ipaddress
 import math
 import os
 import re
 import stat
+import threading
+import zlib
 from collections import Counter, OrderedDict
 from dataclasses import fields, is_dataclass
 from datetime import datetime, timezone
 from functools import lru_cache
-from pathlib import Path
+from pathlib import Path, PurePath
 from typing import Any, Optional
 
 try:
@@ -36,6 +39,10 @@ try:
     from scapy.layers.inet import TCP, UDP  # type: ignore
 except Exception:  # pragma: no cover
     TCP = UDP = None  # type: ignore
+
+from . import progress as _progress
+from .lite import UNSUPPORTED as _LITE_UNSUPPORTED
+from .lite import LitePacket as _LitePacket
 
 PCAPNG_MAGIC = b"\x0a\x0d\x0d\x0a"
 
@@ -227,7 +234,10 @@ def decode_payload(
     if use_cache:
         cached = _DECODE_CACHE.get(key)
         if cached is not None:
-            _DECODE_CACHE.move_to_end(key)
+            try:
+                _DECODE_CACHE.move_to_end(key)
+            except KeyError:  # evicted by another thread (shared analysis pass)
+                pass
             return cached
     try:
         text = view.decode(encoding, errors="ignore")
@@ -238,7 +248,10 @@ def decode_payload(
     if use_cache:
         _DECODE_CACHE[key] = text
         if len(_DECODE_CACHE) > _DECODE_CACHE_MAX_ITEMS:
-            _DECODE_CACHE.popitem(last=False)
+            try:
+                _DECODE_CACHE.popitem(last=False)
+            except KeyError:
+                pass
     return text
 
 
@@ -481,8 +494,110 @@ def set_add_cap(
     target.add(value)
 
 
+GZIP_MAGIC = b"\x1f\x8b"
+
+
+def file_version(path: Path) -> Optional[tuple[str, int, int]]:
+    """``(real path, size, mtime_ns)``: what a fact about a file's bytes is
+    cached under (None when it cannot be stat'ed)."""
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return (os.path.realpath(path), st.st_size, st.st_mtime_ns)
+
+
+def _inflate_start(path: str, size: int) -> bytes:
+    """The first ``size`` inflated bytes of a gzip file, read 4 KiB at a time
+    (the gzip module reads 128 KiB of compressed data for even a few bytes)."""
+    out = bytearray()
+    inflate = zlib.decompressobj(16 + zlib.MAX_WBITS)
+    try:
+        with open(path, "rb", buffering=0) as handle:
+            while len(out) < size:
+                if inflate.eof:  # the next member of a concatenated file
+                    data = inflate.unused_data or handle.read(4096)
+                    inflate = zlib.decompressobj(16 + zlib.MAX_WBITS)
+                else:
+                    data = handle.read(4096)
+                if not data:
+                    break
+                out += inflate.decompress(data)
+    except zlib.error as exc:
+        raise OSError(f"not a readable gzip file: {exc}") from exc
+    return bytes(out[:size])
+
+
+@functools.lru_cache(maxsize=512)
+def _capture_head(version: tuple[str, int, int]) -> tuple[bool, bytes]:
+    """(gzip-compressed?, the first 64 bytes a reader sees) of one version of
+    a file. Every analysis used to sniff the capture again -- two opens and a
+    buffered 128 KB read each, 326 opens for one --overview -- for answers
+    that only change when the file does."""
+    path = version[0]
+    with open(path, "rb", buffering=0) as handle:
+        gz = handle.read(2) == GZIP_MAGIC
+    if gz:
+        return True, _inflate_start(path, 64)
+    with open(path, "rb", buffering=0) as handle:
+        return False, handle.read(64)
+
+
+@functools.lru_cache(maxsize=64)
+def _capture_prefix(version: tuple[str, int, int], size: int) -> bytes:
+    path = version[0]
+    with open(path, "rb", buffering=0) as handle:
+        gz = handle.read(2) == GZIP_MAGIC
+    if gz:
+        return _inflate_start(path, size)
+    with open(path, "rb", buffering=0) as handle:
+        return handle.read(size)
+
+
+def capture_prefix(path: Path, size: int = 1 << 16) -> bytes:
+    """The first ``size`` bytes of a capture as its readers see them
+    (inflated for ``.pcap.gz``), read with as little as that takes; for
+    header checks that need more than :func:`capture_head` keeps."""
+    version = file_version(path)
+    if version is None:
+        raise OSError(f"cannot stat {path}")
+    return _capture_prefix(version, size)
+
+
+def capture_head(path: Path) -> bytes:
+    """The first 64 bytes of a capture as its readers see them (decompressed
+    for ``.pcap.gz``); raises OSError when it cannot be read."""
+    version = file_version(path)
+    if version is None:
+        raise OSError(f"cannot stat {path}")
+    return _capture_head(version)[1]
+
+
+def is_gzip_file(path: Path) -> bool:
+    version = file_version(path)
+    if version is None:
+        return False
+    try:
+        with open(version[0], "rb", buffering=0) as handle:
+            return handle.read(2) == GZIP_MAGIC
+    except OSError:
+        return False
+
+
+def open_capture_file(path: Path, buffering: int = -1):  # type: ignore[no-untyped-def]
+    """A capture's bytes for reading: decompressed for a gzip-compressed
+    capture (``.pcap.gz``), as scapy's readers read it. Hashes are still taken
+    over the file as given. A reader of a header passes a small ``buffering``:
+    the default reads 128 KiB ahead, all of a small capture."""
+    path = Path(path)
+    if is_gzip_file(path):
+        return gzip.open(path, "rb")
+    return path.open("rb", buffering=buffering)
+
+
 def detect_file_type(path: Path) -> str:
-    """Classify a capture by magic number: ``pcapng``, ``pcap`` or ``unknown``.
+    """Classify a capture by magic number: ``pcapng``, ``pcap`` or ``unknown``
+    (a gzip-compressed capture by the magic inside it).
 
     ``unknown`` used to be reported as ``pcap``; scapy then raised on open and
     the analyzers fell back to an empty reader, so a non-capture target
@@ -490,8 +605,7 @@ def detect_file_type(path: Path) -> str:
     reader treat ``unknown`` as a hard error instead.
     """
     try:
-        with path.open("rb") as handle:
-            header = handle.read(4)
+        header = capture_head(path)[:4]
     except Exception:
         return "unknown"
     return capture_type_from_header(header)
@@ -657,6 +771,22 @@ def is_public_ip(value: str) -> bool:
     return obj is not None and bool(obj.is_global) and not obj.is_multicast
 
 
+def gateway_macs(ip_mac_counts: dict) -> set[str]:
+    """MACs that frames pair with two or more public IPv4 addresses: a
+    router's. It forwards for every off-link address, so its MAC rides on all
+    of their frames, while one host rarely holds two public IPv4 addresses.
+    (IPv4 only: one host routinely holds several global IPv6 addresses.)"""
+    public_v4: dict[str, set[str]] = {}
+    for ip_value, counter in (ip_mac_counts or {}).items():
+        if ":" in str(ip_value) or not is_public_ip(str(ip_value)):
+            continue
+        for mac in counter or ():
+            mac_text = str(mac or "").strip().lower()
+            if mac_text and mac_text != "00:00:00:00:00:00":
+                public_v4.setdefault(mac_text, set()).add(str(ip_value))
+    return {mac for mac, ips in public_v4.items() if len(ips) >= 2}
+
+
 def is_private_ip(value: str) -> bool:
     obj = ip_object(value)
     return obj is not None and bool(obj.is_private)
@@ -720,6 +850,34 @@ def extract_packet_endpoints(
     *,
     include_arp: bool = True,
 ) -> tuple[Optional[str], Optional[str]]:
+    """Source/destination of the first IPv4, else IPv6, else ARP layer.
+
+    Lite packets answer from their headers; a scapy packet keeps the answer
+    on itself, since a --threats run asks every packet ~40 times (packets are
+    never modified once read, which the shared in-memory view relies on).
+    """
+    if type(pkt) is _LitePacket:
+        answer = pkt.lite_endpoints(include_arp)  # type: ignore[attr-defined]
+        if answer is not _LITE_UNSUPPORTED:
+            return answer[0] or None, answer[1] or None
+        pkt = pkt.materialize()  # type: ignore[attr-defined]
+    store = getattr(pkt, "__dict__", None)
+    cache_key = "_pcapper_ep" if include_arp else "_pcapper_ep_noarp"
+    if store is not None:
+        cached = store.get(cache_key)
+        if cached is not None:
+            return cached
+    result = _extract_packet_endpoints(pkt, include_arp=include_arp)
+    if store is not None:
+        store[cache_key] = result
+    return result
+
+
+def _extract_packet_endpoints(
+    pkt: object,
+    *,
+    include_arp: bool = True,
+) -> tuple[Optional[str], Optional[str]]:
     getlayer = getattr(pkt, "getlayer", None)
     if not callable(getlayer):
         return None, None
@@ -776,6 +934,10 @@ class _MemoUnkeyable(Exception):
 def _memo_key_value(value: object) -> str:
     if value is None or isinstance(value, _MEMO_SCALARS):
         return repr(value)
+    if isinstance(value, PurePath):
+        # An output directory or an indicator file: the same path asks for
+        # the same result (its files do not change during a run).
+        return f"<path {os.fspath(value)}>"
     if isinstance(value, (list, tuple)):
         inner = ",".join(_memo_key_value(item) for item in value)
         return f"[{inner}]"
@@ -835,9 +997,12 @@ def _analysis_context_key(path: Path) -> tuple:
     decode-as port overrides and split-capture joining."""
     try:
         from .capture_parts import capture_parts
+        from .pcap_cache import get_capture_window
         from .port_overrides import generation
 
-        return (generation(), len(capture_parts(path)))
+        window = get_capture_window(path)
+        window_key = window.key() if window is not None else None  # type: ignore[attr-defined]
+        return (generation(), len(capture_parts(path)), window_key)
     except Exception:
         return ()
 
@@ -852,6 +1017,210 @@ def _memo_defaults(func) -> dict[str, object]:
         }
     except (TypeError, ValueError):
         return {}
+
+
+# Shared analysis pass support (pcapper.sharedpass). While a pass runs,
+# analyzers execute concurrently in threads: the memo is locked, a call whose
+# twin is already being computed waits for it instead of reading the capture
+# again (_COORDINATE), a dry run records every memoised call it makes
+# (_MEMO_RECORDER), and fan-out orchestrators may prefetch their sub-analyses
+# in one shared pass before computing (_FAN_OUT_HOOK).
+_MEMO_LOCK = threading.RLock()
+_IN_FLIGHT: dict[tuple, "_Flight"] = {}
+_COORDINATE = False
+_MEMO_RECORDER: Optional[list] = None
+_FAN_OUT_HOOK: Optional[Any] = None
+_BLOCK_HOOK: Optional[Any] = None
+_NO_HIT = object()
+
+
+_DOMAIN_USER_RE = re.compile(r"\b([A-Za-z0-9_.-]{1,64})\\([A-Za-z0-9_.-]{1,64})\b")
+# Path components that the bare DOMAIN\user shape also matches: WMI namespaces
+# (root\cimv2), filesystem paths (windows\temp, system32\cmd.exe) and
+# registry keys. None of them is an account.
+_NOT_A_DOMAIN = frozenset({
+    "root", "windows", "winnt", "system32", "syswow64", "sysnative", "temp", "tmp", "users", "documents",
+    "programdata", "appdata", "local", "roaming", "microsoft", "software", "system", "currentcontrolset",
+    "controlset001", "control", "services", "policies", "hklm", "hkcu", "hku", "hkcr", "hkey_local_machine",
+    "hkey_current_user", "hkey_users", "hkey_classes_root", "wbem", "drivers", "tasks", "prefetch", "inetpub",
+    "wwwroot", "desktop", "downloads", "public", "default", "cimv2", "subscription", "standardcimv2",
+    "interop", "security", "microsoftdfs", "wmi", "rsop", "directory", "ldap", "policy", "cli", "ccm",
+})
+_NOT_A_USER = frozenset({
+    "cimv2", "standardcimv2", "subscription", "system32", "syswow64", "windows", "winnt", "temp", "tmp", "wbem",
+    "appdata", "programdata", "currentcontrolset", "software", "microsoft", "drivers", "tasks", "prefetch",
+    "inetpub", "wwwroot", "desktop", "downloads",
+})
+_FILE_SUFFIXES = (".exe", ".dll", ".sys", ".ps1", ".psm1", ".bat", ".cmd", ".vbs", ".js", ".txt", ".log", ".tmp",
+                  ".dat", ".ini", ".xml", ".lnk", ".msi", ".zip", ".evtx", ".hta", ".scr")
+
+
+def domain_user_pairs(text: str) -> list[tuple[str, str]]:
+    """``DOMAIN\\user`` account references in ``text``, as written.
+
+    The shape also matches WMI namespaces, file paths, registry keys and UNC
+    host\\share prefixes; those are skipped, so ``root\\cimv2`` or
+    ``C:\\windows\\temp`` never surface as a domain and a user."""
+    pairs: list[tuple[str, str]] = []
+    for match in _DOMAIN_USER_RE.finditer(text or ""):
+        start = match.start()
+        if start and text[start - 1] in "\\:/":  # UNC (\\host\\share) or a deeper path segment
+            continue
+        dom, user = match.group(1), match.group(2)
+        low_dom, low_user = dom.lower(), user.lower()
+        if low_dom in _NOT_A_DOMAIN or low_user in _NOT_A_USER or dom.isdigit() or is_valid_ip(dom):
+            continue
+        if low_user.endswith(_FILE_SUFFIXES) or low_dom.endswith(_FILE_SUFFIXES):
+            continue
+        end = match.end()
+        if end < len(text) and text[end] == "\\":  # a path continues: dir\\dir\\...
+            continue
+        pairs.append((dom, user))
+    return pairs
+
+
+def planning() -> bool:
+    """True while a shared pass makes its plan (sharedpass.discover): every
+    analysis then runs over an empty packet view only to record the memoised
+    calls it makes, so none may read the capture from disk meanwhile."""
+    return _MEMO_RECORDER is not None
+
+
+class _Flight:
+    __slots__ = ("event",)
+
+    def __init__(self) -> None:
+        self.event = threading.Event()
+
+
+def fan_out(func):
+    """Decorate an orchestrator that runs many analyzers over one capture
+    (--threats, --overview ...). On a capture too large to keep in memory its
+    sub-analyses are first computed in one shared pass (pcapper.sharedpass),
+    so the call below finds them in the memo instead of reading the capture
+    once per analyzer. Place it above ``@memoize_analysis``."""
+
+    @functools.wraps(func)
+    def entry(path, *args, **kwargs):
+        hook = _FAN_OUT_HOOK
+        if hook is not None:
+            try:
+                hook(func, path, args, kwargs)
+            except Exception:  # noqa: BLE001 - the plain run below still works
+                pass
+        return func(path, *args, **kwargs)
+
+    entry._pcapper_fan_out = True
+    return entry
+
+
+def _memo_key(func, path, args: tuple, kwargs: dict) -> Optional[tuple]:
+    """The memo key of a call, or None when the call cannot be memoised."""
+    try:
+        path_obj = Path(path).expanduser()
+        try:
+            key_path = path_obj.resolve()
+        except Exception:
+            key_path = path_obj.absolute()
+        st = key_path.stat()
+        file_key = (str(key_path), st.st_size, st.st_mtime_ns)
+    except Exception:
+        return None
+
+    packets = kwargs.get("packets")
+    forced_same = False
+    if packets is not None:
+        try:
+            from .pcap_cache import get_forced_packet_view
+
+            forced_same = packets is get_forced_packet_view(Path(path))
+        except Exception:
+            forced_same = False
+    if packets is not None and not forced_same:
+        view_key: tuple = ("packets", id(packets), len(packets))
+    else:
+        try:
+            from .pcap_cache import get_forced_packet_view, get_forced_packet_view_serial
+
+            forced = get_forced_packet_view(Path(path))
+            serial = get_forced_packet_view_serial(Path(path))
+        except Exception:
+            forced = None
+            serial = None
+        if forced is not None:
+            view_key = ("forced", serial, len(forced))
+        else:
+            view_key = ("disk",)
+
+    # Arguments passed explicitly at their default value (vt_lookup=False,
+    # port_filter=None ...) must not make a second cache entry.
+    defaults = _memo_defaults(func)
+    kwargs_for_key = {
+        name: value
+        for name, value in kwargs.items()
+        if not (
+            name in defaults
+            and type(value) is type(defaults[name])
+            and value == defaults[name]
+        )
+    }
+    try:
+        key_args = [_memo_key_value(value) for value in args]
+        key_kwargs = [
+            (name, _memo_key_value(kwargs_for_key[name]))
+            for name in sorted(kwargs_for_key)
+            if name not in _MEMO_SKIP_KWARGS
+        ]
+    except _MemoUnkeyable:
+        return None
+    return (
+        func.__module__,
+        func.__qualname__,
+        file_key,
+        view_key,
+        _analysis_context_key(Path(path)),
+        tuple(key_args),
+        tuple(key_kwargs),
+    )
+
+
+def _memo_lookup(key: tuple, copy_results: bool) -> Any:
+    with _MEMO_LOCK:
+        cached = _ANALYSIS_MEMO.get(key)
+        if cached is None:
+            return _NO_HIT
+        _ANALYSIS_MEMO.move_to_end(key)
+    if not copy_results:
+        return cached
+    try:
+        return copy.deepcopy(cached)
+    except Exception:
+        with _MEMO_LOCK:
+            _ANALYSIS_MEMO.pop(key, None)
+        return _NO_HIT
+
+
+def _memo_store(key: tuple, result: Any, copy_results: bool) -> None:
+    if copy_results:
+        try:
+            result = copy.deepcopy(result)
+        except Exception:
+            return
+    with _MEMO_LOCK:
+        _ANALYSIS_MEMO[key] = result
+        while len(_ANALYSIS_MEMO) > _ANALYSIS_MEMO_MAX:
+            _ANALYSIS_MEMO.popitem(last=False)
+
+
+def _wait_for_flight(flight: _Flight) -> None:
+    hook = _BLOCK_HOOK
+    if hook is not None:
+        hook(True)
+    try:
+        flight.event.wait()
+    finally:
+        if hook is not None:
+            hook(False)
 
 
 def memoize_analysis(func):
@@ -884,96 +1253,42 @@ def memoize_analysis(func):
         if os.environ.get("PCAPPER_ANALYSIS_MEMO", "1") == "0":
             return func(path, *args, **kwargs)
         copy_results = os.environ.get("PCAPPER_ANALYSIS_MEMO_COPY", "0") == "1"
-        try:
-            path_obj = Path(path).expanduser()
-            try:
-                key_path = path_obj.resolve()
-            except Exception:
-                key_path = path_obj.absolute()
-            st = key_path.stat()
-            file_key = (str(key_path), st.st_size, st.st_mtime_ns)
-        except Exception:
+        key = _memo_key(func, path, args, kwargs)
+        if key is None:
             return func(path, *args, **kwargs)
-
-        packets = kwargs.get("packets")
-        forced_same = False
-        if packets is not None:
+        recorder = _MEMO_RECORDER
+        if recorder is not None:
+            # Discovery (pcapper.sharedpass): note the call and what it calls.
+            token = recorder.enter(wrapper, path, args, dict(kwargs))
             try:
-                from .pcap_cache import get_forced_packet_view
-
-                forced_same = packets is get_forced_packet_view(Path(path))
-            except Exception:
-                forced_same = False
-        if packets is not None and not forced_same:
-            view_key: tuple = ("packets", id(packets), len(packets))
-        else:
-            try:
-                from .pcap_cache import get_forced_packet_view, get_forced_packet_view_serial
-
-                forced = get_forced_packet_view(Path(path))
-                serial = get_forced_packet_view_serial(Path(path))
-            except Exception:
-                forced = None
-                serial = None
-            if forced is not None:
-                view_key = ("forced", serial, len(forced))
-            else:
-                view_key = ("disk",)
-
-        # Arguments passed explicitly at their default value (vt_lookup=False,
-        # port_filter=None ...) must not make a second cache entry.
-        defaults = _memo_defaults(func)
-        kwargs_for_key = {
-            name: value
-            for name, value in kwargs.items()
-            if not (
-                name in defaults
-                and type(value) is type(defaults[name])
-                and value == defaults[name]
-            )
-        }
-        try:
-            key_args = [_memo_key_value(value) for value in args]
-            key_kwargs = [
-                (name, _memo_key_value(kwargs_for_key[name]))
-                for name in sorted(kwargs_for_key)
-                if name not in _MEMO_SKIP_KWARGS
-            ]
-        except _MemoUnkeyable:
-            return func(path, *args, **kwargs)
-
-        key = (
-            func.__module__,
-            func.__qualname__,
-            file_key,
-            view_key,
-            _analysis_context_key(Path(path)),
-            tuple(key_args),
-            tuple(key_kwargs),
-        )
-        cached = _ANALYSIS_MEMO.get(key)
-        if cached is not None:
-            _ANALYSIS_MEMO.move_to_end(key)
-            if not copy_results:
-                return cached
-            try:
-                return copy.deepcopy(cached)
-            except Exception:
-                _ANALYSIS_MEMO.pop(key, None)
                 return func(path, *args, **kwargs)
-
-        result = func(path, *args, **kwargs)
-        if not copy_results:
-            snapshot = result
-        else:
-            try:
-                snapshot = copy.deepcopy(result)
-            except Exception:
-                return result
-        _ANALYSIS_MEMO[key] = snapshot
-        while len(_ANALYSIS_MEMO) > _ANALYSIS_MEMO_MAX:
-            _ANALYSIS_MEMO.popitem(last=False)
-        return result
+            finally:
+                recorder.exit(token)
+        hit = _memo_lookup(key, copy_results)
+        if hit is not _NO_HIT:
+            return hit
+        flight = None
+        if _COORDINATE:
+            with _MEMO_LOCK:
+                existing = _IN_FLIGHT.get(key)
+                if existing is None:
+                    flight = _IN_FLIGHT[key] = _Flight()
+            if existing is not None:
+                _wait_for_flight(existing)
+                hit = _memo_lookup(key, copy_results)
+                if hit is not _NO_HIT:
+                    return hit
+                # The twin computation failed: compute it here.
+        try:
+            result = func(path, *args, **kwargs)
+            _memo_store(key, result, copy_results)
+            _progress.subtask_done(module=func.__module__)  # a finished analysis moves the capture bar
+            return result
+        finally:
+            if flight is not None:
+                with _MEMO_LOCK:
+                    _IN_FLIGHT.pop(key, None)
+                flight.event.set()
 
     return wrapper
 
@@ -1125,18 +1440,34 @@ def packet_wirelen(pkt: object) -> int:
     return packet_length(pkt)
 
 
+@functools.lru_cache(maxsize=32)
+def _printable_runs(min_len: int) -> "re.Pattern[bytes]":
+    return re.compile(rb"[\x20-\x7e]{%d,}" % min_len)
+
+
+_UTF16_PAIRS = re.compile(rb"(?:[\x20-\x7e]\x00)+")
+_ZERO_TO_FF = bytes([0xFF]) + bytes(255)  # translate(): 0x00 -> 0xFF, anything else -> 0x00
+
+
 def extract_ascii_strings(
     data: bytes, min_len: int = 4, max_len: int = 200
 ) -> list[str]:
     """Extract printable-ASCII runs (>= min_len) from a byte buffer.
 
     Canonical implementation shared by the protocol modules. Runs are split on
-    any non-printable byte and decoded latin-1 with errors ignored; the trailing
-    run (if any) is flushed so a string at the very end of the buffer is kept.
+    any non-printable byte and decoded latin-1; a run at the very end of the
+    buffer is kept. One regex scan (the maximal runs a byte loop would flush)
+    instead of a Python loop per byte: --threats spent 30 s here.
     """
-    results: list[str] = []
     if not data:
-        return results
+        return []
+    if min_len < 1:
+        return _ascii_strings_loop(data, min_len, max_len)
+    return [run.decode("latin-1")[:max_len] for run in _printable_runs(min_len).findall(data)]
+
+
+def _ascii_strings_loop(data: bytes, min_len: int, max_len: int) -> list[str]:
+    results: list[str] = []
     current = bytearray()
     for b in data:
         if 32 <= b <= 126:
@@ -1151,14 +1482,33 @@ def extract_ascii_strings(
 
 
 def extract_utf16le_strings(
-    data: bytes, min_len: int = 4, max_len: int = 200
+    data: bytes, min_len: int = 4, max_len: int = 200, *, aligned: bool = True
 ) -> list[str]:
-    """Extract printable-ASCII runs encoded as UTF-16LE (Windows wide strings).
+    """Extract printable-ASCII runs encoded as UTF-16LE (Windows wide strings):
+    each printable byte followed by a 0x00, decoded latin-1.
 
-    Canonical implementation shared by the protocol modules (each printable byte
-    followed by a 0x00). Runs are decoded latin-1 with errors ignored; the
-    trailing run is flushed.
+    ``aligned`` (the default) reads the buffer as pairs from offset 0, as a
+    scan stepping two bytes does; otherwise the scan steps one byte after a
+    pair that is not text and so also finds strings at odd offsets (the WMI
+    and RPC copies). Both run in C: the aligned scan masks every character
+    whose second byte is not 0x00 with one big-integer AND, the other is one
+    regex scan.
     """
+    if not data or min_len < 1:
+        return _utf16le_strings_loop(data, min_len, max_len, aligned) if data else []
+    raw = bytes(data)
+    if not aligned:
+        return [m.group(0)[0::2].decode("latin-1")[:max_len] for m in _UTF16_PAIRS.finditer(raw)
+                if len(m.group(0)) >= 2 * min_len]
+    pairs = len(raw) // 2
+    if pairs < min_len:
+        return []
+    chars, highs = raw[0 : 2 * pairs : 2], raw[1 : 2 * pairs : 2]
+    masked = (int.from_bytes(chars, "big") & int.from_bytes(highs.translate(_ZERO_TO_FF), "big")).to_bytes(pairs, "big")
+    return [run.decode("latin-1")[:max_len] for run in _printable_runs(min_len).findall(masked)]
+
+
+def _utf16le_strings_loop(data: bytes, min_len: int, max_len: int, aligned: bool) -> list[str]:
     results: list[str] = []
     current = bytearray()
     i = 0
@@ -1166,12 +1516,12 @@ def extract_utf16le_strings(
         ch = data[i]
         if 32 <= ch <= 126 and data[i + 1] == 0:
             current.append(ch)
-        elif len(current) >= min_len:
+            i += 2
+            continue
+        if len(current) >= min_len:
             results.append(current.decode("latin-1", errors="ignore")[:max_len])
-            current = bytearray()
-        else:
-            current = bytearray()
-        i += 2
+        current = bytearray()
+        i += 2 if aligned else 1
     if len(current) >= min_len:
         results.append(current.decode("latin-1", errors="ignore")[:max_len])
     return results
@@ -1287,6 +1637,56 @@ def extract_ethertype(pkt: object) -> Optional[int]:
     return None
 
 
+# Top-level domains a domain-shaped token in free text must end with to be
+# counted as a domain: every delegated country code, the legacy generics,
+# common new generics and the internal suffixes analysts meet. Without it
+# HTML/JavaScript ("element.value", "n.push", "window.Document") filled the
+# strings report's domain ranking.
+KNOWN_TLDS = frozenset("""
+ac ad ae af ag ai al am ao aq ar as at au aw ax az ba bb bd be bf bg bh bi bj bm bn bo bq br bs bt bw by bz
+ca cc cd cf cg ch ci ck cl cm cn co cr cu cv cw cx cy cz de dj dk dm do dz ec ee eg er es et eu fi fj fk fm
+fo fr ga gd ge gf gg gh gi gl gm gn gp gq gr gs gt gu gw gy hk hm hn hr ht hu id ie il im in io iq ir is it
+je jm jo jp ke kg kh ki km kn kp kr kw ky kz la lb lc li lk lr ls lt lu lv ly ma mc md me mg mh mk ml mm mn
+mo mp mq mr ms mt mu mv mw mx my mz na nc ne nf ng ni nl no np nr nu nz om pa pe pf pg ph pk pl pm pn pr ps
+pt pw py qa re ro rs ru rw sa sb sc sd se sg sh si sk sl sm sn so sr ss st su sv sx sy sz tc td tf tg th tj
+tk tl tm tn to tr tt tv tw tz ua ug uk us uy uz va vc ve vg vi vn vu wf ws ye yt za zm zw
+com net org edu gov mil int arpa info biz name pro aero coop museum mobi asia tel travel jobs cat post xxx
+app dev page cloud online site website store shop tech xyz top club live life news blog email world today
+space fun icu buzz link click guru agency digital network systems services solutions support center company
+group media zone one global host win bid loan work men vip ltd llc inc art design studio software tools wiki
+academy social chat team ninja rocks cool cafe city download stream video tube photo photos pics games game
+fit health care finance money bank insurance law legal capital ventures fund trade market exchange cash
+credit deals sale gift lol wtf kim moe ooo ink help how pink red blue black green gold plus best mba
+university college school education science bio eco energy earth farm garden pet surf golf run casino bet
+hotel tours cars auto taxi rest bar pub wine beer pizza menu recipes cooking events party community church
+house homes rent land estate realty properties directory guide reviews report review express direct
+domains hosting webcam porn sex sexy adult dating date love xin wang ren top
+google microsoft apple amazon azure windows bing office xbox youtube android chrome play search goog
+local localdomain lan corp internal intranet home
+""".split())
+
+
+def plausible_domain(name: str) -> bool:
+    """A domain-shaped token whose last label is a known top-level domain,
+    written in one case (a mixed-case "hR" is a minified-JavaScript name)."""
+    labels = str(name or "").strip().rstrip(".").split(".")
+    if len(labels) < 2 or not all(labels):
+        return False
+    tld = labels[-1]
+    return tld.lower() in KNOWN_TLDS and tld in (tld.lower(), tld.upper())
+
+
+def ranked_slice(items: list, keep: int, tail: int = 10) -> list:
+    """``items`` (ranked most to least frequent) cut to ``keep`` entries that
+    still end with the true bottom ``tail``: what a report's top and bottom
+    view needs from an analyzer that cannot keep everything."""
+    items = list(items)
+    if len(items) <= keep:
+        return items
+    tail = max(0, min(tail, keep))
+    return items[: keep - tail] + (items[-tail:] if tail else [])
+
+
 def dns_questions(dns_layer: object) -> list[tuple[str, int]]:
     """``(qname, qtype)`` for every question of a scapy DNS layer.
 
@@ -1318,6 +1718,73 @@ def dns_questions(dns_layer: object) -> list[tuple[str, int]]:
         except (TypeError, ValueError):
             qtype = 0
         out.append((name, qtype))
+    return out
+
+
+def dns_message(pkt: object) -> object:
+    """The DNS-format layer of a packet, or None: DNS, or LLMNR -- scapy
+    decodes UDP 5355 as LLMNRQuery / LLMNRResponse, which are not DNS
+    subclasses, and getlayer() matches the exact class, so a getlayer(DNS)
+    alone never sees an LLMNR lookup."""
+    getlayer = getattr(pkt, "getlayer", None)
+    if getlayer is None:
+        return None
+    try:
+        from scapy.layers.dns import DNS
+        from scapy.layers.llmnr import LLMNRQuery, LLMNRResponse
+    except Exception:  # noqa: BLE001
+        return None
+    for layer in (DNS, LLMNRResponse, LLMNRQuery):
+        found = getlayer(layer)
+        if found is not None:
+            return found
+    return None
+
+
+def _dns_text(value: object) -> str:
+    if isinstance(value, (bytes, bytearray)):
+        return bytes(value).decode("utf-8", errors="replace").rstrip(".")
+    return str(value if value is not None else "").rstrip(".")
+
+
+def dns_answers(dns_layer: object, limit: int = 32) -> list[tuple[int, str, str]]:
+    """``(rrtype, name, value)`` for the answer records of a scapy DNS layer:
+    the address for A/AAAA, the target name for CNAME/NS/PTR/DNAME,
+    ``"10 mail.example"`` for MX, ``"host:port"`` for SRV, the joined text for
+    TXT and the primary server for SOA. ``an`` is a list in scapy >= 2.6 and
+    a chained record before (walked through ``ancount``)."""
+    an = getattr(dns_layer, "an", None)
+    if an is None:
+        return []
+    if isinstance(an, (list, tuple)):
+        items = list(an)
+    else:
+        items = []
+        try:
+            for index in range(int(getattr(dns_layer, "ancount", 0) or 0)):
+                items.append(an[index])
+        except Exception:  # noqa: BLE001 - a truncated chain ends the walk
+            pass
+    out: list[tuple[int, str, str]] = []
+    for rr in items[:limit]:
+        try:
+            rrtype = int(getattr(rr, "type", 0) or 0)
+        except (TypeError, ValueError):
+            rrtype = 0
+        name = _dns_text(getattr(rr, "rrname", ""))
+        if rrtype == 15:
+            value = f"{getattr(rr, 'preference', '')} {_dns_text(getattr(rr, 'exchange', ''))}".strip()
+        elif rrtype == 33:
+            value = f"{_dns_text(getattr(rr, 'target', ''))}:{getattr(rr, 'port', '')}"
+        elif rrtype == 6:
+            value = _dns_text(getattr(rr, "mname", ""))
+        else:
+            data = getattr(rr, "rdata", "")
+            if isinstance(data, (list, tuple)):  # TXT: a list of strings
+                value = " ".join(_dns_text(part) for part in data)
+            else:
+                value = _dns_text(data)
+        out.append((rrtype, name, value))
     return out
 
 

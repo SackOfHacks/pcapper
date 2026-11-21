@@ -256,7 +256,7 @@ NTSTATUS_MAP = {
 
 _NTLM_VISIBLE_RE = re.compile(r"^[\x20-\x7e]{1,128}$")
 _NTLM_USER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._$-]{2,63}$")
-_NTLM_DOMAIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{2,63}$")
+_NTLM_DOMAIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{1,63}$")
 _NTLM_WORKSTATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$")
 
 
@@ -302,7 +302,7 @@ def _sanitize_ntlm_domain(value: str) -> str:
         labels = domain.split(".")
         if len(labels) < 2 or any(len(label) < 2 for label in labels):
             return "Unknown"
-    elif len(domain) < 5:
+    elif len(domain) < 2:  # NetBIOS domain names are short: "3B", "AD", "CORP"
         return "Unknown"
     if _looks_like_hex_noise(domain):
         return "Unknown"
@@ -705,9 +705,20 @@ def analyze_ntlm(
                     if server_challenge and nt_len >= 24:
                         lm_resp = ntlm_data[lm_off : lm_off + lm_len]
                         nt_resp = ntlm_data[nt_off : nt_off + nt_len]
+                        # The NTLMv2 HMAC covers the user and domain exactly as
+                        # the client sent them (the domain is not uppercased), so
+                        # the hash line must carry the raw fields, not the
+                        # sanitised display names, or it never cracks.
+                        raw_user = str(user_raw or "").replace("\x00", "")
+                        raw_domain = str(domain_raw or "").replace("\x00", "")
                         record = _build_netntlm_hash(
-                            user, domain, server_challenge, lm_resp, nt_resp
+                            raw_user if user != "Unknown" else user,
+                            raw_domain if domain != "Unknown" else "",
+                            server_challenge, lm_resp, nt_resp,
                         )
+                        if record:
+                            record["username"] = user if user != "Unknown" else raw_user
+                            record["domain"] = domain if domain != "Unknown" else raw_domain
                         if record and record["hash"] not in crackable_seen:
                             crackable_seen.add(record["hash"])
                             record["src_ip"] = src

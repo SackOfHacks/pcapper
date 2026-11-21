@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from .utils import is_private_ip as _is_private_ip, packet_length, memoize_analysis
-from .utils import is_public_ip as _is_public_ip
 import math
 import re
 import struct
@@ -9,6 +7,11 @@ from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
+
+from .ot_ports import foreign_service_reply
+from .utils import is_private_ip as _is_private_ip
+from .utils import is_public_ip as _is_public_ip
+from .utils import memoize_analysis, packet_length
 
 try:
     from scapy.layers.inet import IP, TCP
@@ -18,7 +21,8 @@ except ImportError:
 
 from .device_detection import device_fingerprint_from_fields
 from .equipment import equipment_artifacts
-from .pcap_cache import PcapMeta, iter_packets
+from .lite import UNSUPPORTED, LitePacket
+from .pcap_cache import PassStats, PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, safe_float
 
 # --- Constants ---
@@ -162,7 +166,10 @@ class ModbusAnalysis:
     modbus_payload_bytes: int = 0
 
     # Statistics
-    func_counts: Counter[str] = field(default_factory=Counter)
+    func_counts: Counter[str] = field(default_factory=Counter)  # every frame, both directions
+    # Requests only (a write is echoed in its response, so func_counts counts
+    # each command twice): what a client asked a device to do.
+    request_func_counts: Counter[str] = field(default_factory=Counter)
     unit_ids: Counter[int] = field(default_factory=Counter)
     src_ips: Counter[str] = field(default_factory=Counter)  # Client IPs usually
     dst_ips: Counter[str] = field(default_factory=Counter)  # Server/PLC IPs
@@ -189,6 +196,9 @@ class ModbusAnalysis:
     artifacts: List[ModbusArtifact] = field(default_factory=list)
     anomalies: List[ModbusAnomaly] = field(default_factory=list)
     value_changes: List[dict[str, object]] = field(default_factory=list)
+    # One record per (function, unit, master, server) write stream: count,
+    # first/last time and the last request detail (target + values).
+    write_targets: List[dict[str, object]] = field(default_factory=list)
     errors: List[str] = field(default_factory=list)
 
     @property
@@ -473,6 +483,56 @@ def _register_text(regs: Dict[int, int], minimum: int = 6) -> str:
     return best if len(best) >= minimum else ""
 
 
+_NO_TCP = object()
+
+
+def _ipv4_frame(data: bytes, protos: tuple[int, ...]) -> bool:
+    """The byte test of the raw-bytes fallback below (untagged Ethernet +
+    IPv4 + one of ``protos``): only such frames can get ports from it."""
+    return len(data) >= 34 and data[12:14] == b"\x08\x00" and data[23] in protos
+
+
+def _lite_fields(pkt: object, protos: tuple[int, ...], strip_raw_padding: bool):  # type: ignore[no-untyped-def]
+    """Transport fields of a lite record exactly as the scapy code below
+    derives them: ``(is_tcp, sport, dport, seq, flags, payload)``, _NO_TCP
+    when neither scapy nor the raw fallback finds a transport, or None when
+    only the dissected packet can answer."""
+    if type(pkt) is not LitePacket:
+        return None
+    l4 = pkt.lite_ports()
+    if l4 is UNSUPPORTED:
+        return None
+    if l4 is None or (not l4[0] and 17 not in protos):
+        return None if _ipv4_frame(pkt.original, protos) else _NO_TCP
+    if l4[5] < 0:  # payload dissected into a non-Raw layer by scapy
+        return None
+    data = pkt.original
+    payload = data[l4[5] : l4[6]]
+    if payload:
+        # scapy: Raw.load, then (Modbus) cut a trailing copy of the padding
+        padding = data[l4[6] :]
+        if strip_raw_padding and padding and payload.endswith(padding):
+            payload = payload[: -len(padding)]
+    else:
+        payload = b""  # no Raw layer: the padding-only payload strips to nothing
+    return (l4[0], l4[1], l4[2], l4[3], l4[4], payload)
+
+
+def _modbus_prefilter(ports: frozenset[int]):  # type: ignore[no-untyped-def]
+    """Records the loop below can count as Modbus; the rest only add to the
+    capture totals (kept in PassStats)."""
+
+    def keep(record: object) -> bool:
+        l4 = record.lite_ports()  # type: ignore[attr-defined]
+        if l4 is UNSUPPORTED:
+            return True
+        if l4 is None or not l4[0]:
+            return _ipv4_frame(record.original, (6,))  # type: ignore[attr-defined]
+        return l4[2] in ports or (l4[1] in ports and l4[2] >= 1024)
+
+    return keep
+
+
 @memoize_analysis
 def analyze_modbus(
     path: Path,
@@ -496,6 +556,7 @@ def analyze_modbus(
     modbus_payload_bytes = 0
 
     func_counts = Counter()
+    request_func_counts: Counter[str] = Counter()
     unit_ids = Counter()
     src_ips = Counter()
     dst_ips = Counter()
@@ -534,6 +595,7 @@ def analyze_modbus(
     # Aggregate noisy anomalies
     write_events = Counter()
     write_event_first_seen: Dict[Tuple[str, int, str, str], float] = {}
+    write_event_last_seen: Dict[Tuple[str, int, str, str], float] = {}
     exception_events = Counter()
     diagnostic_events = Counter()
     dangerous_diag_events: Counter = Counter()
@@ -593,9 +655,18 @@ def analyze_modbus(
         Tuple[str, str, int, int], Tuple[Optional[int], bytes]
     ] = OrderedDict()
     stream_gap_reported = False
+    stats = PassStats()
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path,
+            packets=packets,
+            meta=meta,
+            show_status=show_status,
+            lite=True,
+            prefilter=_modbus_prefilter(modbus_ports),
+            stats=stats,
+        ):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
@@ -611,60 +682,68 @@ def analyze_modbus(
             tcp_flags = 0
             payload = b""
 
-            if pkt.haslayer(TCP):
-                has_tcp = True
-                tcp_layer = pkt[TCP]
-                sport = int(tcp_layer.sport)
-                dport = int(tcp_layer.dport)
-                tcp_seq = int(tcp_layer.seq)
-                tcp_flags = int(tcp_layer.flags)
-
-                # Scapy exposes Ethernet padding beneath TCP on some captures;
-                # Raw.load contains the actual captured application segment.
-                payload_obj = tcp_layer.payload
-                if Raw is not None and pkt.haslayer(Raw):
-                    payload = bytes(pkt[Raw].load)
-                else:
-                    payload = bytes(payload_obj) if payload_obj else b""
-                if Padding is not None and pkt.haslayer(Padding):
-                    padding = bytes(pkt[Padding])
-                    if padding and payload.endswith(padding):
-                        payload = payload[: -len(padding)]
+            fast = _lite_fields(pkt, (6,), strip_raw_padding=True)
+            if fast is _NO_TCP:
+                pass
+            elif fast is not None:
+                has_tcp, sport, dport, tcp_seq, tcp_flags, payload = fast
             else:
-                # Fallback: parse TCP from raw bytes if scapy didn't dissect layers
-                try:
-                    raw = bytes(pkt)
-                    if (
-                        len(raw) >= 34 and raw[12:14] == b"\x08\x00"
-                    ):  # Ethernet + IPv4
-                        ihl = (raw[14] & 0x0F) * 4
-                        proto = raw[23]
-                        if proto == 6:  # TCP
-                            ip_start = 14
-                            total_len = int.from_bytes(raw[16:18], "big")
-                            tcp_start = ip_start + ihl
-                            if len(raw) >= tcp_start + 20:
-                                data_offset = (raw[tcp_start + 12] >> 4) * 4
-                                sport = int.from_bytes(
-                                    raw[tcp_start : tcp_start + 2], "big"
-                                )
-                                dport = int.from_bytes(
-                                    raw[tcp_start + 2 : tcp_start + 4], "big"
-                                )
-                                tcp_seq = int.from_bytes(
-                                    raw[tcp_start + 4 : tcp_start + 8], "big"
-                                )
-                                tcp_flags = raw[tcp_start + 13]
-                                payload_start = tcp_start + data_offset
-                                ip_end = ip_start + total_len
-                                payload = (
-                                    raw[payload_start:ip_end]
-                                    if ip_end <= len(raw)
-                                    else raw[payload_start:]
-                                )
-                                has_tcp = True
-                except Exception:
-                    pass
+                if type(pkt) is LitePacket:
+                    pkt = pkt.materialize()
+                if pkt.haslayer(TCP):
+                    has_tcp = True
+                    tcp_layer = pkt[TCP]
+                    sport = int(tcp_layer.sport)
+                    dport = int(tcp_layer.dport)
+                    tcp_seq = int(tcp_layer.seq)
+                    tcp_flags = int(tcp_layer.flags)
+
+                    # Scapy exposes Ethernet padding beneath TCP on some captures;
+                    # Raw.load contains the actual captured application segment.
+                    payload_obj = tcp_layer.payload
+                    if Raw is not None and pkt.haslayer(Raw):
+                        payload = bytes(pkt[Raw].load)
+                    else:
+                        payload = bytes(payload_obj) if payload_obj else b""
+                    if Padding is not None and pkt.haslayer(Padding):
+                        padding = bytes(pkt[Padding])
+                        if padding and payload.endswith(padding):
+                            payload = payload[: -len(padding)]
+                else:
+                    # Fallback: parse TCP from raw bytes if scapy didn't dissect layers
+                    try:
+                        raw = bytes(pkt)
+                        if (
+                            len(raw) >= 34 and raw[12:14] == b"\x08\x00"
+                        ):  # Ethernet + IPv4
+                            ihl = (raw[14] & 0x0F) * 4
+                            proto = raw[23]
+                            if proto == 6:  # TCP
+                                ip_start = 14
+                                total_len = int.from_bytes(raw[16:18], "big")
+                                tcp_start = ip_start + ihl
+                                if len(raw) >= tcp_start + 20:
+                                    data_offset = (raw[tcp_start + 12] >> 4) * 4
+                                    sport = int.from_bytes(
+                                        raw[tcp_start : tcp_start + 2], "big"
+                                    )
+                                    dport = int.from_bytes(
+                                        raw[tcp_start + 2 : tcp_start + 4], "big"
+                                    )
+                                    tcp_seq = int.from_bytes(
+                                        raw[tcp_start + 4 : tcp_start + 8], "big"
+                                    )
+                                    tcp_flags = raw[tcp_start + 13]
+                                    payload_start = tcp_start + data_offset
+                                    ip_end = ip_start + total_len
+                                    payload = (
+                                        raw[payload_start:ip_end]
+                                        if ip_end <= len(raw)
+                                        else raw[payload_start:]
+                                    )
+                                    has_tcp = True
+                    except Exception:
+                        pass
 
             if not has_tcp:
                 continue
@@ -679,7 +758,9 @@ def analyze_modbus(
             # a port's packets to frame as MBAP (see pcapper.port_heuristics).
             # A per-packet "protocol id is 0" guess used to stand in for that
             # and counted fragments of SSH/OPC UA/MELSOFT traffic as Modbus.
-            if dport in modbus_ports or (sport in modbus_ports and dport >= 1024):
+            if (dport in modbus_ports and not foreign_service_reply(sport, modbus_ports)) or (
+                sport in modbus_ports and dport >= 1024
+            ):
                 is_modbus = True
 
             if not is_modbus:
@@ -822,6 +903,8 @@ def analyze_modbus(
                     unit_ids[unit_id] += 1
 
                     is_server_response = sport in modbus_ports
+                    if not is_server_response:
+                        request_func_counts[func_name] += 1
 
                     src_raw, dst_raw = extract_packet_endpoints(pkt)
                     if src_raw and dst_raw:
@@ -911,6 +994,7 @@ def analyze_modbus(
                             write_events[write_key] += 1
                             if ts is not None:
                                 write_event_first_seen.setdefault(write_key, ts)
+                                write_event_last_seen[write_key] = ts
                             src_write_requests[src_ip] += 1
                             if request_detail:
                                 write_details[
@@ -1315,6 +1399,13 @@ def analyze_modbus(
 
     except Exception as e:
         errors.append(f"{type(e).__name__}: {e}")
+
+    if stats.active:  # read from disk: totals cover the records the prefilter dropped
+        total_packets = stats.packets
+        total_bytes = stats.bytes
+        if stats.earliest is not None:
+            start_time = safe_float(getattr(stats.earliest, "time", 0))
+            last_time = safe_float(getattr(stats.latest, "time", 0))
 
     duration = (
         max(0.0, last_time - start_time)
@@ -1864,6 +1955,22 @@ def analyze_modbus(
             "distinct_write_addrs": len(write_addrs),
         }
 
+    write_targets = [
+        {
+            "func": func_name,
+            "unit": unit_id,
+            "src": src_ip,
+            "dst": dst_ip,
+            "count": count,
+            "first": write_event_first_seen.get((func_name, unit_id, src_ip, dst_ip)),
+            "last": write_event_last_seen.get((func_name, unit_id, src_ip, dst_ip)),
+            "detail": write_details.get((func_name, unit_id, src_ip, dst_ip), ""),
+        }
+        for (func_name, unit_id, src_ip, dst_ip), count in sorted(
+            write_events.items(), key=lambda kv: (-kv[1], str(kv[0]))
+        )
+    ]
+
     return ModbusAnalysis(
         path=path,
         duration=duration,
@@ -1873,6 +1980,7 @@ def analyze_modbus(
         modbus_bytes=modbus_bytes,
         modbus_payload_bytes=modbus_payload_bytes,
         func_counts=func_counts,
+        request_func_counts=request_func_counts,
         unit_ids=unit_ids,
         src_ips=src_ips,
         dst_ips=dst_ips,
@@ -1895,5 +2003,6 @@ def analyze_modbus(
         artifacts=artifacts,
         anomalies=anomalies,
         value_changes=value_changes,
+        write_targets=write_targets,
         errors=errors,
     )

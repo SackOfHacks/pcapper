@@ -228,12 +228,16 @@ def extract_device_fields(text: str) -> dict[str, str]:
             fields["os"] = "macOS"
 
     for pattern, key in _VERSION_PATTERNS:
-        match = pattern.search(cleaned)
-        if match:
+        for match in pattern.finditer(cleaned):
             value = match.group(1)
-            if value and value.lower().startswith(("http/", "ssh-")):
+            if not value or value.lower().startswith(("http/", "ssh-")):
+                continue
+            # A version or firmware value has a digit; without one this is
+            # prose ("the latest version of the software").
+            if key in ("version", "firmware") and not any(ch.isdigit() for ch in value):
                 continue
             fields.setdefault(key, value)
+            break
 
     for pattern, key in _MODEL_PATTERNS:
         match = pattern.search(cleaned)

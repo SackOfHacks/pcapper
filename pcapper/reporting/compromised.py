@@ -1,37 +1,13 @@
-"""Rendered output for compromised analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for --compromised: which hosts look compromised, why,
+and the evidence -- see ``render_compromised_summary``."""
 
 from __future__ import annotations
-from ..utils import is_public_ip as _is_public_ip
-from ..coloring import (
-    danger,
-    header,
-    label,
-    muted,
-    ok,
-    warn,
-)
+
 from ..compromised import CompromiseSummary
-from ..utils import (
-    format_duration,
-    format_ts,
-)
-
-from ._common import (
-    SECTION_BAR,
-    SUBSECTION_BAR,
-    _apply_verbose_limit,
-    _finalize_output,
-    _format_kv,
-    _format_table,
-    _limit_value,
-    _redact_in_text,
-    _truncate_text,
-)
-
+from ..utils import format_duration, format_ts
+from ..utils import is_public_ip as _is_public_ip
+from . import _style as st
+from ._common import _redact_in_text, _render_deterministic_checks
 
 _COMPROMISE_ISSUE_REASONS = [
     # (substring to match in summary, why-this-indicates-compromise explanation)
@@ -40,6 +16,12 @@ _COMPROMISE_ISSUE_REASONS = [
         "Files matching malware heuristics (executable/script/archive) were "
         "transferred in the clear; the hashes are pivotable IOCs — look them up "
         "in threat intel and correlate with the delivering host.",
+    ),
+    (
+        "executable payload",
+        "An executable (EXE/DLL) was downloaded -- the classic dropper or "
+        "second-stage delivery; pivot the SHA-256 in threat intel and find what "
+        "ran it on the receiving host.",
     ),
     (
         "malicious file download",
@@ -177,513 +159,164 @@ def _dedupe_compromise_issues(
     return [grouped[k] for k in order]
 
 
-def render_compromised_summary(
-    summary: CompromiseSummary, limit: int = 20, verbose: bool = False
-) -> str:
-    limit = _apply_verbose_limit(limit) or limit
+_VERDICT_TAG = {
+    "TP_MALICIOUS_CANDIDATE": ("malicious candidate", "bad"),
+    "TP_HARDENING": ("hardening", "caution"),
+    "LIKELY_FP": ("likely false positive", "dim"),
+    "LIKELY_CONTROL_WORKING": ("control working", "dim"),
+}
 
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"COMPROMISE ASSESSMENT :: {summary.path.name}"))
-    lines.append(SECTION_BAR)
 
-    if summary.errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        for err in summary.errors if verbose else summary.errors[: _limit_value(20)]:
-            lines.append(danger(f"- {err}"))
-        if not verbose and len(summary.errors) > 20:
-            lines.append(muted(f"... {len(summary.errors) - 20} more errors"))
-
-    lines.append(_format_kv("Total Hosts", str(summary.total_hosts)))
-    lines.append(_format_kv("Compromised Hosts", str(len(summary.compromised_hosts))))
-
-    # ---- Synthesis-level verdict candidates (reviewer accept/reject) ----
-    # Sits near the top of the compromise block so the reviewer reads the
-    # synthesized classification (LIKELY_FP / LIKELY_CONTROL_WORKING /
-    # TP_HARDENING / TP_MALICIOUS_CANDIDATE / INCONCLUSIVE) BEFORE
-    # scrolling through the raw per-finding table. See pcapper.verdict_summary
-    # for the classification rules.
-    try:
-        from ..verdict_summary import render as _render_verdict, summarize as _summarize_verdict
-        _verdict = _summarize_verdict(summary.detections or [])
-        if _verdict.total_detections > 0:
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("Verdict Candidates"))
-            lines.append(_render_verdict(_verdict))
-    except Exception:  # noqa: BLE001 — verdict summary must never break output
-        pass
-
-    def _compromised_verdict() -> tuple[str, str, list[str], int]:
-        score = 0
-        reasons: list[str] = []
-        high_hosts = [
-            host
-            for host in summary.compromised_hosts
-            if host.severity in {"high", "critical"}
-        ]
-        if high_hosts:
-            score += min(4, len(high_hosts))
-            reasons.append(
-                f"High-severity compromised hosts identified ({len(high_hosts)})"
-            )
-        if getattr(summary, "incidents", None):
-            score += 1
-            reasons.append(f"Incident clusters detected ({len(summary.incidents)})")
-        if getattr(summary, "campaigns", None):
-            score += 2
-            reasons.append(
-                f"Shared campaign indicators across hosts ({len(summary.campaigns)})"
-            )
-
-        checks = getattr(summary, "deterministic_checks", {}) or {}
-        staged = (
-            checks.get("multi_stage_sequence", []) if isinstance(checks, dict) else []
-        )
-        if staged:
-            score += 2
-            reasons.append(
-                f"Multi-stage compromise sequencing observed ({len(staged)})"
-            )
-
-        if score >= 7:
-            verdict = "YES - high-confidence host compromise activity is present."
-            confidence = "High"
-        elif score >= 4:
-            verdict = "LIKELY - multiple compromise indicators are present."
-            confidence = "Medium"
-        elif score >= 2:
-            verdict = "POSSIBLE - weak-to-moderate compromise indicators are present."
-            confidence = "Low"
-        else:
-            verdict = "NO STRONG SIGNAL - no convincing high-confidence compromise pattern from current heuristics."
-            confidence = "Low"
-
-        if not reasons:
-            reasons.append("No high-confidence compromise heuristic crossed threshold")
-        return verdict, confidence, reasons, score
-
-    verdict, confidence, verdict_reasons, verdict_score = _compromised_verdict()
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Analyst Verdict"))
-    if verdict.startswith("YES"):
-        lines.append(danger(verdict))
-    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
-        lines.append(warn(verdict))
-    else:
-        lines.append(ok(verdict))
-    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
-    lines.append(muted("Why confidence:"))
-    for reason in verdict_reasons[: _limit_value(8)]:
-        lines.append(muted(f"- {_redact_in_text(reason)}"))
-
-    # Identify likely victims: internal hosts are the assets at risk; external
-    # high-severity hosts are the adversary infrastructure they talked to.
-    internal_victims = [
-        h for h in summary.compromised_hosts if not _is_public_ip(h.ip)
-    ]
-    external_infra = [
-        h
-        for h in summary.compromised_hosts
-        if _is_public_ip(h.ip) and h.severity in {"high", "critical"}
-    ]
-    if internal_victims:
-        lines.append(muted("Suspected victim host(s):"))
-        for host in internal_victims[: _limit_value(5)]:
-            why = (
-                host.evidence[0]
-                if host.evidence
-                else "multiple high-severity indicators"
-            )
-            lines.append(
-                danger(
-                    f"- {(host.hostname or '-')} ({host.ip}) — "
-                    f"{_truncate_text(str(why), 100)}"
-                )
-            )
-    if external_infra:
-        infra = ", ".join(
-            f"{h.ip}{f' ({h.hostname})' if h.hostname else ''}"
-            for h in external_infra[: _limit_value(6)]
-        )
-        lines.append(muted(f"External infrastructure contacted: {infra}"))
-
-    # Add concrete evidence context directly in the verdict block for analyst triage.
-    incidents = list(getattr(summary, "incidents", []) or [])
-    campaigns = list(getattr(summary, "campaigns", []) or [])
-    if verbose and summary.compromised_hosts:
-        lines.append(muted("Who:"))
-        lines.append(muted("- Compromised hosts"))
-        for host in summary.compromised_hosts[: _limit_value(8)]:
-            lines.append(
-                muted(
-                    f"- {(host.hostname or '-')} ({host.ip}) severity={host.severity} "
-                    f"score={host.score} detected={format_ts(host.detection_time)}"
-                )
-            )
-
-    if verbose and incidents:
-        lines.append(muted("When:"))
-        lines.append(muted("- Incident clusters"))
-        for item in incidents[: _limit_value(8)]:
-            stages = item.get("stages", [])
-            stage_text = (
-                ",".join(str(v) for v in stages[:5])
-                if isinstance(stages, list)
-                else str(stages)
-            )
-            lines.append(
-                muted(
-                    f"- host={item.get('ip', '-')} events={item.get('count', '-')} "
-                    f"window={format_ts(item.get('first_ts'))}..{format_ts(item.get('last_ts'))} "
-                    f"stages={stage_text or '-'}"
-                )
-            )
-
-    if verbose and campaigns:
-        lines.append(muted("What:"))
-        lines.append(muted("- Shared campaign indicators"))
-        for item in campaigns[: _limit_value(8)]:
-            hosts = item.get("hosts", [])
-            host_text = (
-                ", ".join(str(v) for v in hosts[: _limit_value(5)])
-                if isinstance(hosts, list)
-                else str(hosts)
-            )
-            lines.append(
-                muted(
-                    f"- {item.get('campaign_id', '-')} ioc={_redact_in_text(str(item.get('ioc', '-')))} "
-                    f"host_count={item.get('host_count', '-')} hosts={host_text or '-'}"
-                )
-            )
-
-    if not verbose:
-        if not summary.compromised_hosts:
-            lines.append(SUBSECTION_BAR)
-            lines.append(
-                ok("No hosts met compromise thresholds based on available evidence.")
-            )
-            lines.append(SECTION_BAR)
-            return _finalize_output(lines, show_truncation_note=False)
-
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Most Likely Compromised Hosts"))
-        lines.append(
-            muted(
-                "INTERNAL hosts are the assets at risk (the likely victims); "
-                "EXTERNAL hosts are the adversary/peer infrastructure they "
-                "contacted — not necessarily compromised themselves."
-            )
-        )
-        # Surface internal victims first (higher triage priority than the
-        # external infrastructure they communicated with).
-        ranked_hosts = sorted(
-            summary.compromised_hosts,
-            key=lambda h: (_is_public_ip(h.ip), -int(h.score)),
-        )
-        rows = [["Host", "IP", "Scope", "Severity", "Score", "Detection Time", "Why"]]
-        for host in ranked_hosts[: _limit_value(limit)]:
-            evidence_text = " | ".join(host.evidence[:2]) if host.evidence else "-"
-            rows.append(
-                [
-                    host.hostname or "-",
-                    host.ip,
-                    "INTERNAL" if not _is_public_ip(host.ip) else "external",
-                    str(host.severity).upper(),
-                    str(host.score),
-                    format_ts(host.detection_time),
-                    _truncate_text(evidence_text, 70),
-                ]
-            )
-        lines.append(_format_table(rows))
-        if len(summary.compromised_hosts) > _limit_value(limit):
-            lines.append(
-                muted(
-                    f"... {len(summary.compromised_hosts) - _limit_value(limit)} additional compromised hosts"
-                )
-            )
-
-        severe_detections = [
-            item
-            for item in list(getattr(summary, "detections", []) or [])
-            if str(item.get("severity", "info")).lower()
-            in {"critical", "high", "warning", "medium"}
-        ]
-        issues = _dedupe_compromise_issues(severe_detections)
-        if issues:
-            # Map IP -> hostname (and internal/external) for host attribution.
-            host_name = {h.ip: (h.hostname or "") for h in summary.compromised_hosts}
-
-            def _host_label(ip_value: str) -> str:
-                name = host_name.get(ip_value, "")
-                scope = "internal" if not _is_public_ip(ip_value) else "external"
-                return f"{ip_value}{f' ({name})' if name else ''} [{scope}]"
-
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("Most Likely Issues"))
-            lines.append(
-                muted(
-                    "Each issue lists WHY it suggests compromise, the hosts involved, "
-                    "and the concrete on-wire evidence."
-                )
-            )
-            for item in issues[: _limit_value(12)]:
-                severity = str(item.get("severity", "info")).lower()
-                summary_text = _truncate_text(str(item.get("summary", "")), 120)
-                details = _truncate_text(str(item.get("details", "")), 160)
-                source = str(item.get("source", ""))
-                if severity == "critical":
-                    marker = danger("[CRITICAL]")
-                elif severity == "high":
-                    marker = danger("[HIGH]")
-                else:
-                    marker = warn("[MEDIUM]")
-                # Skeptical-filter tag — sits between the severity marker and
-                # the summary so the reviewer sees at-a-glance that the
-                # verdict was already downgraded by a known-FP rule.
-                skeptical_tag = ""
-                if item.get("skeptical_downgraded"):
-                    rule = str(item.get("skeptical_rule", "") or "")
-                    orig = str(item.get("skeptical_original_severity", "") or "")
-                    skeptical_tag = muted(
-                        f" [skeptical: {rule}"
-                        + (f", was {orig}" if orig else "")
-                        + "]"
-                    )
-                # Hypothesis-lens tag — reviewer scans for [relevant] first
-                # and can skip [unrelated] on a big capture. Only surfaced
-                # when the lens was active (non-empty hypothesis_relevance).
-                relevance = str(item.get("hypothesis_relevance", "") or "")
-                hypothesis_tag = ""
-                if relevance == "relevant":
-                    hypothesis_tag = danger(" [relevant]")
-                elif relevance == "adjacent":
-                    hypothesis_tag = warn(" [adjacent]")
-                elif relevance == "unrelated":
-                    hypothesis_tag = muted(" [unrelated]")
-                lines.append(
-                    f"{marker}{hypothesis_tag}{skeptical_tag} {summary_text}"
-                    + (f"  ({source})" if source else "")
-                )
-                lines.append(
-                    muted(f"  Why: {_compromise_issue_reason(summary_text, source)}")
-                )
-                # Print the skeptical reason as its own indented line so the
-                # analyst sees the concrete rationale for the downgrade
-                # without having to read the module docstring.
-                if item.get("skeptical_downgraded") and item.get("skeptical_reason"):
-                    reason_text = _truncate_text(
-                        str(item.get("skeptical_reason", "")), 240
-                    )
-                    lines.append(muted(f"  Skeptical filter: {reason_text}"))
-                # Hosts involved — internal hosts first (the likely victims).
-                ips = list(item.get("ips", []) or [])
-                ips.sort(key=lambda v: (_is_public_ip(v), v))
-                if ips:
-                    shown = ", ".join(_host_label(v) for v in ips[: _limit_value(5)])
-                    extra = len(ips) - _limit_value(5)
-                    if extra > 0:
-                        shown += f"  (+{extra} more)"
-                    lines.append(muted(f"  Hosts: {shown}"))
-                if details:
-                    lines.append(muted(f"  Details: {details}"))
-                evidence = item.get("evidence", []) or []
-                if evidence:
-                    lines.append(muted("  Evidence:"))
-                    for ev in evidence[: _limit_value(3)]:
-                        lines.append(muted(f"    - {_truncate_text(str(ev), 150)}"))
-                iocs = item.get("iocs", []) or []
-                if iocs:
-                    lines.append(
-                        muted(
-                            "  IOCs: "
-                            + _truncate_text(", ".join(str(i) for i in iocs[:10]), 150)
-                        )
-                    )
-
-        if incidents:
-            lines.append(
-                _format_kv("Incident Clusters", str(len(incidents)))
-            )
-        if campaigns:
-            lines.append(
-                _format_kv("Shared Campaign Indicators", str(len(campaigns)))
-            )
-        if summary.errors:
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("Errors"))
-            for err in summary.errors[: _limit_value(12)]:
-                lines.append(danger(f"- {err}"))
-
-        lines.append(SECTION_BAR)
-        return _finalize_output(lines, show_truncation_note=False)
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Deterministic Compromise Checks"))
+def _assessment(summary: CompromiseSummary) -> tuple[str, str, list[str], int]:
+    """The weighted score the report used to lead with (kept as -v context)."""
+    score, reasons = 0, []
+    high_hosts = [h for h in summary.compromised_hosts if h.severity in {"high", "critical"}]
+    if high_hosts:
+        score += min(4, len(high_hosts))
+        reasons.append(f"high-severity compromised hosts ({len(high_hosts)})")
+    if summary.incidents:
+        score += 1
+        reasons.append(f"incident clusters ({len(summary.incidents)})")
+    if summary.campaigns:
+        score += 2
+        reasons.append(f"shared campaign indicators across hosts ({len(summary.campaigns)})")
     checks = getattr(summary, "deterministic_checks", {}) or {}
-    check_labels = [
-        ("credential_abuse", "Credential Abuse Evidence"),
-        ("beacon_c2", "Beacon/C2 Evidence"),
-        ("exfiltration", "Exfiltration Evidence"),
-        ("lateral_movement", "Lateral Movement Evidence"),
-        ("multi_stage_sequence", "Multi-Stage Sequence Evidence"),
-        ("high_confidence_ioc", "High-Confidence IOC Correlation"),
-        ("benign_automation_likely", "Likely Benign Automation"),
-    ]
+    staged = checks.get("multi_stage_sequence", []) if isinstance(checks, dict) else []
+    if staged:
+        score += 2
+        reasons.append(f"multi-stage compromise sequencing ({len(staged)})")
+    if score >= 7:
+        return "YES - high-confidence host compromise", "High", reasons, score
+    if score >= 4:
+        return "LIKELY - multiple compromise indicators", "Medium", reasons, score
+    if score >= 2:
+        return "POSSIBLE - weak-to-moderate compromise indicators", "Low", reasons, score
+    return "NO STRONG SIGNAL from the current heuristics", "Low", reasons, score
 
-    for key, label_text in check_labels:
-        evidence_items = checks.get(key, []) if isinstance(checks, dict) else []
-        evidence_items = [str(v) for v in (evidence_items or []) if str(v).strip()]
-        lines.append(label(label_text))
-        if evidence_items:
-            if key == "benign_automation_likely":
-                lines.append(
-                    ok(
-                        f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
-                    )
-                )
-            else:
-                lines.append(
-                    warn(
-                        f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
-                    )
-                )
-            for item in evidence_items[: _limit_value(8 if verbose else 5)]:
-                lines.append(muted(f"- {_redact_in_text(item)}"))
-        else:
-            lines.append(
-                ok(
-                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
-                )
-            )
 
-    priority_rows = list(getattr(summary, "host_priority", []) or [])
-    if priority_rows:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Host Priority Queue"))
-        rows = [
-            ["Host", "IP", "Score", "Severity", "Stages", "IOC Count", "Detection Time"]
-        ]
-        for item in priority_rows[:limit]:
-            stages = item.get("stages", [])
-            stage_text = ",".join(stages) if isinstance(stages, list) else str(stages)
-            rows.append(
-                [
-                    str(item.get("host", "-")),
-                    str(item.get("ip", "-")),
-                    str(item.get("score", "-")),
-                    str(item.get("severity", "-")),
-                    stage_text or "-",
-                    str(item.get("ioc_count", "-")),
-                    format_ts(item.get("detection_time")),
-                ]
-            )
-        lines.append(_format_table(rows))
+def render_compromised_summary(summary: CompromiseSummary, limit: int = 20, verbose: bool = False) -> str:
+    """Which hosts look compromised and why: suspected victims (internal)
+    and the infrastructure they reached (external), then each distinct issue
+    with why it suggests compromise, the hosts, the on-wire evidence and
+    IOCs, tagged with its review class (malicious candidate / hardening /
+    likely FP); incidents and shared campaign indicators follow. The scored
+    assessment, priority queue and per-host detail are -v."""
+    from ..verdict_summary import _classify
 
-    incidents = list(getattr(summary, "incidents", []) or [])
-    if incidents:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Incident Timeline"))
-        rows = [["Host IP", "First", "Last", "Events", "Stages", "Duration"]]
-        for item in incidents[:limit]:
-            first_ts = item.get("first_ts")
-            last_ts = item.get("last_ts")
-            duration = None
-            if isinstance(first_ts, (int, float)) and isinstance(last_ts, (int, float)):
-                duration = max(0.0, float(last_ts) - float(first_ts))
-            stages = item.get("stages", [])
-            rows.append(
-                [
-                    str(item.get("ip", "-")),
-                    format_ts(first_ts),
-                    format_ts(last_ts),
-                    str(item.get("count", "-")),
-                    ",".join(str(v) for v in stages)
-                    if isinstance(stages, list)
-                    else str(stages),
-                    format_duration(duration),
-                ]
-            )
-        lines.append(_format_table(rows))
+    rep = st.Report("Compromise", summary.path)
+    hosts = sorted(summary.compromised_hosts, key=lambda h: (_is_public_ip(h.ip), -st.sev_rank(h.severity), -int(h.score or 0)))
+    victims = [h for h in hosts if not _is_public_ip(h.ip)]
+    infra = [h for h in hosts if _is_public_ip(h.ip)]
+    issues = _dedupe_compromise_issues([d for d in (summary.detections or [])
+                                        if st.sev_rank(d.get("severity", "info")) >= st.sev_rank("medium")])
+    if not hosts:
+        rep.headline(None, "no host met the compromise threshold", f"{st.plural(summary.total_hosts, 'host')} assessed")
+    else:
+        worst = max(hosts, key=lambda h: st.sev_rank(h.severity)).severity
+        text = (f"{st.plural(len(victims), 'suspected victim')} · {st.plural(len(infra), 'external host')} involved" if victims
+                else f"{st.plural(len(infra), 'external host')} flagged, no internal victim identified")
+        rep.headline(worst, text, st.join([f"{st.plural(summary.total_hosts, 'host')} assessed",
+                                           st.plural(len(issues), "issue") if issues else "",
+                                           st.plural(len(summary.incidents), "incident") if summary.incidents else "",
+                                           st.plural(len(summary.campaigns), "shared indicator") if summary.campaigns else ""]))
+    if summary.errors:
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors[: None if st.verbose() else 12]]
+                    + ([st.more(len(summary.errors) - 12, "error")] if not st.verbose() and len(summary.errors) > 12 else []))
 
-    campaigns = list(getattr(summary, "campaigns", []) or [])
-    if campaigns:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Campaign Correlation"))
-        rows = [["Campaign", "Shared IOC", "Host Count", "Hosts"]]
-        for item in campaigns[:limit]:
-            hosts = item.get("hosts", [])
-            host_text = (
-                ", ".join(str(v) for v in hosts[: _limit_value(4)])
-                if isinstance(hosts, list)
-                else str(hosts)
-            )
-            if isinstance(hosts, list) and len(hosts) > _limit_value(4):
-                host_text += "..."
-            rows.append(
-                [
-                    str(item.get("campaign_id", "-")),
-                    _truncate_text(str(item.get("ioc", "-")), 48),
-                    str(item.get("host_count", "-")),
-                    host_text or "-",
-                ]
-            )
-        lines.append(_format_table(rows))
+    def _why(h) -> str:
+        return " | ".join(h.evidence[:2]) if h.evidence else (h.explanation or "-")
 
-    benign_context = list(getattr(summary, "benign_context", []) or [])
-    if benign_context:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("False-Positive Context"))
-        for item in benign_context[: _limit_value(10 if verbose else 6)]:
-            lines.append(muted(f"- {_redact_in_text(str(item))}"))
+    rep.section("Hosts", st.table(
+        ["Scope", "IP", "Host", "Severity", "Score", "Detected", "Why"],
+        [[st.bad("victim") if not _is_public_ip(h.ip) else "external", h.ip, h.hostname or "-", st.badge(h.severity), h.score,
+          st.ts(h.detection_time), _redact_in_text(_why(h))] for h in hosts],
+        align="lllllrl", widths=(None, None, 28, None, None, None, 80), max_rows=10, noun="host",
+    ) + ([st.dim("  victims are the internal assets at risk; external hosts are the infrastructure they reached, not necessarily compromised")]
+         if victims and infra else []))
 
-    if not summary.compromised_hosts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(
-            ok("No hosts met compromise thresholds based on available evidence.")
-        )
-        lines.append(SECTION_BAR)
-        return _finalize_output(lines, show_truncation_note=False)
+    names = {h.ip: h.hostname for h in summary.compromised_hosts if h.hostname and h.hostname != "-"}
+    lines: list[str] = []
+    pad = " " * (st.BADGE_W + 4)
+    for item in issues if st.verbose() else issues[:8]:
+        tags = []
+        cls = _VERDICT_TAG.get(_classify(item))
+        if cls:
+            tags.append(getattr(st, cls[1])(f"[{cls[0]}]"))
+        rel = str(item.get("hypothesis_relevance", "") or "")
+        if rel:
+            tags.append({"relevant": st.bad, "adjacent": st.caution}.get(rel, st.dim)(f"[{rel}]"))
+        if item.get("skeptical_downgraded"):
+            orig = str(item.get("skeptical_original_severity", "") or "")
+            tags.append(st.dim(f"[skeptical: {item.get('skeptical_rule', '')}{f', was {orig}' if orig else ''}]"))
+        source = str(item.get("source", "") or "")
+        lines.append(f"  {st.badge(item.get('severity'))}  {st.strong(str(item.get('summary', '')))}"
+                     + (st.dim(f"  ({source})") if source else "") + ("  " + " ".join(tags) if tags else ""))
+        ips = sorted(item.get("ips") or [], key=lambda v: (_is_public_ip(v), v))
+        host_text = st.listing([f"{ip}{f' ({names[ip]})' if names.get(ip) else ''}{'' if _is_public_ip(ip) else ' [internal]'}" for ip in ips], 5)
+        evidence = [str(e) for e in (item.get("evidence") or [])]
+        rows = [("why", _compromise_issue_reason(str(item.get("summary", "")), source)),
+                ("skeptical", str(item.get("skeptical_reason", "") or "") if item.get("skeptical_downgraded") else ""),
+                ("hosts", host_text), ("details", _redact_in_text(str(item.get("details", "") or "")))]
+        rows += [("evidence", _redact_in_text(e)) for e in (evidence if st.verbose() else evidence[:2])]
+        if not st.verbose() and len(evidence) > 2:
+            rows.append(("", f"+{len(evidence) - 2} more evidence lines (-v)"))
+        rows.append(("IOCs", st.listing([str(i) for i in (item.get("iocs") or [])], 6)))
+        for label_text, value in rows:
+            if value:
+                lines.append(pad + st.dim(st.cut(f"{label_text + ': ' if label_text else ''}{value}", None if st.verbose() else 140)))
+    if not st.verbose() and len(issues) > 8:
+        lines.append(st.more(len(issues) - 8, "issue"))
+    rep.section("Issues", lines)
+    rep.section("Incidents", st.table(
+        ["Host", "First", "Last", "Duration", "Events", "Stages"],
+        [[i.get("ip", "-"), st.ts(i.get("first_ts")), st.ts(i.get("last_ts")),
+          format_duration(float(i["last_ts"]) - float(i["first_ts"]))
+          if isinstance(i.get("first_ts"), (int, float)) and isinstance(i.get("last_ts"), (int, float))
+          and float(i["last_ts"]) > float(i["first_ts"]) else "-",
+          i.get("count", "-"), ", ".join(str(v) for v in i.get("stages") or []) or "-"] for i in summary.incidents or []],
+        align="llllrl", max_rows=5, noun="incident",
+    ))
+    rep.section("Shared indicators", st.table(
+        ["Campaign", "Shared IOC", "Hosts"],
+        [[c.get("campaign_id", "-"), _redact_in_text(str(c.get("ioc", "-"))), f"{c.get('host_count', '-')}: {st.listing(c.get('hosts') or [], 4)}"]
+         for c in summary.campaigns or []], widths=(None, 48), max_rows=5, noun="indicator",
+    ))
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Compromised Hosts"))
-    rows = [["Hostname", "IP", "Detection Time", "Explanation", "Evidence", "IOCs"]]
-    row_hosts = (
-        summary.compromised_hosts if verbose else summary.compromised_hosts[:limit]
-    )
-    for host in row_hosts:
-        evidence_text = " | ".join(host.evidence[:3]) if host.evidence else "-"
-        ioc_text = ", ".join(host.iocs[:4]) if host.iocs else "-"
-        rows.append(
-            [
-                host.hostname or "-",
-                host.ip,
-                format_ts(host.detection_time),
-                _truncate_text(host.explanation or "-", 60),
-                _truncate_text(evidence_text, 70),
-                _truncate_text(ioc_text, 60),
-            ]
-        )
-    lines.append(_format_table(rows))
-    if not verbose and len(summary.compromised_hosts) > limit:
-        lines.append(
-            muted(
-                f"... {len(summary.compromised_hosts) - limit} additional compromised hosts"
-            )
-        )
+    verdict, confidence, reasons, score = _assessment(summary)
+    rep.section("Assessment", st.kv([("Verdict", verdict), ("Confidence", f"{confidence} (score {score})")])
+                + st.bullets(reasons, max_items=None)
+                + [st.dim("  heuristic: validate with endpoint telemetry; evidence comes from beacon, exfil, credential and threat detections")],
+                detail=True)
+    try:
+        from ..verdict_summary import render as _render_verdict
+        from ..verdict_summary import summarize as _summarize_verdict
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Forensics Notes"))
-    lines.append(
-        muted(
-            "- Compromise assessment is heuristic and should be validated with endpoint telemetry."
-        )
-    )
-    lines.append(
-        muted(
-            "- Evidence and IOCs are extracted from high-signal detections (beaconing, exfil, creds, threats)."
-        )
-    )
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines, show_truncation_note=False)
+        verdict_summary = _summarize_verdict(summary.detections or [])
+        block = _render_verdict(verdict_summary).splitlines() if verdict_summary.total_detections else []
+    except Exception:  # noqa: BLE001 -- the verdict summary must never break output
+        block = []
+    rep.section("Verdict candidates", ["  " + line for line in block], detail=True)
+    rep.section("Priority queue", st.table(
+        ["Host", "IP", "Score", "Severity", "Stages", "IOCs", "Detected"],
+        [[i.get("host", "-"), i.get("ip", "-"), i.get("score", "-"), st.badge(i.get("severity", "info")),
+          ",".join(i.get("stages") or []) if isinstance(i.get("stages"), list) else str(i.get("stages", "-")), i.get("ioc_count", "-"),
+          format_ts(i.get("detection_time"))] for i in (getattr(summary, "host_priority", None) or [])],
+        align="llrllrl", max_rows=None,
+    ), detail=True)
+    rep.section("Host detail", st.table(
+        ["Host", "IP", "Detected", "Roles", "Explanation", "Evidence", "IOCs"],
+        [[h.hostname or "-", h.ip, format_ts(h.detection_time), ", ".join(getattr(h, "roles", None) or []) or "-",
+          _redact_in_text(h.explanation or "-"), _redact_in_text(" | ".join(h.evidence)) or "-", ", ".join(h.iocs) or "-"] for h in hosts],
+        max_rows=None,
+    ), detail=True)
+    rep.section("False-positive context", st.bullets([_redact_in_text(str(b)) for b in (getattr(summary, "benign_context", None) or [])],
+                                                     max_items=None), detail=True)
+    if st.analysis_sections():
+        legacy: list[str] = []
+        _render_deterministic_checks(legacy, summary, "Deterministic Compromise Checks", [
+            ("credential_abuse", "Credential Abuse Evidence"), ("beacon_c2", "Beacon/C2 Evidence"), ("exfiltration", "Exfiltration Evidence"),
+            ("lateral_movement", "Lateral Movement Evidence"), ("multi_stage_sequence", "Multi-Stage Sequence Evidence"),
+            ("high_confidence_ioc", "High-Confidence IOC Correlation"), ("benign_automation_likely", "Likely Benign Automation"),
+        ])
+        rep.section("Deterministic checks", legacy[2:])
+    return rep.render()

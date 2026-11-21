@@ -11,6 +11,7 @@ from .dns import analyze_dns
 from .files import analyze_files
 from .netbios import analyze_netbios, collect_netbios_host_intel
 from .ntlm import analyze_ntlm
+from .rpc import analyze_rpc
 from .pcap_cache import PcapMeta, iter_packets
 from .progress import run_with_busy_status
 from .utils import (
@@ -298,86 +299,11 @@ def analyze_domain(
             path, show_status, f"Domain: {desc}", func, *args, **kwargs
         )
 
-    dns_summary = _busy(
-        "DNS", analyze_dns, path, show_status=False, packets=packets, meta=meta
-    )
-    netbios_summary = _busy("NetBIOS", analyze_netbios, path, show_status=False)
-    ntlm_summary = _busy("NTLM", analyze_ntlm, path, show_status=False)
-    files_summary = _busy("Files", analyze_files, path, show_status=False)
-
-    domains = Counter()
-    for qname, count in dns_summary.qname_counts.items():
-        qname_lower = qname.lower().strip(".")
-        if any(qname_lower.endswith(suffix) for suffix in _DOMAIN_SKIP_SUFFIXES):
-            continue
-        base = _base_domain(qname_lower)
-        if base:
-            domains[base] += count
-
-    dc_hosts = Counter()
-    host_labels_by_ip: Dict[str, str] = {}
-    for ip, host in netbios_summary.hosts.items():
-        if host.is_domain_controller:
-            dc_hosts[ip] += 1
-        primary = _extract_primary_host_label(host)
-        if primary:
-            host_labels_by_ip[str(ip)] = primary
-
-    # Passive domain/DC discovery from Browser (MS-BRWS) announcements — the
-    # announced workgroup/domain name, the DC/BDC/master-browser roster, and
-    # per-host server roles. Present even when there is no Kerberos/LDAP.
-    netbios_domains: Counter = Counter()
-    browser_roles: Dict[str, List[str]] = {}
-    try:
-        _nb_intel = collect_netbios_host_intel(netbios_summary)
-    except Exception:
-        _nb_intel = {}
-    for _bip, _facts in _nb_intel.items():
-        if _facts.get("is_dc"):
-            dc_hosts[str(_bip)] += 1
-        _hn = str(_facts.get("hostname", "") or "").strip()
-        if _hn:
-            host_labels_by_ip.setdefault(str(_bip), _hn)
-        _roles = [str(r) for r in _facts.get("roles", []) or []]
-        if _roles:
-            browser_roles[str(_bip)] = _roles
-    for _dom, _cnt in getattr(netbios_summary, "browser_domains", Counter()).items():
-        if _dom:
-            netbios_domains[str(_dom)] += int(_cnt)
-
-    users = Counter(
-        {
-            name: int(count)
-            for name, count in Counter(ntlm_summary.raw_users).items()
-            if _is_plausible_domain_user(name)
-        }
-    )
-    computer_names = Counter(
-        {
-            name: int(count)
-            for name, count in Counter(ntlm_summary.raw_workstations).items()
-            if _is_plausible_computer_name(name)
-        }
-    )
-
-    for name in netbios_summary.unique_names:
-        if _is_plausible_computer_name(name):
-            computer_names[_clean_identity_token(name)] += 1
-    for _bip, _facts in _nb_intel.items():
-        _hn = str(_facts.get("hostname", "") or "").strip()
-        if _hn and _is_plausible_computer_name(_hn):
-            computer_names[_clean_identity_token(_hn)] += 1
-
-    response_codes = Counter()
-    response_codes.update(netbios_summary.response_codes)
-    response_codes.update(ntlm_summary.status_codes)
-
-    request_counts = Counter()
-    request_counts.update(netbios_summary.request_counts)
-    request_counts.update(ntlm_summary.request_counts)
-
-    files = [art.filename for art in files_summary.artifacts]
-
+    # This analysis's own pass over the capture comes first: inside a shared
+    # pass it then reads in the round that computes the analyses below
+    # instead of a round of its own after them. It needs none of their
+    # results; the users it sees join the NTLM ones further down, in order.
+    loop_users: Counter[str] = Counter()
     total_packets = 0
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
@@ -560,7 +486,7 @@ def analyze_domain(
                         if match:
                             user_val = _clean_identity_token(match.group(3))
                             if _is_plausible_domain_user(user_val):
-                                users[user_val] += 1
+                                loop_users[user_val] += 1
                     for pattern in _CRED_PASS_PATTERNS:
                         match = pattern.search(value)
                         if match:
@@ -604,6 +530,96 @@ def analyze_domain(
                         kerberos_msgtype_by_src[client_ip][msg_type] += 1
                     for etype in _extract_kerberos_etypes(payload):
                         kerberos_etypes_by_src[client_ip][etype] += 1
+
+    dns_summary = _busy(
+        "DNS", analyze_dns, path, show_status=False, packets=packets, meta=meta
+    )
+    netbios_summary = _busy("NetBIOS", analyze_netbios, path, show_status=False)
+    ntlm_summary = _busy("NTLM", analyze_ntlm, path, show_status=False)
+    # DRSUAPI sessions on any port (the replication endpoint is a dynamic
+    # port, so the 135/593/445 scan below never sees it), including those
+    # identified from their opnums when the bind is not in the capture.
+    try:
+        rpc_summary = _busy("RPC", analyze_rpc, path, show_status=False)
+    except Exception as exc:  # noqa: BLE001 - one helper must not sink the report
+        rpc_summary = None
+        errors.append(f"RPC helper failed: {exc}")
+    files_summary = _busy("Files", analyze_files, path, show_status=False)
+
+    domains = Counter()
+    for qname, count in dns_summary.qname_counts.items():
+        qname_lower = qname.lower().strip(".")
+        if any(qname_lower.endswith(suffix) for suffix in _DOMAIN_SKIP_SUFFIXES):
+            continue
+        base = _base_domain(qname_lower)
+        if base:
+            domains[base] += count
+
+    dc_hosts = Counter()
+    host_labels_by_ip: Dict[str, str] = {}
+    for ip, host in netbios_summary.hosts.items():
+        if host.is_domain_controller:
+            dc_hosts[ip] += 1
+        primary = _extract_primary_host_label(host)
+        if primary:
+            host_labels_by_ip[str(ip)] = primary
+
+    # Passive domain/DC discovery from Browser (MS-BRWS) announcements — the
+    # announced workgroup/domain name, the DC/BDC/master-browser roster, and
+    # per-host server roles. Present even when there is no Kerberos/LDAP.
+    netbios_domains: Counter = Counter()
+    browser_roles: Dict[str, List[str]] = {}
+    try:
+        _nb_intel = collect_netbios_host_intel(netbios_summary)
+    except Exception:
+        _nb_intel = {}
+    for _bip, _facts in _nb_intel.items():
+        if _facts.get("is_dc"):
+            dc_hosts[str(_bip)] += 1
+        _hn = str(_facts.get("hostname", "") or "").strip()
+        if _hn:
+            host_labels_by_ip.setdefault(str(_bip), _hn)
+        _roles = [str(r) for r in _facts.get("roles", []) or []]
+        if _roles:
+            browser_roles[str(_bip)] = _roles
+    for _dom, _cnt in getattr(netbios_summary, "browser_domains", Counter()).items():
+        if _dom:
+            netbios_domains[str(_dom)] += int(_cnt)
+
+    users = Counter(
+        {
+            name: int(count)
+            for name, count in Counter(ntlm_summary.raw_users).items()
+            if _is_plausible_domain_user(name)
+        }
+    )
+    computer_names = Counter(
+        {
+            name: int(count)
+            for name, count in Counter(ntlm_summary.raw_workstations).items()
+            if _is_plausible_computer_name(name)
+        }
+    )
+
+    for name in netbios_summary.unique_names:
+        if _is_plausible_computer_name(name):
+            computer_names[_clean_identity_token(name)] += 1
+    for _bip, _facts in _nb_intel.items():
+        _hn = str(_facts.get("hostname", "") or "").strip()
+        if _hn and _is_plausible_computer_name(_hn):
+            computer_names[_clean_identity_token(_hn)] += 1
+
+    response_codes = Counter()
+    response_codes.update(netbios_summary.response_codes)
+    response_codes.update(ntlm_summary.status_codes)
+
+    request_counts = Counter()
+    request_counts.update(netbios_summary.request_counts)
+    request_counts.update(ntlm_summary.request_counts)
+
+    files = [art.filename for art in files_summary.artifacts]
+
+    users.update(loop_users)  # the packet pass's users (it ran first), in its order
 
     duration = 0.0
     if first_seen is not None and last_seen is not None:
@@ -1172,7 +1188,32 @@ def analyze_domain(
                 "source": "Domain",
             }
         )
-    if deterministic_checks["dcsync_fingerprint_evidence"]:
+    dcsync_sessions = [d for d in (getattr(rpc_summary, "dcsync_sessions", None) or []) if d.get("replication")]
+    rogue = [d for d in dcsync_sessions if str(d.get("client")) not in dc_set]
+    for d in dcsync_sessions:
+        if str(d.get("client")) in dc_set:
+            benign_context.append(f"DRSUAPI replication {d['client']} -> {d['server']} is between domain controllers")
+    if rogue:
+        flows = ", ".join(f"{d['client']} -> {d['server']}:{d['server_port']}" for d in rogue[:5])
+        inferred = sum(1 for d in rogue if d.get("inferred"))
+        detections.append(
+            {
+                "severity": "high",
+                "summary": "DCSync from a non-DC host (DRSGetNCChanges)",
+                "details": (
+                    f"{flows}"
+                    + (f"; {inferred} identified from the DRSUAPI opnum sequence (bind not captured)" if inferred else "")
+                    + ". Domain-controller replication from a workstation or server is credential theft "
+                    "(secretsdump, mimikatz lsadump::dcsync): reset krbtgt and the replicated accounts."
+                ),
+                "source": "Domain",
+                "mitre": "T1003.006",
+                "src": rogue[0]["client"],
+                "dst": rogue[0]["server"],
+                "ts": rogue[0].get("first_seen"),
+            }
+        )
+    if deterministic_checks["dcsync_fingerprint_evidence"] and not rogue:
         detections.append(
             {
                 "severity": "high",

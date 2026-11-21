@@ -1,61 +1,40 @@
-"""Rendered output for synchrophasor analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for IEEE C37.118 synchrophasor (PMU/PDC) analysis."""
 
 from __future__ import annotations
-from ..coloring import (
-    danger,
-    header,
-    muted,
-    warn,
-)
+
 from ..synchrophasor import SynchrophasorSummary
-
-from ._common import (
-    _filtered_detections,
-    _finalize_output,
-    _format_counter,
-    _format_kv,
-    _limit_value,
-    _ot_full_render,
-    _render_ot_verdict,
-)
+from . import _style as st
+from ._kv import counter_line, findings_for, window
 
 
-@_ot_full_render
-def render_synchrophasor_summary(
-    summary: SynchrophasorSummary, verbose: bool = False
-) -> str:
-    lines = [header("SYNCHROPHASOR ANALYSIS")]
-    _render_ot_verdict(lines, "Synchrophasor (C37.118)", getattr(summary, "detections", []))
-    lines.append(_format_kv("C37.118 Frames", str(summary.synchrophasor_packets)))
-    lines.append(_format_kv("Frame Types", _format_counter(summary.frame_types, 6)))
-    if summary.id_codes:
-        lines.append(
-            _format_kv(
-                "PMU/PDC ID Codes",
-                ", ".join(str(c) for c, _ in summary.id_codes.most_common(8)),
-            )
-        )
-    if summary.commands:
-        lines.append(_format_kv("Command Frames", _format_counter(summary.commands, 6)))
-    lines.append(_format_kv("Top Sources", _format_counter(summary.src_ips, 5)))
-    lines.append(_format_kv("Top Destinations", _format_counter(summary.dst_ips, 5)))
+def render_synchrophasor_summary(summary: SynchrophasorSummary, verbose: bool = False) -> str:
+    rep = st.Report("Synchrophasor", summary.path)
+    findings = findings_for(summary)
+    if not summary.synchrophasor_packets and not st.material(findings):
+        return rep.absent("IEEE C37.118 traffic", summary.errors)
+    severity, text = st.verdict(
+        findings,
+        high="high-severity PMU/PDC activity (commands or configuration change): confirm it is authorized",
+        medium="synchrophasor anomalies to review",
+    )
+    rep.headline(severity, text, st.join([
+        f"{st.count(summary.synchrophasor_packets)} C37.118 frames",
+        st.duration(summary.duration_seconds) if summary.duration_seconds else "",
+        window(summary),
+    ]))
+    rep.scope(st.join([
+        f"{st.plural(len(summary.src_ips), 'source')} -> {st.plural(len(summary.dst_ips), 'destination')}",
+        st.plural(len(summary.id_codes), "PMU/PDC ID code") if summary.id_codes else "",
+    ]))
     if summary.errors:
-        lines.append(_format_kv("Errors", "; ".join(summary.errors)))
-    detections = _filtered_detections(summary, verbose)
-    if detections:
-        lines.append(header("Detections"))
-        for item in detections[: _limit_value(8)]:
-            sev = str(item.get("severity", "info")).upper()
-            summary_text = str(item.get("summary", ""))
-            details = str(item.get("details", ""))
-            sev_color = danger if sev in {"CRITICAL", "HIGH"} else warn
-            if sev in {"INFO", "LOW"}:
-                sev_color = muted
-            lines.append(sev_color(f"[{sev}] {summary_text}"))
-            if details:
-                lines.append(muted(f"  {details}"))
-    return _finalize_output(lines)
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Findings", st.findings_block(findings))
+    rep.section("Stream", st.kv([
+        counter_line("Command frames", summary.commands, 6),
+        counter_line("Frame types", summary.frame_types, 6),
+        ("PMU/PDC ID codes", ", ".join(str(c) for c, _ in summary.id_codes.most_common(None if st.verbose() else 8))),
+        counter_line("Sources", summary.src_ips),
+        counter_line("Destinations", summary.dst_ips),
+    ]))
+    rep.section("Capture", st.kv([("Total packets", st.count(summary.total_packets))]), detail=True)
+    return rep.render()

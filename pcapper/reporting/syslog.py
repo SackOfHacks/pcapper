@@ -1,208 +1,103 @@
-"""Rendered output for syslog analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for syslog: the log messages themselves -- the notable
+ones (warning and worse, or matching an auth/execution/tampering pattern)
+first -- with who sent them, plus the facility, severity, host and app mix.
+Binary payloads on syslog ports are counted, not printed."""
 
 from __future__ import annotations
-from ..coloring import (
-    danger,
-    header,
-    muted,
-    ok,
-    warn,
-)
-from ..syslog import SyslogSummary
-from ..utils import (
-    format_bytes_as_mb,
-    format_duration,
-)
 
-from ._common import (
-    SECTION_BAR,
-    SUBSECTION_BAR,
-    _apply_verbose_limit,
-    _counter_table,
-    _filtered_detections,
-    _finalize_output,
-    _format_client_server_table,
-    _format_kv,
-    _format_sessions_table,
-    _format_table,
-    _limit_value,
-    _meaningful_plaintext_items,
-    _render_protocol_verdict,
-    _truncate_text,
-)
+from ..syslog import SUSPICIOUS_PATTERNS, SyslogSummary, is_text_message
+from . import _style as st
+from ._common import _meaningful_plaintext_items
+from ._kv import counter_line, findings_for
+from ._remote import counts, session_table
+
+_SEVERITY_STYLE = {0: st.bad, 1: st.bad, 2: st.bad, 3: st.caution, 4: st.caution}
 
 
-def render_syslog_summary(
-    summary: SyslogSummary, limit: int = 12, verbose: bool = False
-) -> str:
-    limit = _apply_verbose_limit(limit)
+def _flag(message: str) -> str:
+    return next((label for pattern, label in SUSPICIOUS_PATTERNS if pattern.search(message)), "")
+
+
+def render_syslog_summary(summary: SyslogSummary, limit: int = 12, verbose: bool = False) -> str:
     if not summary:
         return ""
-
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"SYSLOG ANALYSIS :: {summary.path.name}"))
-    lines.append(SECTION_BAR)
-    _render_protocol_verdict(
-        lines,
-        label="Syslog",
-        detections=getattr(summary, "detections", None),
-        anomalies=getattr(summary, "anomalies", None),
-    )
-
+    rep = st.Report("Syslog", summary.path)
+    findings = findings_for(summary, ot=False)
+    if not summary.syslog_packets and not st.material(findings):
+        return rep.absent("syslog traffic", summary.errors)
+    severity, text = st.verdict(findings, high="high-severity events in the logs: investigate",
+                                medium="log events to review")
+    rep.headline(severity, text, st.join([
+        f"{st.count(summary.total_messages)} messages",
+        st.duration(summary.duration_seconds) if summary.duration_seconds else "",
+        st.ts_range(summary.first_seen, summary.last_seen) if summary.first_seen else "",
+    ]))
+    ports = ", ".join(str(p) for p, _ in summary.server_ports.most_common(4))
+    rep.scope(st.join([f"{st.plural(summary.unique_clients, 'sender')} -> {st.plural(summary.unique_servers, 'collector')}",
+                       f"port {ports}" if ports else ""]))
     if summary.errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        for err in summary.errors:
-            lines.append(danger(f"- {err}"))
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Findings", st.findings_block(findings))
 
-    lines.append(_format_kv("Total Packets", str(summary.total_packets)))
-    lines.append(_format_kv("Syslog Packets", str(summary.syslog_packets)))
-    lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
-    if summary.duration_seconds is not None:
-        lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
-    lines.append(_format_kv("Messages", str(summary.total_messages)))
-    lines.append(_format_kv("Unique Clients", str(summary.unique_clients)))
-    lines.append(_format_kv("Unique Servers", str(summary.unique_servers)))
+    messages = list(getattr(summary, "messages", None) or [])
+    texts = [m for m in messages if is_text_message(str(m.get("message") or ""))]
+    binary = len(messages) - len(texts)
+    if binary:
+        rep.note("NOTE", f"{st.count(binary)} payloads on syslog ports are not text (binary or padding); not listed")
+    if summary.total_messages > len(messages):
+        rep.note("CAPPED", f"the first {st.count(len(messages))} of {st.count(summary.total_messages)} messages were kept")
 
-    if summary.server_ports:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Server Ports"))
-        lines.append(_counter_table(summary.server_ports, "Port", limit=limit))
+    def _rows(items: list) -> list:
+        rows = []
+        for m in sorted(items, key=lambda m: m.get("ts") or 0.0):
+            pri = m.get("pri")
+            sev = str(m.get("severity") or "-")
+            msg = str(m.get("message") or "").rstrip("\x00\r\n ")
+            flag = _flag(msg)
+            rows.append([st.ts(m.get("ts"))] + ([m.get("logged") or "-"] if st.verbose() else [])
+                        + [m.get("src") or "-", m.get("hostname") or "-", m.get("appname") or "-",
+                           _SEVERITY_STYLE.get(pri, str)(sev) if isinstance(pri, int) else sev,
+                           st.bad(flag) if flag else "", msg])
+        return rows
 
-    if summary.client_counts or summary.server_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Syslog Clients & Servers"))
-        lines.append(
-            _format_client_server_table(summary.client_counts, summary.server_counts)
-        )
+    # "Logged" (-v) is the sender's own header timestamp: compare it with the
+    # capture time to spot clock skew or replayed logs.
+    columns = ["Time"] + (["Logged"] if st.verbose() else []) + ["Sender", "Host", "App", "Severity", "Flag", "Message"]
+    notable = [m for m in texts if (isinstance(m.get("pri"), int) and m["pri"] <= 4) or _flag(str(m.get("message") or ""))]
+    if notable:
+        rep.section("Notable messages", st.table(columns, _rows(notable), widths=(None, None, 24, 20, None, 26, 90) if not st.verbose() else (),
+                                                 max_rows=15, noun="message"))
+    if st.verbose() or not notable:
+        rep.section("Messages", st.table(columns, _rows(texts), widths=(None, None, 24, 20, None, 26, 90) if not st.verbose() else (),
+                                         max_rows=10, noun="message"))
+    rep.section("Mix", st.kv([
+        counter_line("Severities", summary.severity_counts, 8),
+        counter_line("Facilities", summary.facility_counts, 6),
+        counter_line("Hosts", summary.hostname_counts, 6),
+        counter_line("Apps", summary.appname_counts, 6),
+        counter_line("Senders", summary.client_counts, 6),
+        counter_line("Collectors", summary.server_counts, 6),
+    ]))
+    rep.section("Files", counts(summary.file_artifacts, "File", width=100, noun="file"))
 
-    if summary.hostname_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Observed Hostnames"))
-        rows = [["Hostname", "Count"]]
-        for name, count in summary.hostname_counts.most_common(limit):
-            rows.append([_truncate_text(name, 50), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.appname_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Observed Applications"))
-        rows = [["App", "Count"]]
-        for name, count in summary.appname_counts.most_common(limit):
-            rows.append([_truncate_text(name, 50), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.version_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Syslog Versions"))
-        lines.append(_counter_table(summary.version_counts, "Version", limit=limit))
-
-    if summary.facility_counts or summary.severity_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Facility & Severity"))
-        rows = [["Facilities", "Severities"]]
-        facility_text = (
-            ", ".join(
-                f"{name}({count})"
-                for name, count in summary.facility_counts.most_common(_limit_value(6))
-            )
-            or "-"
-        )
-        severity_text = (
-            ", ".join(
-                f"{name}({count})"
-                for name, count in summary.severity_counts.most_common(_limit_value(6))
-            )
-            or "-"
-        )
-        rows.append([facility_text, severity_text])
-        lines.append(_format_table(rows))
-
-    if summary.request_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Request Summary"))
-        rows = [["Request", "Count"]]
-        for name, count in summary.request_counts.most_common(limit):
-            rows.append([_truncate_text(name, 50), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.response_codes:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Response Codes"))
-        rows = [["Code", "Count"]]
-        for name, count in summary.response_codes.most_common(limit):
-            rows.append([_truncate_text(name, 30), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.conversations:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Syslog Sessions"))
-        lines.append(_format_sessions_table(summary.conversations, limit))
-
-    if summary.plaintext_strings:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Observed Plaintext"))
-        rows = [["String", "Count"]]
-        for text, count in _meaningful_plaintext_items(summary.plaintext_strings, limit):
-            rows.append([_truncate_text(text, 70), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.file_artifacts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Files Discovered"))
-        rows = [["File", "Count"]]
-        for name, count in summary.file_artifacts.most_common(limit):
-            rows.append([_truncate_text(name, 60), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.anomalies:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Anomalies"))
-        for item in summary.anomalies[:limit]:
-            title = item.title
-            details = item.details
-            sev = item.severity
-            sev_color = danger if sev in ("HIGH", "CRITICAL") else warn
-            lines.append(sev_color(f"[{sev}] {title}: {details}"))
-
-    detections = _filtered_detections(summary, verbose)
-    if detections:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Detections"))
-        for item in detections:
-            severity = str(item.get("severity", "info")).lower()
-            summary_text = str(item.get("summary", ""))
-            details = str(item.get("details", ""))
-            if severity in {"critical", "high"}:
-                marker = danger("[HIGH]")
-                summary_text = danger(summary_text)
-            elif severity == "warning":
-                marker = warn("[WARN]")
-            else:
-                marker = ok("[INFO]")
-            lines.append(f"{marker} {summary_text}")
-            if details:
-                lines.append(muted(f"  {details}"))
-
-    if summary.artifacts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Artifacts"))
-        rows = [["Type", "Detail", "Src", "Dst"]]
-        for item in summary.artifacts[:limit]:
-            rows.append(
-                [
-                    str(item.kind),
-                    _truncate_text(str(item.detail), 60),
-                    str(item.src),
-                    str(item.dst),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    message_texts = {str(m.get("message") or "") for m in messages}
+    carved = [(t, n) for t, n in _meaningful_plaintext_items(summary.plaintext_strings, 10**9) if t not in message_texts]
+    rep.section("Carved strings", st.table(["String", "Count"], [[t, st.count(n)] for t, n in carved], align="lr",
+                                           max_rows=None), detail=True)
+    rep.section("Sessions", session_table(summary.conversations, [("Proto", lambda c: c.protocol)], max_rows=None),
+                detail=True)
+    rep.section("Header fields", st.kv([
+        counter_line("Versions", summary.version_counts, None),
+        counter_line("Process IDs", getattr(summary, "procid_counts", None), None),
+        counter_line("Message IDs", getattr(summary, "msgid_counts", None), None),
+        counter_line("Transports", getattr(summary, "protocol_counts", None), None),
+        counter_line("Ports", summary.server_ports, None),
+    ]), detail=True)
+    rep.section("Artifacts", st.table(["Kind", "Detail", "Flow"],
+                                      [[a.kind, a.detail, st.flow(a.src, a.dst)] for a in summary.artifacts],
+                                      max_rows=None), detail=True)
+    rep.section("Traffic", st.kv([
+        ("Packets", f"{summary.total_packets} total · {summary.syslog_packets} syslog"),
+        ("Bytes", st.size(summary.total_bytes)),
+    ]), detail=True)
+    return rep.render()

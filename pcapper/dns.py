@@ -17,6 +17,7 @@ from typing import Callable, Optional
 from .pcap_cache import PcapMeta, iter_packets
 from .progress import build_statusbar
 from .utils import (
+    dns_message,
     counter_inc,
     decode_payload,
     env_int,
@@ -321,6 +322,39 @@ class DnsSummary:
     timeline: list[dict[str, object]] = field(default_factory=list)
     periodicity_profiles: list[dict[str, object]] = field(default_factory=list)
     benign_context: list[str] = field(default_factory=list)
+
+
+def rcode_name(rcode_id: int) -> str:
+    """The IANA name of a DNS response code (``3`` -> ``NXDOMAIN``)."""
+    # IANA DNS RCODEs. Values 16+ are EDNS/TSIG extended codes; the basic
+    # header carries only the low 4 bits so 11-15 are what normally surface.
+    name = {
+        0: "NOERROR",
+        1: "FORMERR",
+        2: "SERVFAIL",
+        3: "NXDOMAIN",
+        4: "NOTIMP",
+        5: "REFUSED",
+        6: "YXDOMAIN",
+        7: "YXRRSET",
+        8: "NXRRSET",
+        9: "NOTAUTH",
+        10: "NOTZONE",
+        11: "DSOTYPENI",
+        16: "BADVERS/BADSIG",
+        17: "BADKEY",
+        18: "BADTIME",
+        19: "BADMODE",
+        20: "BADNAME",
+        21: "BADALG",
+        22: "BADTRUNC",
+        23: "BADCOOKIE",
+    }.get(rcode_id)
+    if name:
+        return name
+    if 12 <= rcode_id <= 15:
+        return "UNASSIGNED"
+    return "UNKNOWN"
 
 
 def _size_stats(values: list[int]) -> dict[str, object]:
@@ -685,7 +719,7 @@ def analyze_dns(
     first_skip_error: str | None = None
 
     for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
-        dns_layer = pkt.getlayer(DNS)  # type: ignore[arg-type]
+        dns_layer = dns_message(pkt)  # DNS, or LLMNR (a separate scapy layer)
         if dns_layer is None:
             continue
         try:

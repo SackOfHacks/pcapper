@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import copy
 import dataclasses
+import functools
 import difflib
 import glob
 import inspect
@@ -19,8 +20,11 @@ from pathlib import Path
 from typing import Any
 
 from . import __version__
+from . import pcap_cache
+from . import sharedpass
 from .aim import analyze_aim, merge_aim_summaries
 from .analyzer import analyze_pcap, merge_pcap_summaries
+from .packet_at import analyze_packet_at
 from .arp import analyze_arp, merge_arp_summaries
 from .bacnet import analyze_bacnet
 from .baseline import build_baseline, compare_baseline, load_baseline
@@ -50,7 +54,13 @@ from .genisys import analyze_genisys
 from .csp import analyze_csp
 from .ctf import analyze_ctf
 from .decode import analyze_decode
-from .decryption import DecryptConfig, DecryptSummary, decrypt_ssh, decrypt_tls
+from .decryption import (
+    DecryptConfig,
+    DecryptSummary,
+    decrypt_capture,
+    discard_decrypt_feeds,
+    start_decrypt_feeds,
+)
 from .df1 import analyze_df1
 from .dhcp import analyze_dhcp, merge_dhcp_summaries
 from .capture_parts import capture_size, group_split_captures
@@ -61,6 +71,7 @@ from .port_overrides import DecodeAsError, register_spec as register_decode_as
 from .discovery import find_pcaps, is_supported_pcap
 from .dnp3 import analyze_dnp3
 from .dns import analyze_dns
+from .dnsqueries import analyze_dns_queries
 from .domain import analyze_domain
 from .email import analyze_email, merge_email_summaries
 from .encrypted_dns import analyze_encrypted_dns
@@ -76,6 +87,7 @@ from .hart import analyze_hart
 from .health import analyze_health, merge_health_summaries
 from .honeywell import analyze_honeywell
 from .hostdetails import analyze_hostdetails, merge_hostdetails_summaries
+from .hosts import analyze_hosts
 from .hostname import analyze_hostname, merge_hostname_summaries
 from .http import analyze_http
 from .http2 import analyze_http2
@@ -112,15 +124,21 @@ from .opc import analyze_opc
 from .opc_classic import analyze_opc_classic
 from .overview import analyze_overview, merge_overview_summaries
 from .ot_commands import OtControlConfig, analyze_ot_commands, load_ot_control_config
+from . import progress
+from .progress import display_session
 from .pcap_cache import (
     clear_forced_packet_view,
+    estimated_packets,
+    fits_in_memory,
     get_cache_config,
     is_scapy_available,
-    iter_packets,
     load_filtered_packets,
     load_packets_if_allowed,
+    memory_admissible,
+    max_cache_packets,
     set_forced_packet_view,
 )
+from .industrial_helpers import merge_size_buckets
 from .pcapmeta import analyze_pcapmeta
 from .pccc import analyze_pccc
 from .pcworx import analyze_pcworx
@@ -161,6 +179,7 @@ from .reporting import (
     render_dnp3_rollup,
     render_dnp3_summary,
     render_dns_summary,
+    render_dnsqueries_summary,
     render_domain_summary,
     render_email_summary,
     render_encrypted_dns_summary,
@@ -292,7 +311,13 @@ from .syslog import analyze_syslog
 from .tcp import analyze_tcp
 from .teamviewer import analyze_teamviewer, merge_teamviewer_summaries
 from .telnet import analyze_telnet, merge_telnet_summaries
-from .threats import analyze_suricata, analyze_threats, merge_threats_summaries
+from .threats import (
+    analyze_suricata,
+    analyze_threats,
+    discard_suricata_feeds,
+    merge_threats_summaries,
+    start_suricata_feed,
+)
 from .timeline import (
     NON_OT_CATEGORIES,
     OT_CATEGORIES,
@@ -303,6 +328,7 @@ from .timeline import (
 from .tls import analyze_tls
 from .udp import analyze_udp
 from .utils import (
+    format_bytes_as_mb,
     detect_file_type,
     display_safe,
     hexdump,
@@ -362,6 +388,7 @@ def _core_flag_map() -> dict[str, str]:
         "--vlan": "vlan",
         "--icmp": "icmp",
         "--dns": "dns",
+        "--dnsqueries": "dnsqueries",
         "--http": "http",
         "--webrequests": "webrequests",
         "--ftp": "ftp",
@@ -517,6 +544,563 @@ def _ordered_steps(
 
 # Steps that read OT protocols by port, directly or by fanning out: worth one
 # bounded payload-structure pass to find OT protocols on non-standard ports.
+# Steps whose call in the step loop is exactly ``analyze_x(path, show_status=...,
+# packets=..., meta=...)``: a shared pass (pcapper.sharedpass) can compute them
+# under the memo key the step then looks up. tests/test_shared_pass.py derives
+# this table from the step loop again and fails when it drifts.
+_SIMPLE_STEP_ANALYZERS: dict[str, tuple[str, ...]] = {
+    "aim": ("analyze_aim",),
+    "arp": ("analyze_arp",),
+    "bacnet": ("analyze_bacnet",),
+    "beacon": ("analyze_beacons",),
+    "bsap": ("analyze_bsap",),
+    "certificates": ("analyze_certificates",),
+    "cip": ("analyze_cip",),
+    "coap": ("analyze_coap",),
+    "codesys": ("analyze_codesys",),
+    "control_loop": ("analyze_control_loop",),
+    "creds": ("analyze_creds",),
+    "crimson": ("analyze_crimson",),
+    "csp": ("analyze_csp",),
+    "ctf": ("analyze_ctf",),
+    "df1": ("analyze_df1",),
+    "dhcp": ("analyze_dhcp",),
+    "dnp3": ("analyze_dnp3",),
+    "domain": ("analyze_domain",),
+    "email": ("analyze_email",),
+    "encrypted_dns": ("analyze_encrypted_dns",),
+    "enip": ("analyze_enip",),
+    "ethercat": ("analyze_ethercat",),
+    "exfil": ("analyze_exfil",),
+    "fins": ("analyze_fins",),
+    "ftp": ("analyze_ftp",),
+    "genisys": ("analyze_genisys",),
+    "goose": ("analyze_goose",),
+    "hart": ("analyze_hart",),
+    "health": ("analyze_health",),
+    "honeywell": ("analyze_honeywell",),
+    "http2": ("analyze_http2",),
+    "iccp": ("analyze_iccp",),
+    "icmp": ("analyze_icmp",),
+    "iec101_103": ("analyze_iec101_103",),
+    "iec104": ("analyze_iec104",),
+    "kerberos": ("analyze_kerberos",),
+    "ldap": ("analyze_ldap",),
+    "lldp": ("analyze_lldp_dcp",),
+    "malware": ("analyze_malware",),
+    "melsec": ("analyze_melsec",),
+    "mms": ("analyze_mms",),
+    "modbus": ("analyze_modbus",),
+    "modicon": ("analyze_modicon",),
+    "mqtt": ("analyze_mqtt",),
+    "netbios": ("analyze_netbios",),
+    "nfs": ("analyze_nfs",),
+    "niagara": ("analyze_niagara",),
+    "ntlm": ("analyze_ntlm",),
+    "ntp": ("analyze_ntp",),
+    "obfuscation": ("analyze_obfuscation",),
+    "opc": ("analyze_opc",),
+    "opc_classic": ("analyze_opc_classic",),
+    "pcapmeta": ("analyze_pcapmeta",),
+    "pccc": ("analyze_pccc",),
+    "pcworx": ("analyze_pcworx",),
+    "powershell": ("analyze_powershell",),
+    "prconos": ("analyze_prconos",),
+    "profinet": ("analyze_profinet",),
+    "protocols": ("analyze_protocols",),
+    "ptp": ("analyze_ptp",),
+    "quic": ("analyze_quic",),
+    "rdp": ("analyze_rdp",),
+    "routing": ("analyze_routing",),
+    "rpc": ("analyze_rpc",),
+    "s7": ("analyze_s7",),
+    "safety": ("analyze_safety",),
+    "scan": ("analyze_scan",),
+    "secrets": ("analyze_secrets",),
+    "sizes": ("analyze_sizes",),
+    "smb": ("analyze_quic", "analyze_smb",),
+    "snmp": ("analyze_snmp",),
+    "srtp": ("analyze_srtp",),
+    "ssdp": ("analyze_ssdp",),
+    "ssh": ("analyze_ssh",),
+    "strings": ("analyze_strings",),
+    "sv": ("analyze_sv",),
+    "synchrophasor": ("analyze_synchrophasor",),
+    "syslog": ("analyze_syslog",),
+    "tcp": ("analyze_tcp",),
+    "teamviewer": ("analyze_teamviewer",),
+    "telnet": ("analyze_telnet",),
+    "udp": ("analyze_udp",),
+    "vlan": ("analyze_vlans",),
+    "vnc": ("analyze_vnc",),
+    "vpn": ("analyze_vpn",),
+    "winrm": ("analyze_winrm",),
+    "wlan": ("analyze_wlan",),
+    "wmic": ("analyze_wmic",),
+    "yokogawa": ("analyze_yokogawa",),
+}
+
+
+_ROLLUP_MIN_FIELDS = ("first_seen", "first_ts", "first_time", "start_ts", "start_time", "earliest")
+_ROLLUP_MAX_FIELDS = ("last_seen", "last_ts", "last_time", "end_ts", "end_time", "latest")
+
+
+def _rollup_time_mode(field_name: str | None) -> str | None:
+    """'min'/'max' for fields holding a first/last timestamp (or a map of
+    them): merging rollups must keep the earliest/latest, not add times up."""
+    name = str(field_name or "")
+    if name in _ROLLUP_MIN_FIELDS:
+        return "min"
+    if name in _ROLLUP_MAX_FIELDS:
+        return "max"
+    return None
+
+
+# Numeric fields that are not counts: adding them across captures gives
+# nonsense (two link-type-1 captures became "LINKTYPE_2", a snaplen doubled).
+_ROLLUP_MAX_SEGMENTS = frozenset({
+    "linktype", "snaplen", "version", "ratio", "rate", "score", "avg", "average", "mean", "median",
+    "percent", "pct", "confidence", "ttl", "mtu", "unique", "max", "peak", "level", "entropy",
+})
+
+
+def _rollup_numeric_kind(field_name: str | None) -> str:
+    """How a rollup combines a numeric field: "sum" for counts, "max" for
+    values that are not additive, "min" for minimums."""
+    segments = set(str(field_name or "").lower().split("_"))
+    if ("min" in segments or "minimum" in segments) and "per" not in segments:  # not "..._per_min"
+        return "min"
+    if segments & _ROLLUP_MAX_SEGMENTS or str(field_name or "").lower().endswith("_port"):
+        return "max"
+    return "sum"
+
+
+def _rollup_set(obj: object, name: str, value: object) -> None:
+    """Set a field on a rollup's merged copy, frozen dataclasses included: the
+    copy belongs to the rollup, and a silently refused setattr used to send
+    every frozen summary (DNS, TLS, CTF, the OT protocols ...) to the generic
+    rollup instead of its own report."""
+    try:
+        setattr(obj, name, value)
+    except (AttributeError, TypeError):
+        object.__setattr__(obj, name, value)
+
+
+def _tag_capture_records(summary: object) -> object:
+    """Mark each per-capture record (a dict in a list field) of a summary
+    copy with its capture's name, so merged rows such as CTF candidates keep
+    saying where their packet numbers come from."""
+    name = str(getattr(getattr(summary, "path", None), "name", "") or "")
+    if not name or not hasattr(summary, "__dict__"):
+        return summary
+    for value in vars(summary).values():
+        if isinstance(value, list):
+            for item in value:
+                if isinstance(item, dict):
+                    item.setdefault("capture", name)
+    return summary
+
+
+def _rollup_fix_duration(summary: object) -> None:
+    """Duration of a merged summary from its merged first/last times: the
+    span the captures cover, not the sum of their durations. Summaries pair
+    their time fields with either duration name (CTF keeps first_seen /
+    last_seen with duration_seconds), so the span goes to whichever exists."""
+    for start_name, end_name in (
+        ("start_ts", "end_ts"),
+        ("first_seen", "last_seen"),
+        ("start_time", "end_time"),
+        ("first_ts", "last_ts"),
+    ):
+        start = getattr(summary, start_name, None)
+        end = getattr(summary, end_name, None)
+        if not (isinstance(start, (int, float)) and isinstance(end, (int, float))):
+            continue
+        if isinstance(start, bool) or isinstance(end, bool):
+            continue
+        span = max(0.0, float(end) - float(start))
+        for duration_name in ("duration_seconds", "duration"):
+            current = getattr(summary, duration_name, False)
+            if current is None or (isinstance(current, (int, float)) and not isinstance(current, bool)):
+                try:
+                    _rollup_set(summary, duration_name, span)
+                except Exception:
+                    pass
+        return
+
+
+# --split: one large capture analysed as N byte windows in N processes, each
+# reported on its own (exactly what splitting it with editcap -c and running
+# pcapper on every part gives, in parallel). Steps tied to packet positions or
+# written files, and outputs that combine captures, need the whole capture.
+_SPLIT_UNSAFE_STEPS = frozenset({"packet", "streams", "carve", "suricata"})
+_MIN_WINDOW_PACKETS = 20_000
+_SPLIT_JOB: tuple | None = None  # (call args, path, windows): inherited by forked workers
+
+
+def _split_windows(
+    path: Path,
+    count: int,
+    *,
+    ordered_steps: list[str],
+    filtered: bool,
+    exclusive_options: bool,
+) -> list | None:
+    """The windows a --split run reports, or None to analyse ``path`` whole
+    (a note on stderr says why)."""
+    reason = None
+    unsafe = sorted(set(ordered_steps) & _SPLIT_UNSAFE_STEPS)
+    if filtered:
+        reason = "packet filters (BPF, time window, IP scope) apply to the whole capture"
+    elif unsafe:
+        reason = "--" + ", --".join(unsafe) + " need the whole capture"
+    elif exclusive_options:
+        reason = (
+            "--packet/--extract/--view/--decrypt, exports, baselines, -summarize and "
+            "--correlate need the whole capture"
+        )
+    elif not sharedpass.parallel_available():
+        reason = "parallel windows need fork() (Linux/macOS)"
+    if reason is None:
+        estimate = estimated_packets(path)
+        if estimate is not None and estimate < 2 * _MIN_WINDOW_PACKETS:
+            reason = f"it holds only ~{estimate:,} packets"
+        else:
+            try:
+                from .rawcap import plan_windows
+
+                # The windows' reports give the capture's hashes: the walk
+                # that indexes it reads every byte, and hashes them too.
+                pcap_cache.want_hashes(path)
+
+                windows = plan_windows(path, count, min_packets=_MIN_WINDOW_PACKETS)
+            except Exception as exc:  # noqa: BLE001
+                windows = None
+                reason = f"the capture could not be indexed ({type(exc).__name__})"
+            if windows and len(windows) >= 2:
+                return windows
+            reason = reason or "compressed or unrecognised captures cannot be split"
+    _print_error(f"--split {count}: analysing {path.name} whole ({reason}).")
+    return None
+
+
+def _split_worker(index: int) -> tuple[str, str, tuple]:
+    """Report one window in a forked worker: (stdout, stderr, time span)."""
+    import contextlib
+    import io
+
+    from . import pcap_cache, utils
+
+    call_args, path, windows = _SPLIT_JOB  # type: ignore[misc]
+    # Nothing the parent held in memory describes this window.
+    pcap_cache._PACKET_CACHE.clear()
+    pcap_cache._FORCED_PACKET_VIEWS.clear()
+    pcap_cache._FORCED_VIEW_SERIALS.clear()
+    pcap_cache._COMPLETE_VIEWS.clear()
+    pcap_cache.forget_primed()  # the parent's reader shares its file offset
+    pcap_cache.forget_tees()
+    utils.clear_analysis_memo()
+    os.environ["PCAPPER_CACHE_MAX_PACKETS"] = str(
+        max(_MIN_WINDOW_PACKETS, max_cache_packets() // max(1, call_args.get("split", 1)))
+    )
+    window = windows[index]
+    pcap_cache.set_capture_window(path, window)
+    args = dict(call_args)
+    args.update(paths=[path], jobs=1, split=1, show_status=False, _window=window)
+    out, err = io.StringIO(), io.StringIO()
+    with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+        _analyze_paths(**args)
+    span: tuple = ()
+    try:
+        from .rawcap import LiteStream, window_span
+
+        # The window's time span: noted by the read of it the analyses made,
+        # else (nothing read it) a read of its own.
+        noted = window_span(window)
+        if noted is not None:
+            span = noted
+        else:
+            stream = LiteStream(path, window)
+            first = last = None
+            for record in stream:
+                if first is None:
+                    first = record
+                last = record
+            stream.close()
+            if first is not None:
+                span = (float(first.time), float(last.time))
+    except Exception:
+        span = ()
+    return out.getvalue(), err.getvalue(), span
+
+
+def _run_split(path: Path, windows: list, call_args: dict) -> bool:
+    """Analyse every window in parallel and print their reports in order."""
+    import multiprocessing
+    from concurrent.futures import ProcessPoolExecutor, as_completed
+
+    from .progress import build_statusbar
+
+    global _SPLIT_JOB
+    # Done once and inherited by every worker: the decode-as ports of the
+    # whole capture and its hashes (each worker would read all of it).
+    if call_args.get("auto_decode_enabled", True) and any(
+        step in _AUTO_DECODE_STEPS for step in call_args.get("ordered_steps", [])
+    ):
+        for detection in auto_decode(path):
+            _print_notice(
+                f"Auto decode-as ({path.name}): {detection.describe()}. "
+                f"Pass --no-auto-decode to disable, or --decode-as to force."
+            )
+    from .pcap_cache import capture_hashes
+
+    capture_hashes(path)
+    workers = min(len(windows), max(1, int(call_args.get("split") or 1)))
+    progress.capture_plan(weights=[1.0])  # the windows are the whole bar
+    _SPLIT_JOB = (call_args, path, windows)
+    results: list = [None] * len(windows)
+    status = build_statusbar(path, enabled=bool(call_args.get("show_status")))
+    try:
+        context = multiprocessing.get_context("fork")
+        with ProcessPoolExecutor(max_workers=workers, mp_context=context) as pool:
+            futures = {pool.submit(_split_worker, i): i for i in range(len(windows))}
+            for done, future in enumerate(as_completed(futures), start=1):
+                results[futures[future]] = future.result()
+                status.update(int(done * 100 / len(windows)))
+    except KeyboardInterrupt:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        _print_error(f"--split: parallel analysis of {path.name} failed ({type(exc).__name__}: {exc}); analysing it whole.")
+        return False
+    finally:
+        status.finish()
+        _SPLIT_JOB = None
+    notes: list[str] = []
+    for index, (text, errors, span) in enumerate(results):
+        window = windows[index]
+        first = window.first_packet + 1
+        last = window.first_packet + window.packets
+        from .reporting import _style as st
+
+        rule = st.accent("━" * 80)
+        print(rule)
+        print(f"{st.strong(f'WINDOW {index + 1}/{len(windows)}')}  "
+              + st.dim(st.join([path.name, f"packets ~{first:,}–{last:,}", st.ts_range(span[0], span[1]) if span else ""])))
+        print(rule)
+        sys.stdout.write(text)
+        if index + 1 < len(windows):
+            print()
+        for line in errors.splitlines():
+            if line.strip() and not line.startswith("Auto decode-as") and line not in notes:
+                notes.append(line)
+    for line in notes:
+        _print_error(line)
+    return True
+
+
+_LARGE_CAPTURE_PACKETS = 1_000_000
+
+
+def _seconds_per_dissection(path: Path, sample: int = 2000) -> float | None:
+    """What scapy takes per packet on this machine, timed on the first records."""
+    import itertools
+    import time
+
+    from .rawcap import LiteStream
+
+    try:
+        stream = LiteStream(path)
+        try:
+            records = list(itertools.islice(stream, sample))
+        finally:
+            stream.close()
+        if len(records) < 200:
+            return None
+        started = time.perf_counter()
+        for record in records:
+            record.materialize()
+        return (time.perf_counter() - started) / len(records)
+    except Exception:
+        return None
+
+
+def _human_duration(seconds: float) -> str:
+    if seconds >= 5400:
+        return f"~{seconds / 3600:.1f} h"
+    if seconds >= 90:
+        return f"~{seconds / 60:.0f} min"
+    return f"~{seconds:.0f} s"
+
+
+def _memory_file_override(path: Path, multi_analyzer: bool) -> int | None:
+    """A multi-analyzer run may keep a capture up to the whole cache budget in
+    memory (each analyzer would otherwise read it again); one analyzer only up
+    to the per-file cap."""
+    enabled, max_cache, _max_file = get_cache_config()
+    if enabled and max_cache > 0 and multi_analyzer:
+        size_bytes = capture_size(path)
+        if size_bytes and size_bytes <= max_cache:
+            return max_cache
+    return None
+
+
+def _resolve_jobs(value: int | None) -> int | None:
+    """--jobs as given: None (not given) chooses per capture, 0 one per CPU."""
+    if value is None:
+        return None
+    return (os.cpu_count() or 1) if value == 0 else max(1, value)
+
+
+def _note_large_capture(
+    path: Path, *, jobs: int | None = None, split: int = 1, multi_analyzer: bool
+) -> None:
+    """Large-capture guidance on stderr: how long one read takes here, whether
+    the capture stays in memory, and how to make it faster."""
+    try:
+        threshold = int(os.environ.get("PCAPPER_LARGE_CAPTURE_PACKETS", _LARGE_CAPTURE_PACKETS))
+    except ValueError:
+        threshold = _LARGE_CAPTURE_PACKETS
+    if not progress.detail_enabled():
+        return  # shown with -v only: nothing to estimate for
+    bound = pcap_cache.packets_at_most(path)
+    if bound is not None and bound < threshold:
+        return  # its size alone rules it out: no sampled estimate
+    estimate = estimated_packets(path)
+    if estimate is None or estimate < threshold:
+        return
+    if jobs is None:
+        jobs = sharedpass.jobs_for(path)
+    size = format_bytes_as_mb(capture_size(path)) if capture_size(path) else "?"
+    per_packet = _seconds_per_dissection(path)
+    timing = ""
+    if per_packet:
+        timing = (
+            f" Dissecting it once takes {_human_duration(estimate * per_packet)} on this machine "
+            f"(~{per_packet * 1e6:.0f} µs/packet)"
+            + (f", {_human_duration(estimate * per_packet / split)} per --split window" if split > 1 else "")
+            + "."
+        )
+    memory = ""
+    if multi_analyzer and not fits_in_memory(path):
+        memory = (
+            f" Too large to keep in memory (limit {max_cache_packets():,} packets, "
+            "PCAPPER_CACHE_MAX_PACKETS): analyzers share streaming reads instead."
+        )
+    tips = []
+    from_disk = not memory_admissible(path, max_file_override=_memory_file_override(path, multi_analyzer))
+    if multi_analyzer and from_disk and jobs > 1:
+        tips_lead = f" Its analyses run in {jobs} processes (--jobs; same report)."
+    else:
+        tips_lead = ""
+        if multi_analyzer and from_disk:
+            tips.append("--jobs N runs its analyses in N processes (same report)")
+    if split <= 1:
+        tips.append("--split N reports N windows of it in parallel")
+        tips.append("a single protocol flag reads only what it needs")
+        tips.append(
+            "or cut it first (editcap -A/-B for a time window, tcpdump -r IN -w OUT "
+            "'tcp port 502' for one protocol)"
+        )
+    advice = tips_lead + (" Faster: " + "; ".join(tips) + "." if tips else "")
+    _print_notice(f"Large capture: {path.name} holds ~{estimate / 1e6:.1f}M packets ({size}).{timing}{memory}{advice}")
+
+
+# Steps (beyond _SIMPLE_STEP_ANALYZERS) whose analyzers the shared pass
+# already dry-runs: the fan-out orchestrators (utils.fan_out), and analyzers
+# inside their plans. The progress bar dry-runs them to count the analyses a
+# step will run. Lookups, searches, Suricata, IOC files and stream exports
+# are never dry-run: their steps count as one analysis.
+_DRY_RUN_STEP_ROOTS: dict[str, tuple[str, ...]] = {
+    "carve": ("analyze_carving",),
+    "compromised": ("analyze_compromised",),
+    "dns": ("analyze_dns",),
+    "files": ("analyze_files",),
+    "hostdetails": ("analyze_hostdetails",),
+    "hostnames": ("analyze_hostname",),
+    "http": ("analyze_http",),
+    "ips": ("analyze_ips",),
+    "mitre": ("analyze_mitre",),
+    "ot_commands": ("analyze_ot_commands",),
+    "overview": ("analyze_overview",),
+    "services": ("analyze_services",),
+    "threats": ("analyze_threats",),
+    "timeline": ("analyze_timeline",),
+    "tls": ("analyze_tls", "analyze_quic"),
+    "voip": ("analyze_voip",),
+}
+# Costs on the capture bar, in units of one OT protocol analysis (port
+# filtered: cheap unless the capture is OT traffic). Measured on a 14 s read
+# and a 125 s --threats of the same capture: the read that loads the packets
+# (scapy dissects each one) ~40, an IT analysis scanning payloads ~6.
+_PROGRESS_READ_COST = 40.0
+_PROGRESS_PLANS: dict[tuple, tuple[list[float], list[float]]] = {}
+_PROGRESS_IT_COST = 6.0
+_PROGRESS_OT_COST = 1.0
+
+
+@functools.lru_cache(maxsize=1)
+def _ot_analysis_modules() -> frozenset[str]:
+    """Modules of the analyzers behind the OT/ICS/INDUSTRIAL flags."""
+    flag_map = _builtin_flag_map()
+    modules = {
+        getattr(func, "__module__", "")
+        for flag, _help in _ICS_FLAGS
+        for func, _args, _kwargs in _dry_run_roots(flag_map.get(flag, ""))
+    }
+    return frozenset(m for m in modules if m)
+
+
+def _analysis_cost(module: str) -> float:
+    """What a finished analysis is worth on the bar, by its module."""
+    return _PROGRESS_OT_COST if module in _ot_analysis_modules() else _PROGRESS_IT_COST
+
+
+def _dry_run_roots(step: str) -> list[tuple[object, tuple, dict]]:
+    """The analyzers a step starts that are safe to dry-run: the ones the
+    shared pass dry-runs itself (plain step analyzers, OT table analyzers,
+    fan-out orchestrators and what they run). Others are not run."""
+    roots: list[tuple[object, tuple, dict]] = []
+    for name in (*_SIMPLE_STEP_ANALYZERS.get(step, ()), *_DRY_RUN_STEP_ROOTS.get(step, ())):
+        func = globals().get(name)
+        if func is not None and hasattr(func, "__wrapped__"):
+            roots.append((func, (), {}))
+    spec = OT_EXTRA_BY_STEP.get(step)
+    if spec is not None:
+        roots.append((spec.analyzer(), (), {}))
+    return roots
+
+
+def _progress_plan(path: Path, ordered_steps: list[str], *, read: bool) -> tuple[list[float], list[float]]:
+    """How a capture's bar divides: the read, then each step weighted by the
+    cost of the analyses it will compute -- found by the shared pass's dry
+    run (about 0.1 s for --threats), each analysis once, in the step that
+    first runs it (later steps get it from the memo). The dry run sees an
+    empty packet view, so the plan depends on the steps only: it is made
+    once per run, not once per capture."""
+    progress.set_analysis_weigher(_analysis_cost)
+    cache_key = (tuple(ordered_steps), bool(read))
+    cached = _PROGRESS_PLANS.get(cache_key)
+    if cached is not None:
+        return list(cached[0]), list(cached[1])
+    seen: set = set()
+    expected: list[float] = []
+    for step in ordered_steps:
+        roots = _dry_run_roots(step)
+        try:
+            keys = sharedpass.dry_run_keys(path, roots) if roots else []
+        except Exception:  # noqa: BLE001 - an unplanned step still gets a share
+            keys = []
+        fresh = [key for key in keys if key not in seen]
+        seen.update(fresh)
+        if not roots:  # not dry-run: counted as one analysis
+            expected.append(_PROGRESS_IT_COST)
+            continue
+        expected.append(sum(_analysis_cost(str(key[0])) for key in fresh))
+    weights = [_PROGRESS_READ_COST if read else 0.0] + [max(_PROGRESS_OT_COST, cost) for cost in expected]
+    _PROGRESS_PLANS[cache_key] = (weights, [0.0, *expected])
+    return list(weights), [0.0, *expected]
+
+
 _AUTO_DECODE_STEPS = {
     "overview", "threats", "mitre", "ot_commands", "control_loop", "timeline",
     "compromised", "hostdetails", "services", "protocols", "ctf", "safety",
@@ -530,6 +1114,7 @@ _AUTO_DECODE_STEPS = {
 
 
 _FILTER_COMPATIBLE_STEPS = {
+    "dnsqueries",
     "search",
     "packet",
     "dns",
@@ -571,6 +1156,7 @@ _FILTER_COMPATIBLE_STEPS = {
 
 
 _IP_TARGET_FILTER_STEPS = {
+    "dnsqueries",
     "aim",
     "beacon",
     "compromised",
@@ -658,34 +1244,53 @@ def _collect_filter_incompatibilities(
     return list(dict.fromkeys(unsupported))
 
 
-def _build_banner() -> str:
-    ot_ics_quotes = [
-        "Safety before speed. Reliability before novelty.",
-        "In OT, availability is the first control.",
-        "A quiet control network is a healthy one.",
-        "Know the process, not just the packets.",
-        "What changes state can change safety.",
-        "Latency is a signal. Jitter is a story.",
-        "Every write is a decision; log it.",
-        "Trust the physics, verify the traffic.",
-        "Asset context turns alerts into action.",
-        "A stable process leaves a stable trail.",
-    ]
+_OT_ICS_QUOTES = [
+    "Safety before speed. Reliability before novelty.",
+    "In OT, availability is the first control.",
+    "A quiet control network is a healthy one.",
+    "Know the process, not just the packets.",
+    "What changes state can change safety.",
+    "Latency is a signal. Jitter is a story.",
+    "Every write is a decision; log it.",
+    "Trust the physics, verify the traffic.",
+    "Asset context turns alerts into action.",
+    "A stable process leaves a stable trail.",
+]
+
+
+def _quote_of_the_day() -> str:
+    """``PCAPPER_QUOTE``, or one of the quotes, chosen by the date (by
+    ``PCAPPER_QUOTE_SEED`` when set; fixed under pytest)."""
     override = os.environ.get("PCAPPER_QUOTE", "").strip()
     if override:
-        quote = override
+        return override
+    seed_raw = os.environ.get("PCAPPER_QUOTE_SEED", "").strip()
+    if seed_raw:
+        try:
+            seed_value = int(seed_raw)
+        except ValueError:
+            seed_value = sum(ord(ch) for ch in seed_raw)
+    elif os.environ.get("PYTEST_CURRENT_TEST"):
+        seed_value = 0
     else:
-        seed_raw = os.environ.get("PCAPPER_QUOTE_SEED", "").strip()
-        if seed_raw:
-            try:
-                seed_value = int(seed_raw)
-            except ValueError:
-                seed_value = sum(ord(ch) for ch in seed_raw)
-        elif os.environ.get("PYTEST_CURRENT_TEST"):
-            seed_value = 0
-        else:
-            seed_value = datetime.now(timezone.utc).date().toordinal()
-        quote = ot_ics_quotes[seed_value % len(ot_ics_quotes)]
+        seed_value = datetime.now(timezone.utc).date().toordinal()
+    return _OT_ICS_QUOTES[seed_value % len(_OT_ICS_QUOTES)]
+
+
+def _build_run_header() -> str:
+    """The lines an analysis run starts with: the name and version, and the
+    quote of the day under them (the ASCII-art banner stays for `pcapper`
+    without arguments and for -h)."""
+    from .coloring import ANSI_CYAN, colorize
+
+    product = colorize("PCAPPER", ANSI_CYAN, bold=True)
+    rest = colorize(f"v{__version__} · PCAP forensics and threat hunting for IT and OT/ICS", "\x1b[37m", dim=True)
+    quote = colorize(f'Quote of the day: "{_quote_of_the_day()}"', "\x1b[37m", dim=True)
+    return f"{product} {rest}\n{quote}"
+
+
+def _build_banner() -> str:
+    quote = _quote_of_the_day()
     banner = [
         "=====================================================================================",
         "   ██████╗  ██████╗  █████╗ ██████╗ ██████╗ ███████╗██████╗     ",
@@ -843,6 +1448,13 @@ def _print_error(message: str) -> None:
     print(message, file=sys.stderr)
 
 
+def _print_notice(message: str) -> None:
+    """Guidance and information on stderr (large-capture tips, auto
+    decode-as): detail, shown with -v. Errors stay on _print_error."""
+    if progress.detail_enabled():
+        _print_error(message)
+
+
 _OUTPUT_WARNED_PATHS: set[str] = set()
 
 
@@ -891,8 +1503,9 @@ def _run_self_check(
     plugin_errors: list[str],
     config_path: Path | None,
 ) -> int:
-    print("PCAPPER SELF-CHECK")
-    print("==================")
+    from .reporting import _style as st
+
+    print("\n".join(st.title("Self-check", "pcapper")))
     if config_path:
         print(f"Config: {config_path}")
     else:
@@ -1166,6 +1779,69 @@ class PcapperArgumentParser(argparse.ArgumentParser):
         super().error(message)
 
 
+# The OT/ICS/INDUSTRIAL FUNCTIONS flags (help group, and the progress bar's
+# cost classes).
+_ICS_FLAGS: list[tuple[str, str]] = [
+    ("--bacnet", "Include BACnet analysis (BVLC functions, endpoints, anomalies)."),
+    ("--cip", "Include CIP analysis (object operations)."),
+    ("--coap", "Include CoAP analysis (RESTful IoT/ICS)."),
+    (
+        "--control-loop",
+        "Analyze control-loop value changes (rate-of-change, oscillation, outliers).",
+    ),
+    ("--crimson", "Include Crimson V3 analysis (HMI/tag traffic)."),
+    ("--csp", "Include CSP analysis (ControlNet service protocol)."),
+    ("--df1", "Include Allen-Bradley DF1 analysis (serial framing)."),
+    ("--dnp3", "Include DNP3 protocol analysis (Functions, Restarts, File Ops)."),
+    ("--enip", "Include EtherNet/IP analysis (encapsulation, sessions, I/O)."),
+    ("--ethercat", "Include EtherCAT analysis (datagrams, operations)."),
+    ("--fins", "Include Omron FINS analysis (commands, endpoints)."),
+    ("--hart", "Include HART-IP analysis (field device communications)."),
+    ("--honeywell", "Include Honeywell CDA analysis (DCS traffic)."),
+    ("--iccp", "Include ICCP/TASE.2 analysis (inter-control center)."),
+    (
+        "--iec104",
+        "Include IEC-104 analysis (APCI/ASDU, control events, anomalies).",
+    ),
+    ("--melsec", "Include MELSEC-Q analysis (MC protocol)."),
+    ("--mms", "Include IEC 61850 MMS analysis (substation automation)."),
+    (
+        "--modbus",
+        "Include Modbus/TCP status and security analysis (Functions, Units, Anomalies).",
+    ),
+    ("--modicon", "Include Schneider Modicon UMAS analysis (Unity / EcoStruxure engineering traffic, Modbus function 0x5A)."),
+    ("--mqtt", "Include MQTT analysis (publish/subscribe IoT/ICS)."),
+    ("--niagara", "Include Niagara Fox analysis (building automation)."),
+    ("--codesys", "Include CODESYS (CoDeSys) programming-traffic analysis."),
+    ("--opc", "Include OPC UA analysis (secure channel, messages)."),
+    ("--pccc", "Include PCCC analysis (AB/DF1 over IP)."),
+    ("--pcworx", "Include PCWorx analysis (PLC operations)."),
+    ("--prconos", "Include ProConOS analysis (ProSoft protocol)."),
+    ("--profinet", "Include Profinet analysis (RT/PNIO, endpoints, anomalies)."),
+    ("--s7", "Include Siemens S7 analysis (TPKT/COTP, jobs, anomalies)."),
+    (
+        "--safety",
+        "Include safety PLC/SIS protocol detection (Triconex/TriStation).",
+    ),
+    ("--srtp", "Include GE SRTP analysis (PLC communications)."),
+    ("--goose", "Include IEC 61850 GOOSE analysis (L2 events)."),
+    ("--sv", "Include IEC 61850 Sampled Values analysis (L2)."),
+    ("--lldp", "Include LLDP/Profinet DCP asset discovery analysis."),
+    ("--ptp", "Include IEEE 1588 PTP time-sync analysis."),
+    ("--synchrophasor", "Include IEEE C37.118 synchrophasor (PMU/PDC) analysis."),
+    ("--bsap", "Include BSAP-IP analysis (Bristol/Emerson gas/oil SCADA)."),
+    ("--genisys", "Include Genisys analysis (rail/substation SCADA)."),
+    ("--ot-commands", "Include normalized OT control/write command analysis."),
+    (
+        "--ot-commands-fast",
+        "Fast OT command scan (port heuristics + cached packets).",
+    ),
+    ("--iec101-103", "Include IEC 60870-5-101/103 heuristic analysis."),
+    ("--yokogawa", "Include Yokogawa Vnet/IP analysis."),
+    *((spec.flag, spec.help) for spec in OT_EXTRA),
+]
+
+
 def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentParser:
     banner = _build_banner()
     epilog = (
@@ -1335,7 +2011,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
     general.add_argument(
         "--no-status",
         action="store_true",
-        help="Disable the processing status bar.",
+        help="Disable the progress bar (and with -v the status lines).",
     )
     general.add_argument(
         "--quiet",
@@ -1470,6 +2146,37 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         ),
     )
     general.add_argument(
+        "--jobs",
+        "-j",
+        type=int,
+        default=None,
+        metavar="N",
+        help=(
+            "Run the analyses of a capture in N processes (0 = one per CPU, 1 = a single "
+            "process). Every analysis still sees the whole capture, so the report is "
+            "identical to a single-process run; what parallelises is the work of a "
+            "multi-flag or fan-out run (--threats, --overview, --ot-commands ...). The capture "
+            "is still read once: held in memory it is shared with the processes, read from disk "
+            "the main process's read is copied to them. Default: one per "
+            "usable CPU, at most 8, when the run is big enough to gain (packets x analyses "
+            "500,000+), and for a capture in memory no more than half the free memory allows."
+        ),
+    )
+    general.add_argument(
+        "--split",
+        type=int,
+        default=1,
+        metavar="N",
+        help=(
+            "Analyse a large capture as N contiguous windows in parallel and report each "
+            "window on its own (0 = one per CPU): what splitting it with editcap -c and "
+            "running pcapper on every part gives. Each window's report is exact for that "
+            "window; conversations and detections spanning windows are seen in parts. "
+            "Packet filters, exports, -summarize and --packet/--streams/--carve/--extract "
+            "analyse the capture whole."
+        ),
+    )
+    general.add_argument(
         "-summarize",
         action="store_true",
         help="Summarize supported analysis across all pcaps (e.g., --modbus, --dnp3). Use single-dash -summarize.",
@@ -1478,14 +2185,18 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         "-v",
         "--verbose",
         action="store_true",
-        help="Show verbose details in analysis output.",
+        help=(
+            "Show every report section and row, and the processing detail: read-pass "
+            "percentages, per-analysis timing, library warnings and notices (without it: "
+            "one progress bar per capture)."
+        ),
     )
     general.add_argument(
         "-vt",
         "--vt",
         dest="vt",
         action="store_true",
-        help="Enable VirusTotal lookups/enrichment for --dns, --http, --tls/--tlsm, --threats, --webrequests, --timeline, and --compromised (requires VT_API_KEY). Sends observed domains, IPs and full URLs - query strings included, which can carry credentials - to VirusTotal.",
+        help="Enable VirusTotal lookups/enrichment for --dns, --dnsqueries, --http, --tls/--tlsm, --threats, --webrequests, --timeline, and --compromised (requires VT_API_KEY). Sends observed domains, IPs and full URLs - query strings included, which can carry credentials - to VirusTotal.",
     )
     general.add_argument(
         "--ip-geo",
@@ -1763,6 +2474,12 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         ),
         ("--dns", "Include DNS analysis in the output."),
         (
+            "--dnsqueries",
+            "List every DNS lookup (DNS, LLMNR, mDNS) with the response observed for it: client, resolver, name, "
+            "type, answers or error. Each distinct lookup once with its count; -v every query with packet number, "
+            "transaction ID and round-trip time. Works with -ip (that host's lookups), -summarize, -vt and the exports.",
+        ),
+        (
             "--domain",
             "Include MS AD and domain analysis (services, users, DCs, artifacts).",
         ),
@@ -1994,65 +2711,7 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
     )
 
     ics_group = parser.add_argument_group("OT/ICS/INDUSTRIAL FUNCTIONS")
-    ics_flags = [
-        ("--bacnet", "Include BACnet analysis (BVLC functions, endpoints, anomalies)."),
-        ("--cip", "Include CIP analysis (object operations)."),
-        ("--coap", "Include CoAP analysis (RESTful IoT/ICS)."),
-        (
-            "--control-loop",
-            "Analyze control-loop value changes (rate-of-change, oscillation, outliers).",
-        ),
-        ("--crimson", "Include Crimson V3 analysis (HMI/tag traffic)."),
-        ("--csp", "Include CSP analysis (ControlNet service protocol)."),
-        ("--df1", "Include Allen-Bradley DF1 analysis (serial framing)."),
-        ("--dnp3", "Include DNP3 protocol analysis (Functions, Restarts, File Ops)."),
-        ("--enip", "Include EtherNet/IP analysis (encapsulation, sessions, I/O)."),
-        ("--ethercat", "Include EtherCAT analysis (datagrams, operations)."),
-        ("--fins", "Include Omron FINS analysis (commands, endpoints)."),
-        ("--hart", "Include HART-IP analysis (field device communications)."),
-        ("--honeywell", "Include Honeywell CDA analysis (DCS traffic)."),
-        ("--iccp", "Include ICCP/TASE.2 analysis (inter-control center)."),
-        (
-            "--iec104",
-            "Include IEC-104 analysis (APCI/ASDU, control events, anomalies).",
-        ),
-        ("--melsec", "Include MELSEC-Q analysis (MC protocol)."),
-        ("--mms", "Include IEC 61850 MMS analysis (substation automation)."),
-        (
-            "--modbus",
-            "Include Modbus/TCP status and security analysis (Functions, Units, Anomalies).",
-        ),
-        ("--modicon", "Include Modicon/Unity analysis (Modbus family)."),
-        ("--mqtt", "Include MQTT analysis (publish/subscribe IoT/ICS)."),
-        ("--niagara", "Include Niagara Fox analysis (building automation)."),
-        ("--codesys", "Include CODESYS (CoDeSys) programming-traffic analysis."),
-        ("--opc", "Include OPC UA analysis (secure channel, messages)."),
-        ("--pccc", "Include PCCC analysis (AB/DF1 over IP)."),
-        ("--pcworx", "Include PCWorx analysis (PLC operations)."),
-        ("--prconos", "Include ProConOS analysis (ProSoft protocol)."),
-        ("--profinet", "Include Profinet analysis (RT/PNIO, endpoints, anomalies)."),
-        ("--s7", "Include Siemens S7 analysis (TPKT/COTP, jobs, anomalies)."),
-        (
-            "--safety",
-            "Include safety PLC/SIS protocol detection (Triconex/TriStation).",
-        ),
-        ("--srtp", "Include GE SRTP analysis (PLC communications)."),
-        ("--goose", "Include IEC 61850 GOOSE analysis (L2 events)."),
-        ("--sv", "Include IEC 61850 Sampled Values analysis (L2)."),
-        ("--lldp", "Include LLDP/Profinet DCP asset discovery analysis."),
-        ("--ptp", "Include IEEE 1588 PTP time-sync analysis."),
-        ("--synchrophasor", "Include IEEE C37.118 synchrophasor (PMU/PDC) analysis."),
-        ("--bsap", "Include BSAP-IP analysis (Bristol/Emerson gas/oil SCADA)."),
-        ("--genisys", "Include Genisys analysis (rail/substation SCADA)."),
-        ("--ot-commands", "Include normalized OT control/write command analysis."),
-        (
-            "--ot-commands-fast",
-            "Fast OT command scan (port heuristics + cached packets).",
-        ),
-        ("--iec101-103", "Include IEC 60870-5-101/103 heuristic analysis."),
-        ("--yokogawa", "Include Yokogawa Vnet/IP analysis."),
-        *((spec.flag, spec.help) for spec in OT_EXTRA),
-    ]
+    ics_flags = _ICS_FLAGS
     ics_entries: list[tuple[str, dict[str, object]]] = [
         (flag, {"action": "store_true", "help": help_text})
         for flag, help_text in ics_flags
@@ -2417,9 +3076,16 @@ def _analyze_paths(
     correlate_requested: bool = False,
     correlate_min: int = 2,
     auto_decode_enabled: bool = True,
+    jobs: int | None = 1,
+    split: int = 1,
+    _window: object = None,
 ) -> int:
+    # Every argument, to re-enter this function for one --split window
+    # (_window: the window this process analyses).
+    _call_args = dict(locals())
     if not paths:
         return 1
+    sharedpass.set_jobs(jobs)
 
     # Keep single-pcap behavior identical with/without -summarize.
     # Rollup rendering is only meaningful when multiple pcaps are supplied.
@@ -2432,7 +3098,9 @@ def _analyze_paths(
     baseline_requested = bool(baseline_save or baseline_compare)
     baseline_service_summaries: list[object] = []
     baseline_ot_summaries: list[object] = []
+    baseline_host_summaries: list[object] = []
     correlate_service_summaries: list[object] = []
+    correlate_host_summaries: list[object] = []
     rules_rollups: list[object] = []
     decrypt_rollups: list[object] = []
     # Steps that internally fan out into many other analyzers; preloading the
@@ -2477,14 +3145,9 @@ def _analyze_paths(
                 _print_error(f"Packet {index} not found in loaded packet list.")
                 return
         else:
-            stream = iter_packets(path, show_status=step_status)
-            try:
-                for i, item in enumerate(stream, start=1):
-                    if i == index:
-                        pkt = item
-                        break
-            finally:
-                stream.close()
+            # Planned with the run's other analyses: from disk, taken from
+            # the run's one read rather than a read of its own.
+            pkt = analyze_packet_at(path, index, show_status=step_status)
             if pkt is None:
                 _print_error(f"Packet {index} not found in capture.")
                 return
@@ -2497,9 +3160,9 @@ def _analyze_paths(
             if isinstance(original, (bytes, bytearray)):
                 raw = bytes(original)
 
-        print("=" * 72)
-        print(f"PACKET VIEW :: {path.name} :: #{index}")
-        print("=" * 72)
+        from .reporting import _style as st
+
+        print("\n".join(st.title(f"Packet #{index}", path.name)))
         try:
             summary = pkt.summary()  # type: ignore[attr-defined]
         except Exception:
@@ -2514,7 +3177,7 @@ def _analyze_paths(
                 print(hexdump(raw))
         else:
             print("<packet bytes unavailable>")
-        print("=" * 72)
+        print()
 
     def _resolve_export_path(base: Path, pcap_path: Path, suffix: str) -> Path:
         if case_dir and not base.is_absolute():
@@ -2676,7 +3339,157 @@ def _analyze_paths(
             ),
         )
 
+    plan_shapes: dict[str, tuple[int, bool]] = {}
+    # What an analysis costs (bar weights; --jobs balances workers by it).
+    progress.set_analysis_weigher(_analysis_cost)
+
+    def _plan_shape(path: Path, roots: list[tuple[object, tuple, dict]]) -> tuple[int, bool]:
+        """How many analyses ``roots`` start (each once) and whether any of
+        them reports the capture's hashes -- from the shared pass's dry run.
+        It sees an empty packet view, so the answer depends on the roots
+        (fixed for the run) only: one dry run per run, not per capture."""
+        if not roots:
+            return 0, False
+        signature = repr([(getattr(f, "__qualname__", f), a, sorted(k.items())) for f, a, k in roots])
+        cached = plan_shapes.get(signature)
+        if cached is not None:
+            return cached
+        requests = pcap_cache._HASH_PLAN_REQUESTS
+        try:
+            planned = len(sharedpass.dry_run_keys(path, roots))
+        except Exception:  # noqa: BLE001 - no plan: each analysis reads as before
+            planned = 0
+        shape = (planned, pcap_cache._HASH_PLAN_REQUESTS != requests)
+        plan_shapes[signature] = shape
+        return shape
+
+    def _run_plan_roots(steps: list[str]) -> list[tuple[object, tuple, dict]]:
+        """Every analysis the requested steps start, called exactly as the step
+        loop calls it (the same memo key): the roots of one plan -- one shared
+        read -- for the whole run over a capture read from disk, and the count
+        that says whether a run reads the capture more than once. Steps whose
+        analyses are unsafe to dry-run (lookups, Suricata, carving, stream and
+        file exports) are left to their own reads; a root whose own call cannot
+        be keyed still plans the analyses it starts."""
+        roots: list[tuple[object, tuple, dict]] = []
+        filters = {"target_ip": timeline_ip, "hostname_query": hostname_name,
+                   "port_filter": stream_port, "search_query": stream_search}
+        for step in steps:
+            names = _SIMPLE_STEP_ANALYZERS.get(step)
+            if names:
+                roots += [(globals()[n], (), {}) for n in names if hasattr(globals().get(n), "__wrapped__")]
+                continue
+            spec = OT_EXTRA_BY_STEP.get(step)
+            if spec is not None:
+                roots.append((spec.analyzer(), (), {}))
+            elif step == "dns":
+                roots.append((analyze_dns, (), {"vt_lookup": dns_vt}))
+            elif step == "dnsqueries":
+                roots.append((analyze_dns_queries, (), {"vt_lookup": dns_vt}))
+            elif step == "http":
+                roots.append((analyze_http, (), {"vt_lookup": dns_vt, **filters}))
+            elif step == "tls":
+                roots += [(analyze_quic, (), {}), (analyze_tls, (), {"vt_lookup": dns_vt, **filters})]
+            elif step == "webrequests":
+                roots.append((analyze_webrequests, (timeline_ip if timeline_ip else None,), {
+                    "post_only": webrequests_post_only, "high_only": webrequests_high_only,
+                    "search_query": stream_search, "vt_lookup": dns_vt}))
+            elif step == "ips":
+                roots.append((analyze_ips, (), {"geo_lookup": ip_geo}))
+            elif step == "services":
+                roots.append((analyze_services, (), {"filter_ip": timeline_ip}))
+            elif step == "qos":
+                roots.append((analyze_qos, (), {"filter_ip": timeline_ip}))
+            elif step == "hostnames":
+                roots.append((analyze_hostname, (timeline_ip,), {
+                    "include_related": False, "hostname_query": hostname_name, "port_filter": stream_port,
+                    "search_query": stream_search,
+                    "apply_filters": bool(timeline_ip or hostname_name or stream_port or stream_search)}))
+            elif step == "threats":
+                roots.append((analyze_threats, (), {"vt_lookup": dns_vt}))
+            elif step == "compromised":
+                roots.append((analyze_compromised, (), {"vt_lookup": dns_vt}))
+            elif step == "overview":
+                roots.append((analyze_overview, (), {"vt_lookup": dns_vt, "ot_commands_fast": show_ot_commands_fast,
+                                                      "ot_commands_config": ot_commands_config}))
+            elif step == "ot_commands":
+                roots.append((analyze_ot_commands, (), {"fast": show_ot_commands_fast, "config": ot_commands_config}))
+            elif step == "mitre":
+                roots.append((analyze_mitre, (), {"ioc_file": Path(ioc_file).expanduser() if ioc_file else None}))
+            elif step == "files":
+                # Exactly the step's call, extraction included: over a dry
+                # run's empty view it extracts nothing (and creates no more
+                # than the step would), and the step then extracts nothing
+                # twice.
+                roots.append((analyze_files, (), {
+                    "extract_name": extract_name, "output_dir": (case_dir / "files") if case_dir else None,
+                    "view_name": view_name, "view_raw": view_raw, "hash_name": hash_name,
+                    "include_x509": bool(verbose or files_executable_only),
+                    "filter_ip": timeline_ip, "hostname_query": hostname_name, "port_filter": stream_port,
+                    "search_query": stream_search, "executable_only": files_executable_only}))
+            elif step == "timeline" and timeline_ip:
+                roots.append((analyze_timeline, (timeline_ip,), {
+                    "timeline_bins": timeline_bins, "timeline_storyline_off": timeline_storyline_off,
+                    "categories": timeline_categories, "invert_categories": timeline_categories_invert,
+                    "vt_lookup": dns_vt}))
+            elif step == "hostdetails" and timeline_ip:
+                roots.append((analyze_hostdetails, (timeline_ip,), {
+                    "hostname_query": hostname_name, "port_filter": stream_port, "search_query": stream_search}))
+            elif step == "search" and search_query:
+                roots.append((analyze_search, (search_query,), {"case_sensitive": search_case}))
+            elif step == "packet" and packet_index is not None and packet_index > 0:
+                roots.append((analyze_packet_at, (packet_index,), {}))
+            elif step == "ip_lookup":
+                roots.append((analyze_ip_lookup, (lookup_mac or "",), {}))
+            elif step == "mac_lookup":
+                roots.append((analyze_mac_lookup, (timeline_ip or "",), {}))
+            elif step == "voip" and not (voip_out or case_dir):
+                roots.append((analyze_voip, (), {"target_ip": timeline_ip, "output_dir": None}))
+            elif step == "ioc" and ioc_file:
+                roots.append((analyze_iocs, (Path(ioc_file),), {}))
+            elif step == "streams":
+                roots.append((analyze_streams, (), {
+                    "stream_id": stream_id, "stream_search": stream_search, "streams_full": streams_full,
+                    "filter_ip": timeline_ip, "filter_port": stream_port,
+                    "established_only": streams_established, "view_content": view_name is not None}))
+            elif step == "carve":
+                carve_base = (
+                    _resolve_misc_path(carve_out)
+                    if carve_out
+                    else ((case_dir / "carved") if case_dir else Path("carved"))
+                )
+                roots.append((analyze_carving, (), {
+                    "output_dir": carve_base / (path.stem if len(paths) > 1 else ""),
+                    "stream_max_bytes": carve_stream_bytes, "carve_max_bytes": carve_max_bytes,
+                    "carve_limit": carve_limit}))
+        if baseline_requested or correlate_requested:
+            # The host inventory a baseline compares and a correlation matches
+            # (called before the steps, below).
+            roots.append((analyze_hosts, (), {}))
+        return roots
+
     for idx, path in enumerate(paths, start=1):
+        progress.capture_begin(path, index=idx, total=len(paths))
+        if _window is None:
+            _note_large_capture(path, split=split, multi_analyzer=use_packets)
+            if split > 1:
+                windows = _split_windows(
+                    path,
+                    split,
+                    ordered_steps=ordered_steps,
+                    filtered=_has_packet_filters(bpf, time_start, time_end)
+                    or bool(timeline_ip and ip_scope_requested),
+                    exclusive_options=bool(
+                        packet_index or extract_name or view_name or show_streams or show_carve
+                        or decrypt_config or voip_out or baseline_requested or correlate_requested
+                        or summarize_rollups or export_json_path or export_csv_path or export_sqlite_path
+                    ),
+                )
+                if windows and _run_split(path, windows, _call_args):
+                    pcap_cache.discard_primed(path)
+                    if idx < len(paths):
+                        print()
+                    continue
         packets = None
         meta = None
         step_status = show_status
@@ -2693,6 +3506,39 @@ def _analyze_paths(
             else:
                 effective_bpf = ip_bpf
 
+        # Read once: a run that starts more than one analysis -- several steps,
+        # a fan-out step, or one step that nests others (--http the file
+        # analysis, --tls QUIC and certificates, --ips host names) -- loads the
+        # capture into memory when it fits, else computes everything in one
+        # shared pass (plan_roots); a single analysis streams it. Hashes the
+        # run reports come from that same read.
+        plan_roots: list[tuple[object, tuple, dict]] = []
+        multi = use_packets
+        if not _has_packet_filters(effective_bpf, time_start, time_end):
+            plan_roots = _run_plan_roots(ordered_steps)
+            if render_base_summary:
+                plan_roots.insert(0, (analyze_pcap, (), {}))
+        planned, hashes_wanted = _plan_shape(path, plan_roots)
+        multi = multi or planned >= 2
+        if hashes_wanted or render_base_summary or case_dir or (show_suricata and "suricata" in ordered_steps):
+            pcap_cache.want_hashes(path)
+        feeding = False
+        if show_suricata and "suricata" in ordered_steps:
+            # Suricata reads a copy of the run's read of the capture (or of
+            # one made for it) instead of the file.
+            feeding = start_suricata_feed(path, suricata_rules, suricata_config)
+        # So does tshark's stream listing for --decrypt.
+        feeding = start_decrypt_feeds(decrypt_config, path) > 0 or feeding
+        # A copy waiting on the run's read: that read comes first, even for one
+        # analysis (its step may come after the copy's, which would read the
+        # capture for the copy and leave the analysis to read it again).
+        read_ahead = feeding and planned >= 1
+        if progress.bar_active():
+            weights, expected = _progress_plan(
+                path, ordered_steps,
+                read=bool(multi or read_ahead or _has_packet_filters(effective_bpf, time_start, time_end)),
+            )
+            progress.capture_plan(weights=weights, expected=expected)
         if _has_packet_filters(effective_bpf, time_start, time_end):
             packets, meta = load_filtered_packets(
                 path,
@@ -2703,24 +3549,18 @@ def _analyze_paths(
             )
             if ip_scope_requested and timeline_ip:
                 ip_scope_enabled_for_path = True
-        elif use_packets:
-            max_file_override = None
-            enabled, max_cache, _max_file = get_cache_config()
-            if enabled and max_cache > 0 and use_packets:
-                size_bytes = capture_size(path)
-                if size_bytes and size_bytes <= max_cache:
-                    max_file_override = max_cache
+        elif multi:
             packets, meta = load_packets_if_allowed(
                 path,
                 show_status=show_status,
-                max_file_override=max_file_override,
+                max_file_override=_memory_file_override(path, multi),
             )
             if packets is not None:
                 step_status = show_status
 
         forced_view_for_path = False
         if ip_scope_enabled_for_path and packets is not None:
-            set_forced_packet_view(path, packets, meta)
+            set_forced_packet_view(path, packets, meta, complete=False)  # the -ip host's packets only
             forced_view_for_path = True
         elif packets is not None and not _has_packet_filters(
             effective_bpf, time_start, time_end
@@ -2732,15 +3572,31 @@ def _analyze_paths(
             # helpers), so chained steps never re-read the pcap from disk.
             set_forced_packet_view(path, packets, meta)
             forced_view_for_path = True
+        elif packets is not None:
+            # Filtered (BPF, time window): every analysis -- nested ones too,
+            # which take no packets= (the NFS analysis inside --files) -- sees
+            # the filtered packets, instead of reading the whole capture again.
+            set_forced_packet_view(path, packets, meta, complete=False)
+            forced_view_for_path = True
 
         if auto_decode_enabled and any(
             step in _AUTO_DECODE_STEPS for step in ordered_steps
         ):
             for detection in auto_decode(path, packets=packets, meta=meta):
-                _print_error(
+                _print_notice(
                     f"Auto decode-as ({path.name}): {detection.describe()}. "
                     f"Pass --no-auto-decode to disable, or --decode-as to force."
                 )
+
+        if (multi or read_ahead) and plan_roots and (packets is None or forced_view_for_path):
+            # Every analysis of the run in one plan, not one plan per step:
+            # too large for memory, in one shared pass (one read); in memory,
+            # spread over --jobs processes when that pays (nothing to read).
+            sharedpass.run_plan(
+                path, plan_roots, show_status=step_status,
+                decode_ports=bool(auto_decode_enabled and any(step in _AUTO_DECODE_STEPS for step in ordered_steps)),
+                ahead=read_ahead,
+            )
 
         if render_base_summary:
             summary = analyze_pcap(
@@ -2752,7 +3608,22 @@ def _analyze_paths(
                 print(render_summary(summary, protocol_limit=protocol_limit))
             export_summaries["base"] = summary
 
+        if baseline_requested or correlate_requested:
+            # The host inventory (IPs, MACs, hostnames, OS, open ports) a
+            # baseline compares and a correlation matches across captures;
+            # without it both could only speak about services.
+            try:
+                host_summary = analyze_hosts(path, show_status=step_status, packets=packets, meta=meta)
+            except Exception as exc:  # noqa: BLE001 - the rest of the run stands
+                host_summary = None
+                _print_error(f"Host inventory for baseline/correlation failed on {path.name}: {exc}")
+            if host_summary is not None:
+                if baseline_requested:
+                    baseline_host_summaries.append(host_summary)
+                if correlate_requested:
+                    correlate_host_summaries.append(host_summary)
         for step in ordered_steps:
+            progress.capture_next_unit()
             if step == "search" and search_query:
                 search_summary = analyze_search(
                     path,
@@ -2800,6 +3671,19 @@ def _analyze_paths(
                 else:
                     print(render_dns_summary(dns_summary, verbose=verbose))
                 export_summaries["dns"] = dns_summary
+            elif step == "dnsqueries":
+                dnsq_summary = analyze_dns_queries(
+                    path,
+                    show_status=step_status,
+                    packets=packets,
+                    meta=meta,
+                    vt_lookup=dns_vt,
+                )
+                if summarize_rollups:
+                    rollups.setdefault("dnsqueries", []).append(dnsq_summary)
+                else:
+                    print(render_dnsqueries_summary(dnsq_summary))
+                export_summaries["dnsqueries"] = dnsq_summary
             elif step == "http" and show_http:
                 http_summary = analyze_http(
                     path,
@@ -3993,33 +4877,16 @@ def _analyze_paths(
             export_summaries["rules"] = rules_summary
 
         if decrypt_config and decrypt_config.enabled:
-            decrypt_summaries = []
-            if decrypt_config.tls_keylog:
-                tls_out_dir = decrypt_config.output_dir / (
-                    path.stem if len(paths) > 1 else ""
-                )
-                tls_out_dir = tls_out_dir / "tls"
-                decrypt_summaries.append(
-                    decrypt_tls(
-                        path,
-                        decrypt_config.tls_keylog,
-                        tls_out_dir,
-                        decrypt_config.limit,
-                    )
-                )
-            if decrypt_config.ssh_keylog:
-                ssh_out_dir = decrypt_config.output_dir / (
-                    path.stem if len(paths) > 1 else ""
-                )
-                ssh_out_dir = ssh_out_dir / "ssh"
-                decrypt_summaries.append(
-                    decrypt_ssh(
-                        path,
-                        decrypt_config.ssh_keylog,
-                        ssh_out_dir,
-                        decrypt_config.limit,
-                    )
-                )
+            # TLS and SSH together: their streams followed in one tshark run.
+            out_base = decrypt_config.output_dir / (path.stem if len(paths) > 1 else "")
+            decrypt_summaries = decrypt_capture(
+                path,
+                tls_keylog=decrypt_config.tls_keylog,
+                ssh_keylog=decrypt_config.ssh_keylog,
+                tls_output_dir=out_base / "tls",
+                ssh_output_dir=out_base / "ssh",
+                limit=decrypt_config.limit,
+            )
             if decrypt_summaries:
                 if summarize_rollups:
                     decrypt_rollups.extend(decrypt_summaries)
@@ -4053,14 +4920,18 @@ def _analyze_paths(
         )
         if forced_view_for_path:
             clear_forced_packet_view(path)
-        if idx < len(paths):
+        discard_suricata_feeds(path)
+        discard_decrypt_feeds(path)
+        pcap_cache.discard_primed(path)  # a head no whole read took
+        progress.capture_end()
+        if idx < len(paths) and not summarize_rollups:  # rollups print nothing per capture
             print()
 
     correlation_summary = None
     if correlate_requested:
         if len(paths) > 1:
             correlation_summary = correlate(
-                [],
+                correlate_host_summaries,
                 correlate_service_summaries,
                 min_count=max(2, int(correlate_min or 2)),
             )
@@ -4071,8 +4942,6 @@ def _analyze_paths(
         if base_rollups:
             merged_base = merge_pcap_summaries(base_rollups)
             print(render_summary(merged_base, protocol_limit=protocol_limit))
-            if rollups or modbus_rollups or dnp3_rollups:
-                print()
 
         def _dedupe_sequence(values: list[object]) -> list[object]:
             deduped: list[object] = []
@@ -4101,19 +4970,27 @@ def _analyze_paths(
                 merged_counter.update(right)
                 return merged_counter
 
+            time_mode = _rollup_time_mode(field_name)
             if isinstance(left, dict) and isinstance(right, dict):
                 merged_dict = copy.deepcopy(left)
                 for key, value in right.items():
-                    key_str = str(key)
+                    # Values under a first_seen/last_seen map keep its min/max
+                    # rule; anything else merges by its own key.
+                    nested = field_name if time_mode else str(key)
                     if key in merged_dict:
                         merged_dict[key] = _merge_generic_rollup_value(
-                            merged_dict[key], value, key_str
+                            merged_dict[key], value, nested
                         )
                     else:
                         merged_dict[key] = copy.deepcopy(value)
                 return merged_dict
 
             if isinstance(left, list) and isinstance(right, list):
+                if str(field_name or "").endswith("size_buckets"):
+                    try:
+                        return merge_size_buckets([left, right])
+                    except Exception:
+                        pass
                 merged_list = list(left) + list(right)
                 if field_name in {
                     "errors",
@@ -4124,6 +5001,15 @@ def _analyze_paths(
                 }:
                     return _dedupe_sequence(merged_list)
                 return merged_list
+
+            if (
+                time_mode
+                and isinstance(left, (int, float))
+                and isinstance(right, (int, float))
+                and not isinstance(left, bool)
+                and not isinstance(right, bool)
+            ):
+                return min(left, right) if time_mode == "min" else max(left, right)
 
             if isinstance(left, set) and isinstance(right, set):
                 return set(left) | set(right)
@@ -4137,6 +5023,11 @@ def _analyze_paths(
                 and not isinstance(left, bool)
                 and not isinstance(right, bool)
             ):
+                kind = _rollup_numeric_kind(field_name)
+                if kind == "min":
+                    return min(left, right)
+                if kind == "max":
+                    return max(left, right)
                 return left + right
 
             if isinstance(left, str) and isinstance(right, str):
@@ -4165,7 +5056,7 @@ def _analyze_paths(
                     merged_value = _merge_generic_rollup_value(
                         left_value, right_value, field_name
                     )
-                    setattr(left_obj, field_name, merged_value)
+                    _rollup_set(left_obj, field_name, merged_value)
                 except Exception:
                     continue
             return True
@@ -4177,25 +5068,26 @@ def _analyze_paths(
                 merged_single = copy.deepcopy(values[0])
                 if hasattr(merged_single, "path"):
                     try:
-                        setattr(merged_single, "path", Path("ALL_PCAPS"))
+                        _rollup_set(merged_single, "path", Path("ALL_PCAPS"))
                     except Exception:
                         pass
                 return merged_single
-            merged = copy.deepcopy(values[0])
+            merged = _tag_capture_records(copy.deepcopy(values[0]))
             for item in values[1:]:
-                if not _merge_generic_rollup_object(merged, item):
+                if not _merge_generic_rollup_object(merged, _tag_capture_records(copy.deepcopy(item))):
                     return None
             if hasattr(merged, "path"):
                 try:
-                    setattr(merged, "path", Path("ALL_PCAPS"))
+                    _rollup_set(merged, "path", Path("ALL_PCAPS"))
                 except Exception:
                     pass
             if hasattr(merged, "errors"):
                 try:
                     errors = list(getattr(merged, "errors", []) or [])
-                    setattr(merged, "errors", _dedupe_sequence(errors))
+                    _rollup_set(merged, "errors", _dedupe_sequence(errors))
                 except Exception:
                     pass
+            _rollup_fix_duration(merged)
             if len(values) > 1:
                 merged_path_name = str(getattr(getattr(merged, "path", None), "name", ""))
                 if merged_path_name != "ALL_PCAPS":
@@ -4207,6 +5099,11 @@ def _analyze_paths(
         }
 
         def _render_auto_rollup(step_name: str, merged_summary: object) -> str | None:
+            if step_name in OT_EXTRA_BY_STEP:  # the table-driven OT analyzers share one renderer
+                try:
+                    return render_ot_extra_summary(OT_EXTRA_BY_STEP[step_name], merged_summary)
+                except Exception:
+                    return None
             render_fn_name = rollup_renderer_aliases.get(
                 step_name, f"render_{step_name}_summary"
             )
@@ -4531,6 +5428,10 @@ def _analyze_paths(
             if rollups.get(step):
                 if step == "search":
                     print(render_search_rollup(rollups[step]))
+                elif step == "pcapmeta":
+                    # File metadata describes each capture, not their sum.
+                    for meta_summary in rollups[step]:
+                        print(render_pcapmeta_summary(meta_summary))
                 elif step == "udp":
                     print(render_udp_rollup(rollups[step], verbose=verbose))
                 elif step in merge_handlers:
@@ -4556,14 +5457,11 @@ def _analyze_paths(
                                 title_map.get(step, step.upper()), rollups[step]
                             )
                         )
-                print()
+        # Each report opens with its own blank line: no separators here.
         if rollups.get("vlan"):
             print(render_vlan_rollup(rollups["vlan"], verbose=verbose))
-            print()
         if show_modbus and modbus_rollups:
             print(render_modbus_rollup(modbus_rollups))
-            if show_dnp3 and dnp3_rollups:
-                print()
         if show_dnp3 and dnp3_rollups:
             print(render_dnp3_rollup(dnp3_rollups))
         if export_json_path or export_csv_path or export_sqlite_path:
@@ -4641,7 +5539,7 @@ def _analyze_paths(
         current_baseline = build_baseline(
             __version__,
             [str(item) for item in paths],
-            [],
+            baseline_host_summaries,
             baseline_service_summaries,
             baseline_ot_summaries,
         )
@@ -4674,6 +5572,7 @@ def _analyze_paths(
 
 
 def main() -> int:
+    sharedpass.install()
     argv = _normalize_timeline_category_argv(sys.argv[1:])
     plugins_enabled = _plugins_enabled_from_argv(argv)
     plugins, plugin_errors = _filtered_plugins(
@@ -4820,7 +5719,7 @@ def main() -> int:
     if getattr(args, "oui", False):
         set_oui_annotation(True)
     if not getattr(args, "quiet", False):
-        print(_build_banner())
+        print(_build_run_header())
     if rules_errors:
         print("Rule load warnings:")
         for err in rules_errors:
@@ -5256,208 +6155,215 @@ def main() -> int:
                 if not os.access(candidate, os.R_OK):
                     _print_error(f"{label_text} file is not readable: {candidate}")
                     return 2
-        return _analyze_paths(
-            paths,
-            args.limit_protocols,
-            show_base=args.base,
-            show_status=not args.no_status,
-            search_query=args.search,
-            search_case=args.search_case,
-            show_vlan=args.vlan,
-            show_icmp=args.icmp,
-            show_dns=args.dns,
-            dns_vt=args.vt,
-            ip_geo=getattr(args, "ip_geo", False),
-            show_http=args.http,
-            show_webrequests=getattr(args, "webrequests", False),
-            webrequests_post_only=bool(getattr(args, "webrequests_post_only", False)),
-            webrequests_high_only=bool(getattr(args, "webrequests_high_only", False)),
-            webrequests_host_view=bool(getattr(args, "webrequests_host_view", False)),
-            show_ftp=args.ftp,
-            show_aim=getattr(args, "aim", False),
-            show_tls=args.tls,
-            show_ssh=args.ssh,
-            show_rdp=args.rdp,
-            show_telnet=args.telnet,
-            show_vnc=args.vnc,
-            show_teamviewer=args.teamviewer,
-            show_winrm=args.winrm,
-            show_wmic=args.wmic,
-            show_powershell=args.powershell,
-            show_malware=getattr(args, "malware", False),
-            show_syslog=args.syslog,
-            show_snmp=args.snmp,
-            show_email=getattr(args, "email", False),
-            show_rpc=args.rpc,
-            show_tcp=args.tcp,
-            show_udp=args.udp,
-            show_exfil=args.exfil,
-            show_sizes=args.sizes,
-            show_ips=args.ips,
-            show_ip_lookup=getattr(args, "ip_lookup", False),
-            show_mac_lookup=getattr(args, "mac_lookup", False),
-            show_beacon=args.beacon,
-            show_scan=getattr(args, "scan", False),
-            show_threats=args.threats,
-            show_mitre=getattr(args, "mitre", False),
-            show_suricata=getattr(args, "suricata", False),
-            suricata_rules=suricata_rules_path,
-            suricata_config=suricata_config_path,
-            suricata_eve_types={
-                item.strip().lower()
-                for item in str(getattr(args, "suricata_eve_types", "") or "").split(
-                    ","
-                )
-                if item.strip()
-            }
-            or None,
-            suricata_suppress_sid={
-                item.strip()
-                for item in str(getattr(args, "suricata_suppress_sid", "") or "").split(
-                    ","
-                )
-                if item.strip()
-            }
-            or None,
-            suricata_only_sid={
-                item.strip()
-                for item in str(getattr(args, "suricata_only_sid", "") or "").split(",")
-                if item.strip()
-            }
-            or None,
-            suricata_strict=bool(getattr(args, "suricata_strict", False)),
-            show_files=args.files,
-            files_executable_only=bool(getattr(args, "files_executable_only", False)),
-            show_overview=getattr(args, "overview", False),
-            show_protocols=args.protocols,
-            show_routing=args.routing,
-            show_services=args.services,
-            show_smb=args.smb,
-            show_nfs=args.nfs,
-            show_strings=args.strings,
-            show_creds=args.creds,
-            show_secrets_scan=getattr(args, "secrets", False),
-            show_certificates=args.certificates,
-            show_health=args.health,
-            show_compromised=getattr(args, "compromised", False),
-            show_hostnames=args.hostnames,
-            hostname_name=getattr(args, "hostname_name", None),
-            show_hostdetails=args.hostdetails,
-            show_timeline=args.timeline,
-            timeline_ip=args.timeline_ip,
-            lookup_mac=getattr(args, "lookup_mac", None),
-            timeline_bins=args.timeline_bins,
-            timeline_storyline_off=args.timeline_storyline_off,
-            timeline_categories=timeline_categories,
-            timeline_categories_invert=bool(
-                getattr(args, "timeline_categories_invert", False)
-            ),
-            show_ntlm=args.ntlm,
-            show_netbios=args.netbios,
-            show_arp=args.arp,
-            show_dhcp=getattr(args, "dhcp", False),
-            show_modbus=args.modbus,
-            show_dnp3=args.dnp3,
-            show_iec104=args.iec104,
-            show_bacnet=args.bacnet,
-            show_enip=args.enip,
-            show_profinet=args.profinet,
-            show_s7=args.s7,
-            show_opc=args.opc,
-            show_ethercat=args.ethercat,
-            show_fins=args.fins,
-            show_crimson=args.crimson,
-            show_pcworx=args.pcworx,
-            show_melsec=args.melsec,
-            show_cip=args.cip,
-            show_codesys=args.codesys,
-            show_niagara=args.niagara,
-            show_mms=args.mms,
-            show_srtp=args.srtp,
-            show_df1=args.df1,
-            show_pccc=args.pccc,
-            show_csp=args.csp,
-            show_modicon=args.modicon,
-            show_yokogawa=args.yokogawa,
-            show_honeywell=args.honeywell,
-            show_mqtt=args.mqtt,
-            show_coap=args.coap,
-            show_hart=args.hart,
-            show_prconos=args.prconos,
-            show_iccp=args.iccp,
-            show_control_loop=getattr(args, "control_loop", False),
-            show_safety=getattr(args, "safety", False),
-            verbose=args.verbose,
-            extract_name=args.extract,
-            view_name=args.view,
-            view_raw=args.view_raw,
-            hash_name=getattr(args, "hash_name", None),
-            packet_index=args.packet,
-            show_domain=args.domain,
-            show_ldap=args.ldap,
-            show_kerberos=args.kerberos,
-            ordered_steps=ordered_steps,
-            summarize=args.summarize,
-            show_quic=getattr(args, "quic", False),
-            show_qos=getattr(args, "qos", False),
-            show_wlan=getattr(args, "wlan", False),
-            show_http2=getattr(args, "http2", False),
-            show_encrypted_dns=getattr(args, "encrypted_dns", False),
-            show_ntp=getattr(args, "ntp", False),
-            show_ssdp=getattr(args, "ssdp", False),
-            show_vpn=getattr(args, "vpn", False),
-            show_goose=getattr(args, "goose", False),
-            show_sv=getattr(args, "sv", False),
-            show_lldp=getattr(args, "lldp", False),
-            show_ptp=getattr(args, "ptp", False),
-            show_synchrophasor=getattr(args, "synchrophasor", False),
-            show_bsap=getattr(args, "bsap", False),
-            show_genisys=getattr(args, "genisys", False),
-            show_opc_classic=getattr(args, "opc_classic", False),
-            show_streams=getattr(args, "streams", False),
-            stream_id=getattr(args, "stream_id", None),
-            stream_search=getattr(args, "stream_search", None),
-            stream_port=getattr(args, "stream_port", None),
-            streams_established=getattr(args, "streams_established", False),
-            streams_full=getattr(args, "streams_full", False),
-            show_voip=getattr(args, "voip", False) or getattr(args, "sip", False),
-            voip_out=Path(args.voip_out).expanduser()
-            if getattr(args, "voip_out", None)
-            else None,
-            show_carve=getattr(args, "carve", False),
-            carve_out=Path(args.carve_out).expanduser()
-            if getattr(args, "carve_out", None)
-            else None,
-            carve_limit=getattr(args, "carve_limit", 100),
-            carve_max_bytes=getattr(args, "carve_max_bytes", 2 * 1024 * 1024),
-            carve_stream_bytes=getattr(args, "carve_stream_bytes", 8 * 1024 * 1024),
-            show_obfuscation=getattr(args, "obfuscation", False),
-            show_ctf=getattr(args, "ctf", False),
-            show_ioc=getattr(args, "ioc", False),
-            ioc_file=getattr(args, "ioc_file", None),
-            show_pcapmeta=getattr(args, "pcapmeta", False),
-            show_ot_commands=getattr(args, "ot_commands", False),
-            show_ot_commands_fast=getattr(args, "ot_commands_fast", False),
-            ot_commands_config=ot_commands_config,
-            ot_commands_sessions_limit=getattr(args, "ot_commands_sessions", 10),
-            show_iec101_103=getattr(args, "iec101_103", False),
-            bpf=getattr(args, "bpf", None),
-            time_start=time_start,
-            time_end=time_end,
-            export_json_path=export_json_path,
-            export_csv_path=export_csv_path,
-            export_sqlite_path=export_sqlite_path,
-            case_dir=case_dir,
-            log_config=log_config,
-            plugins=plugins,
-            ruleset=ruleset,
-            baseline_save=baseline_save,
-            baseline_compare=baseline_compare,
-            decrypt_config=decrypt_config,
-            correlate_requested=getattr(args, "correlate", False),
-            correlate_min=getattr(args, "correlate_min", 2),
-            auto_decode_enabled=not getattr(args, "no_auto_decode", False),
-        )
+        # The terminal display: a progress bar per capture, or with -v the
+        # detail (pass percentages, analysis timing, library warnings).
+        with display_session(
+            verbose=bool(args.verbose), status=not args.no_status, color=not args.no_color
+        ):
+            return _analyze_paths(
+                paths,
+                args.limit_protocols,
+                show_base=args.base,
+                show_status=not args.no_status,
+                search_query=args.search,
+                search_case=args.search_case,
+                show_vlan=args.vlan,
+                show_icmp=args.icmp,
+                show_dns=args.dns,
+                dns_vt=args.vt,
+                ip_geo=getattr(args, "ip_geo", False),
+                show_http=args.http,
+                show_webrequests=getattr(args, "webrequests", False),
+                webrequests_post_only=bool(getattr(args, "webrequests_post_only", False)),
+                webrequests_high_only=bool(getattr(args, "webrequests_high_only", False)),
+                webrequests_host_view=bool(getattr(args, "webrequests_host_view", False)),
+                show_ftp=args.ftp,
+                show_aim=getattr(args, "aim", False),
+                show_tls=args.tls,
+                show_ssh=args.ssh,
+                show_rdp=args.rdp,
+                show_telnet=args.telnet,
+                show_vnc=args.vnc,
+                show_teamviewer=args.teamviewer,
+                show_winrm=args.winrm,
+                show_wmic=args.wmic,
+                show_powershell=args.powershell,
+                show_malware=getattr(args, "malware", False),
+                show_syslog=args.syslog,
+                show_snmp=args.snmp,
+                show_email=getattr(args, "email", False),
+                show_rpc=args.rpc,
+                show_tcp=args.tcp,
+                show_udp=args.udp,
+                show_exfil=args.exfil,
+                show_sizes=args.sizes,
+                show_ips=args.ips,
+                show_ip_lookup=getattr(args, "ip_lookup", False),
+                show_mac_lookup=getattr(args, "mac_lookup", False),
+                show_beacon=args.beacon,
+                show_scan=getattr(args, "scan", False),
+                show_threats=args.threats,
+                show_mitre=getattr(args, "mitre", False),
+                show_suricata=getattr(args, "suricata", False),
+                suricata_rules=suricata_rules_path,
+                suricata_config=suricata_config_path,
+                suricata_eve_types={
+                    item.strip().lower()
+                    for item in str(getattr(args, "suricata_eve_types", "") or "").split(
+                        ","
+                    )
+                    if item.strip()
+                }
+                or None,
+                suricata_suppress_sid={
+                    item.strip()
+                    for item in str(getattr(args, "suricata_suppress_sid", "") or "").split(
+                        ","
+                    )
+                    if item.strip()
+                }
+                or None,
+                suricata_only_sid={
+                    item.strip()
+                    for item in str(getattr(args, "suricata_only_sid", "") or "").split(",")
+                    if item.strip()
+                }
+                or None,
+                suricata_strict=bool(getattr(args, "suricata_strict", False)),
+                show_files=args.files,
+                files_executable_only=bool(getattr(args, "files_executable_only", False)),
+                show_overview=getattr(args, "overview", False),
+                show_protocols=args.protocols,
+                show_routing=args.routing,
+                show_services=args.services,
+                show_smb=args.smb,
+                show_nfs=args.nfs,
+                show_strings=args.strings,
+                show_creds=args.creds,
+                show_secrets_scan=getattr(args, "secrets", False),
+                show_certificates=args.certificates,
+                show_health=args.health,
+                show_compromised=getattr(args, "compromised", False),
+                show_hostnames=args.hostnames,
+                hostname_name=getattr(args, "hostname_name", None),
+                show_hostdetails=args.hostdetails,
+                show_timeline=args.timeline,
+                timeline_ip=args.timeline_ip,
+                lookup_mac=getattr(args, "lookup_mac", None),
+                timeline_bins=args.timeline_bins,
+                timeline_storyline_off=args.timeline_storyline_off,
+                timeline_categories=timeline_categories,
+                timeline_categories_invert=bool(
+                    getattr(args, "timeline_categories_invert", False)
+                ),
+                show_ntlm=args.ntlm,
+                show_netbios=args.netbios,
+                show_arp=args.arp,
+                show_dhcp=getattr(args, "dhcp", False),
+                show_modbus=args.modbus,
+                show_dnp3=args.dnp3,
+                show_iec104=args.iec104,
+                show_bacnet=args.bacnet,
+                show_enip=args.enip,
+                show_profinet=args.profinet,
+                show_s7=args.s7,
+                show_opc=args.opc,
+                show_ethercat=args.ethercat,
+                show_fins=args.fins,
+                show_crimson=args.crimson,
+                show_pcworx=args.pcworx,
+                show_melsec=args.melsec,
+                show_cip=args.cip,
+                show_codesys=args.codesys,
+                show_niagara=args.niagara,
+                show_mms=args.mms,
+                show_srtp=args.srtp,
+                show_df1=args.df1,
+                show_pccc=args.pccc,
+                show_csp=args.csp,
+                show_modicon=args.modicon,
+                show_yokogawa=args.yokogawa,
+                show_honeywell=args.honeywell,
+                show_mqtt=args.mqtt,
+                show_coap=args.coap,
+                show_hart=args.hart,
+                show_prconos=args.prconos,
+                show_iccp=args.iccp,
+                show_control_loop=getattr(args, "control_loop", False),
+                show_safety=getattr(args, "safety", False),
+                verbose=args.verbose,
+                extract_name=args.extract,
+                view_name=args.view,
+                view_raw=args.view_raw,
+                hash_name=getattr(args, "hash_name", None),
+                packet_index=args.packet,
+                show_domain=args.domain,
+                show_ldap=args.ldap,
+                show_kerberos=args.kerberos,
+                ordered_steps=ordered_steps,
+                summarize=args.summarize,
+                show_quic=getattr(args, "quic", False),
+                show_qos=getattr(args, "qos", False),
+                show_wlan=getattr(args, "wlan", False),
+                show_http2=getattr(args, "http2", False),
+                show_encrypted_dns=getattr(args, "encrypted_dns", False),
+                show_ntp=getattr(args, "ntp", False),
+                show_ssdp=getattr(args, "ssdp", False),
+                show_vpn=getattr(args, "vpn", False),
+                show_goose=getattr(args, "goose", False),
+                show_sv=getattr(args, "sv", False),
+                show_lldp=getattr(args, "lldp", False),
+                show_ptp=getattr(args, "ptp", False),
+                show_synchrophasor=getattr(args, "synchrophasor", False),
+                show_bsap=getattr(args, "bsap", False),
+                show_genisys=getattr(args, "genisys", False),
+                show_opc_classic=getattr(args, "opc_classic", False),
+                show_streams=getattr(args, "streams", False),
+                stream_id=getattr(args, "stream_id", None),
+                stream_search=getattr(args, "stream_search", None),
+                stream_port=getattr(args, "stream_port", None),
+                streams_established=getattr(args, "streams_established", False),
+                streams_full=getattr(args, "streams_full", False),
+                show_voip=getattr(args, "voip", False) or getattr(args, "sip", False),
+                voip_out=Path(args.voip_out).expanduser()
+                if getattr(args, "voip_out", None)
+                else None,
+                show_carve=getattr(args, "carve", False),
+                carve_out=Path(args.carve_out).expanduser()
+                if getattr(args, "carve_out", None)
+                else None,
+                carve_limit=getattr(args, "carve_limit", 100),
+                carve_max_bytes=getattr(args, "carve_max_bytes", 2 * 1024 * 1024),
+                carve_stream_bytes=getattr(args, "carve_stream_bytes", 8 * 1024 * 1024),
+                show_obfuscation=getattr(args, "obfuscation", False),
+                show_ctf=getattr(args, "ctf", False),
+                show_ioc=getattr(args, "ioc", False),
+                ioc_file=getattr(args, "ioc_file", None),
+                show_pcapmeta=getattr(args, "pcapmeta", False),
+                show_ot_commands=getattr(args, "ot_commands", False),
+                show_ot_commands_fast=getattr(args, "ot_commands_fast", False),
+                ot_commands_config=ot_commands_config,
+                ot_commands_sessions_limit=getattr(args, "ot_commands_sessions", 10),
+                show_iec101_103=getattr(args, "iec101_103", False),
+                bpf=getattr(args, "bpf", None),
+                time_start=time_start,
+                time_end=time_end,
+                export_json_path=export_json_path,
+                export_csv_path=export_csv_path,
+                export_sqlite_path=export_sqlite_path,
+                case_dir=case_dir,
+                log_config=log_config,
+                plugins=plugins,
+                ruleset=ruleset,
+                baseline_save=baseline_save,
+                baseline_compare=baseline_compare,
+                decrypt_config=decrypt_config,
+                correlate_requested=getattr(args, "correlate", False),
+                correlate_min=getattr(args, "correlate_min", 2),
+                auto_decode_enabled=not getattr(args, "no_auto_decode", False),
+                jobs=_resolve_jobs(getattr(args, "jobs", None)),
+                split=(os.cpu_count() or 1) if getattr(args, "split", 1) == 0 else max(1, getattr(args, "split", 1)),
+            )
 
     def _write_case_metadata(end_time: datetime) -> None:
         if not case_dir:

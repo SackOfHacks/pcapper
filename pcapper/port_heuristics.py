@@ -29,7 +29,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Callable
 
-from .industrial_helpers import _strip_padding
+from .industrial_helpers import _record_payload, _tcp_seq_flags, _transport_record
 from .pcap_cache import PcapMeta, iter_packets
 from .port_overrides import register, scope_key
 
@@ -433,25 +433,32 @@ def detect_nonstandard_ports(
     counts: Counter[tuple[str, int]] = Counter()
     samples: dict[tuple[str, int], list[tuple[bytes, int]]] = {}
 
-    for index, pkt in enumerate(
-        iter_packets(path, packets=packets, meta=meta, show_status=show_status)
-    ):
+    head = None
+    if packets is None:
+        from . import sharedpass
+        from .pcap_cache import read_head
+
+        if not sharedpass.consuming(path):
+            # Read from disk, the records are kept for the pass that follows,
+            # which replays them instead of reading them again.
+            head = read_head(path, max_packets)
+    source = head if head is not None else iter_packets(
+        path, packets=packets, meta=meta, show_status=show_status, lite=True
+    )
+    for index, pkt in enumerate(source):
         if index >= max_packets:
             break
-        layer = pkt.getlayer(TCP)  # type: ignore[attr-defined]
-        transport = "tcp"
-        if layer is None:
-            layer = pkt.getlayer(UDP) if UDP is not None else None  # type: ignore[attr-defined]
-            transport = "udp"
-            if layer is None:
-                continue
-        sport = int(getattr(layer, "sport", 0) or 0)
-        dport = int(getattr(layer, "dport", 0) or 0)
+        record = _transport_record(pkt)
+        if record is None:
+            continue
+        transport = "tcp" if record[0] else "udp"
+        sport, dport = record[1], record[2]
         if transport == "tcp":
-            flags = int(getattr(layer, "flags", 0) or 0)
+            seq_flags = _tcp_seq_flags(pkt)
+            flags = seq_flags[1] if seq_flags is not None else 0
             if flags & 0x02 and not flags & 0x10:
                 syn_servers.add(("tcp", dport))
-        payload = _strip_padding(layer.payload)
+        payload = _record_payload(pkt, record)
         if not payload:
             continue
         # A registered OT/IT server port decides first: one stray SYN to a
@@ -478,6 +485,8 @@ def detect_nonstandard_ports(
         bucket = samples.setdefault(key, [])
         if len(bucket) < SAMPLE_CAP:
             bucket.append((bytes(payload[:SAMPLE_BYTES]), len(payload)))
+    if head is not None:
+        head.close()  # type: ignore[attr-defined]  # stores the kept records
 
     found: list[PortDetection] = []
     for transport in ("tcp", "udp"):
@@ -558,6 +567,13 @@ def auto_decode(
     cached = _DETECTED.get(key)
     if cached is not None:
         return cached
+    from . import utils
+
+    if utils._MEMO_RECORDER is not None:
+        # A shared-pass dry run (pcapper.sharedpass.discover) sees an empty
+        # packet view: detecting -- and caching -- "nothing" here would turn
+        # auto decode-as off for the real run.
+        return []
     detections = detect_nonstandard_ports(
         path, packets=packets, meta=meta, show_status=show_status
     )

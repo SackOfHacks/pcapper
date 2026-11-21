@@ -2,21 +2,22 @@ from __future__ import annotations
 
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import PcapMeta, iter_packets
-from .utils import extract_ascii_strings as _extract_ascii_strings
+from .utils import beacon_score as _beaconing_score
 from .utils import (
     env_int,
     extract_packet_endpoints,
+    is_public_ip,
     memoize_analysis,
     packet_length,
     safe_float,
     tcp_segment_length,
 )
-from .utils import beacon_score as _beaconing_score
+from .utils import extract_ascii_strings as _extract_ascii_strings
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -40,6 +41,13 @@ MAX_VNC_MACS_PER_IP = env_int("PCAPPER_MAX_VNC_MACS_PER_IP", 32, minimum=1)
 # an ephemeral port; a flow from ephemeral 5900 to 443 is not VNC.
 _EPHEMERAL_MIN = 1024
 VNC_BANNER_RE = re.compile(r"(RFB\s+\d+\.\d+)")
+# A viewer listening for reverse connections ("vncviewer -listen", UltraVNC's
+# listening viewer) uses 5500; UltraVNC servers announce themselves to a
+# repeater / listening viewer with "ID:<number>" NUL-padded to 250 bytes.
+REVERSE_VNC_PORTS = {5500}
+ULTRAVNC_ID_RE = re.compile(rb"^ID:(\d{1,12})\x00")
+PENDING_FLOW_PACKETS = 16
+MAX_PENDING_FLOWS = env_int("PCAPPER_MAX_VNC_PENDING_FLOWS", 200000, minimum=1)
 # RFB security types are BINARY bytes negotiated in the handshake (NOT text), so
 # they must be parsed from the handshake — matching the words "None"/"Tight" in
 # arbitrary framebuffer/clipboard text produced constant false "no auth" alerts.
@@ -92,7 +100,7 @@ SUSPICIOUS_PLAINTEXT = [
 ]
 
 FILE_NAME_RE = re.compile(
-    r"[\w\-.()\[\]/ ]+\.(?:exe|bin|elf|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|tar|gz|tgz|txt|csv|log|ps1|sh|bat|py|js|jar|apk|iso|img)",
+    r"[\w\-.()\[\]/](?:[\w\-.()\[\]/]| (?! ))*\.(?:exe|bin|elf|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|tar|gz|tgz|txt|csv|log|ps1|sh|bat|py|js|jar|apk|iso|img)\b",
     re.IGNORECASE,
 )
 
@@ -115,6 +123,11 @@ class VncConversation:
     last_seen: Optional[float]
     client_banner: Optional[str]
     server_banner: Optional[str]
+    # The VNC server opened the TCP connection to a listening viewer.
+    reverse: bool = False
+    repeater_id: str = ""  # UltraVNC repeater/backconnect "ID:" number
+    handshake: str = ""  # how far the RFB handshake got
+    hello_strings: tuple[str, ...] = ()  # strings in the UltraVNC hello buffer
 
 
 @dataclass(frozen=True)
@@ -230,6 +243,28 @@ class _SessionState:
     rfb_stage: int = 0  # 0=init, 1=server-version, 2=client-version, 3=sec-types parsed
     vnc_security: str = ""
     offered_security_types: tuple[int, ...] = ()
+    initiator: Optional[tuple[str, int]] = None  # the side that sent the SYN
+    roles_fixed: bool = False
+    reverse: bool = False
+    repeater_id: str = ""
+    hello_strings: tuple[str, ...] = ()
+    side_macs: dict = field(default_factory=dict)
+
+    def swap_roles(self) -> None:
+        self.client_ip, self.server_ip = self.server_ip, self.client_ip
+        self.client_port, self.server_port = self.server_port, self.client_port
+        self.client_packets, self.server_packets = self.server_packets, self.client_packets
+        self.client_bytes, self.server_bytes = self.server_bytes, self.client_bytes
+        self.client_banner, self.server_banner = self.server_banner, self.client_banner
+
+    def handshake(self) -> str:
+        if self.rfb_stage >= 3:
+            return f"security: {self.vnc_security}" if self.vnc_security else "security types offered"
+        if self.rfb_stage == 2:
+            return "versions exchanged"
+        if self.rfb_stage == 1:
+            return "viewer never answered"
+        return "repeater hello only" if self.repeater_id else "no RFB handshake seen"
 
 
 def _scan_plaintext(
@@ -353,7 +388,7 @@ def analyze_vnc(
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
 
-    sessions: dict[tuple[str, int, str, int], _SessionState] = {}
+    sessions: dict[tuple, _SessionState] = {}
     client_counts: Counter[str] = Counter()
     server_counts: Counter[str] = Counter()
     client_macs: Counter[str] = Counter()
@@ -375,6 +410,16 @@ def analyze_vnc(
     pair_first_seen: dict[tuple[str, str], list[float]] = defaultdict(list)
     session_cap_reached = False
 
+    def _flow_key(a_ip: str, a_port: int, b_ip: str, b_port: int) -> tuple:
+        a, b = (a_ip, a_port), (b_ip, b_port)
+        return (a, b) if a <= b else (b, a)
+
+    # The first packets of every TCP flow, briefly: a flow identified as VNC
+    # only later (an UltraVNC hello or a banner on an unregistered port, e.g.
+    # a reverse connection to a viewer listening on 5500) is then counted from
+    # its handshake on, not from the banner packet.
+    pending: dict[tuple, dict] = {}
+
     try:
         for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
             total_packets += 1
@@ -391,44 +436,44 @@ def analyze_vnc(
             tcp = pkt[TCP]  # type: ignore[index]
             sport = int(getattr(tcp, "sport", 0) or 0)
             dport = int(getattr(tcp, "dport", 0) or 0)
-
+            try:
+                tcp_flags = int(getattr(tcp, "flags", 0) or 0)
+            except Exception:
+                tcp_flags = 0
+            is_syn = bool(tcp_flags & 0x02) and not tcp_flags & 0x10
             payload = _tcp_payload_bytes(pkt, tcp)
-
-            payload_prefix = payload[:12] if payload else b""
-            is_vnc = (
-                dport in VNC_PORTS
-                or (sport in VNC_PORTS and dport >= _EPHEMERAL_MIN)
-                or payload_prefix.startswith(b"RFB ")
-            )
-            if not is_vnc:
-                continue
-
-            vnc_packets += 1
             ts = safe_float(getattr(pkt, "time", None))
-            if ts is not None:
-                if first_seen is None or ts < first_seen:
-                    first_seen = ts
-                if last_seen is None or ts > last_seen:
-                    last_seen = ts
+            flow = _flow_key(src_ip, sport, dst_ip, dport)
+            hello = ULTRAVNC_ID_RE.match(payload) if payload else None
 
-            eth_src = None
-            eth_dst = None
-            if Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
-                try:
-                    eth_layer = pkt[Ether]  # type: ignore[index]
-                    eth_src = str(getattr(eth_layer, "src", "")) or None
-                    eth_dst = str(getattr(eth_layer, "dst", "")) or None
-                except Exception:
-                    eth_src = None
-                    eth_dst = None
-
-            client_ip, server_ip, client_port, server_port = _direction(
-                src_ip, dst_ip, sport, dport
-            )
-
-            session_key = (client_ip, client_port, server_ip, server_port)
-            session = sessions.get(session_key)
+            session = sessions.get(flow)
             if session is None:
+                is_vnc = (
+                    dport in VNC_PORTS
+                    or (sport in VNC_PORTS and dport >= _EPHEMERAL_MIN)
+                    or payload[:4] == b"RFB "
+                    or hello is not None
+                )
+                if not is_vnc:
+                    state = pending.get(flow)
+                    if state is None:
+                        if len(pending) >= MAX_PENDING_FLOWS:
+                            pending.clear()
+                        state = pending[flow] = {"packets": Counter(), "bytes": Counter(), "first": ts, "last": ts,
+                                                 "syn": None}
+                    elif state.get("done"):
+                        continue
+                    side = (src_ip, sport)
+                    state["packets"][side] += 1
+                    state["bytes"][side] += pkt_len
+                    if ts is not None:
+                        state["first"] = ts if state["first"] is None else min(state["first"], ts)
+                        state["last"] = ts if state["last"] is None else max(state["last"], ts)
+                    if is_syn:
+                        state["syn"] = side
+                    if sum(state["packets"].values()) > PENDING_FLOW_PACKETS:
+                        pending[flow] = {"done": True}
+                    continue
                 if len(sessions) >= MAX_VNC_SESSIONS:
                     if not session_cap_reached:
                         errors.append(
@@ -437,56 +482,86 @@ def analyze_vnc(
                         )
                         session_cap_reached = True
                     continue
+                client_ip, server_ip, client_port, server_port = _direction(src_ip, dst_ip, sport, dport)
                 session = _SessionState(
-                    client_ip=client_ip,
-                    server_ip=server_ip,
-                    client_port=client_port,
-                    server_port=server_port,
-                    packets=0,
-                    bytes=0,
-                    first_seen=ts,
-                    last_seen=ts,
+                    client_ip=client_ip, server_ip=server_ip, client_port=client_port, server_port=server_port,
+                    first_seen=ts, last_seen=ts,
                 )
-                sessions[session_key] = session
+                prior = pending.pop(flow, None)
+                if prior and not prior.get("done"):
+                    for side, n in prior["packets"].items():
+                        nbytes = prior["bytes"][side]
+                        session.packets += n
+                        session.bytes += nbytes
+                        vnc_packets += n
+                        if side == (client_ip, client_port):
+                            session.client_packets += n
+                            session.client_bytes += nbytes
+                        else:
+                            session.server_packets += n
+                            session.server_bytes += nbytes
+                    session.initiator = prior["syn"]
+                    for value in (prior["first"], prior["last"]):
+                        if value is not None:
+                            session.first_seen = value if session.first_seen is None else min(session.first_seen, value)
+                            first_seen = value if first_seen is None else min(first_seen, value)
+                            last_seen = value if last_seen is None else max(last_seen, value)
+                sessions[flow] = session
+            if is_syn and session.initiator is None:
+                session.initiator = (src_ip, sport)
 
-            server_ports[server_port] += 1
-            client_counts[client_ip] += 1
-            server_counts[server_ip] += 1
-            if eth_src and src_ip:
-                if (
-                    len(ip_to_macs[src_ip]) < MAX_VNC_MACS_PER_IP
-                    or eth_src.lower() in ip_to_macs[src_ip]
-                ):
-                    ip_to_macs[src_ip].add(eth_src.lower())
-            if eth_dst and dst_ip:
-                if (
-                    len(ip_to_macs[dst_ip]) < MAX_VNC_MACS_PER_IP
-                    or eth_dst.lower() in ip_to_macs[dst_ip]
-                ):
-                    ip_to_macs[dst_ip].add(eth_dst.lower())
-            if eth_src and src_ip == client_ip:
-                client_macs[eth_src.lower()] += 1
-            if eth_dst and dst_ip == server_ip:
-                server_macs[eth_dst.lower()] += 1
+            vnc_packets += 1
+            if ts is not None:
+                if first_seen is None or ts < first_seen:
+                    first_seen = ts
+                if last_seen is None or ts > last_seen:
+                    last_seen = ts
 
-            if session.client_mac is None and eth_src and src_ip == client_ip:
-                session.client_mac = eth_src.lower()
-            if session.server_mac is None and eth_dst and dst_ip == server_ip:
-                session.server_mac = eth_dst.lower()
+            # Roles follow the protocol, not the ports: the VNC server speaks
+            # first (its ProtocolVersion, or UltraVNC's "ID:" hello to a
+            # repeater/listening viewer). When that side opened the TCP
+            # connection, the server dialled the viewer: a reverse connection.
+            ver = _parse_rfb_version(payload)
+            if (hello is not None or ver is not None) and not session.roles_fixed:
+                session.roles_fixed = True
+                if (src_ip, sport) != (session.server_ip, session.server_port):
+                    session.swap_roles()
+                if session.initiator is not None:
+                    session.reverse = session.initiator == (src_ip, sport)
+                else:  # capture started mid-connection: judge by the ports
+                    session.reverse = sport not in VNC_PORTS and dport not in VNC_PORTS and (
+                        dport in REVERSE_VNC_PORTS or sport > dport
+                    )
+            if hello is not None and not session.repeater_id:
+                session.repeater_id = hello.group(1).decode("ascii", "replace")
+                session.hello_strings = tuple(
+                    item for item in _extract_ascii_strings(payload[len(hello.group(0)):], min_len=4)[:8]
+                    if any(ch.isalpha() for ch in item)
+                )
 
+            eth_src = None
+            if Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
+                try:
+                    eth_layer = pkt[Ether]  # type: ignore[index]
+                    eth_src = str(getattr(eth_layer, "src", "")) or None
+                    eth_dst = str(getattr(eth_layer, "dst", "")) or None
+                except Exception:
+                    eth_src = eth_dst = None
+                for ip_value, mac in ((src_ip, eth_src), (dst_ip, eth_dst)):
+                    if mac and (len(ip_to_macs[ip_value]) < MAX_VNC_MACS_PER_IP or mac.lower() in ip_to_macs[ip_value]):
+                        ip_to_macs[ip_value].add(mac.lower())
+            if eth_src:
+                session.side_macs.setdefault((src_ip, sport), eth_src.lower())
+
+            from_server = (src_ip, sport) == (session.server_ip, session.server_port)
             session.packets += 1
             session.bytes += pkt_len
-            if src_ip == client_ip:
-                session.client_packets += 1
-                session.client_bytes += pkt_len
-                client_packets += 1
-                client_bytes += pkt_len
-            else:
+            if from_server:
                 session.server_packets += 1
                 session.server_bytes += pkt_len
-                server_packets += 1
-                server_bytes += pkt_len
-
+            else:
+                session.client_packets += 1
+                session.client_bytes += pkt_len
             if ts is not None:
                 if session.first_seen is None or ts < session.first_seen:
                     session.first_seen = ts
@@ -501,8 +576,6 @@ def analyze_vnc(
                     text = ""
 
             # ---- RFB handshake security-type parsing (binary) ----------------
-            from_server = src_ip == server_ip
-            ver = _parse_rfb_version(payload)
             if ver is not None:
                 session.rfb_version = ver
                 # Server sends its version first, then the client echoes its own.
@@ -540,7 +613,7 @@ def analyze_vnc(
                 banner = VNC_BANNER_RE.search(text)
                 if banner:
                     value = banner.group(1)
-                    if src_ip == client_ip:
+                    if not from_server:
                         session.client_banner = session.client_banner or value
                         if value in client_banners or len(client_banners) < MAX_VNC_UNIQUE_VALUES:
                             client_banners[value] += 1
@@ -566,6 +639,19 @@ def analyze_vnc(
 
     conversations: list[VncConversation] = []
     for session in sessions.values():
+        session.client_mac = session.side_macs.get((session.client_ip, session.client_port))
+        session.server_mac = session.side_macs.get((session.server_ip, session.server_port))
+        client_counts[session.client_ip] += session.packets
+        server_counts[session.server_ip] += session.packets
+        server_ports[session.server_port] += session.packets
+        client_packets += session.client_packets
+        server_packets += session.server_packets
+        client_bytes += session.client_bytes
+        server_bytes += session.server_bytes
+        if session.client_mac:
+            client_macs[session.client_mac] += session.client_packets
+        if session.server_mac:
+            server_macs[session.server_mac] += session.server_packets
         conversations.append(
             VncConversation(
                 client_ip=session.client_ip,
@@ -584,6 +670,10 @@ def analyze_vnc(
                 last_seen=session.last_seen,
                 client_banner=session.client_banner,
                 server_banner=session.server_banner,
+                reverse=session.reverse,
+                repeater_id=session.repeater_id,
+                handshake=session.handshake(),
+                hello_strings=session.hello_strings,
             )
         )
         if session.packets <= 6 and session.bytes < 2000:
@@ -598,7 +688,33 @@ def analyze_vnc(
     detections: list[dict[str, object]] = []
     anomalies: list[dict[str, object]] = []
 
-    non_standard_ports = [port for port in server_ports if port not in VNC_PORTS]
+    reverse = [c for c in conversations if c.reverse]
+    for conv in sorted(reverse, key=lambda c: (-c.packets, c.server_ip))[:5]:
+        viewer_public = is_public_ip(conv.client_ip)
+        duration = (conv.last_seen - conv.first_seen) if conv.first_seen is not None and conv.last_seen is not None else None
+        detections.append(
+            {
+                "severity": "high" if viewer_public else "warning",
+                "summary": "Reverse VNC: a VNC server connected out to a listening viewer",
+                "details": (
+                    f"{conv.server_ip} (the desktop) dialled {conv.client_ip}:{conv.client_port} "
+                    f"({'external' if viewer_public else 'internal'} viewer)"
+                    + (f", UltraVNC repeater ID {conv.repeater_id}" if conv.repeater_id else "")
+                    + f"; handshake: {conv.handshake}; {conv.packets} packets"
+                    + (f" over {duration:.0f}s" if duration else "")
+                    + (f"; hello buffer strings: {', '.join(conv.hello_strings)}" if conv.hello_strings else "")
+                    + ". Remote-control malware (hVNC / UltraVNC backconnect) connects out like this to pass firewalls."
+                ),
+                "source": "VNC",
+                "mitre": "T1219",
+                "src": conv.server_ip,
+                "dst": f"{conv.client_ip}:{conv.client_port}",
+                "ts": conv.first_seen,
+            }
+        )
+
+    non_standard_ports = [port for port in server_ports if port not in VNC_PORTS
+                          and not any(c.reverse and c.server_port == port for c in conversations)]
     if non_standard_ports:
         detections.append(
             {

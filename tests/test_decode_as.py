@@ -148,18 +148,23 @@ class TestCli:
         return cli.main()
 
     def test_auto_detection_is_announced(self, tmp_path, monkeypatch, capfd) -> None:
+        """The decode-as notice is detail: announced with -v, silent without
+        (the report still decodes the port either way)."""
         capture = tmp_path / "plc.pcap"
         _mapna(capture)
         errors: list[str] = []
         assert self._run(monkeypatch, str(capture), "--s7", errors=errors) == 0
+        assert not any("Auto decode-as" in e for e in errors)
+        assert f"{len(MAPNA_S7)} S7 packets" in capfd.readouterr().out
+        assert self._run(monkeypatch, str(capture), "--s7", "-v", errors=errors) == 0
         assert any("Auto decode-as" in e and "tcp/10203" in e for e in errors)
-        assert f"S7 Packets              : {len(MAPNA_S7)}" in capfd.readouterr().out
+        assert f"{len(MAPNA_S7)} S7 packets" in capfd.readouterr().out
 
     def test_no_auto_decode_and_explicit_spec(self, tmp_path, monkeypatch, capfd) -> None:
         capture = tmp_path / "plc.pcap"
         _mapna(capture)
         assert self._run(monkeypatch, str(capture), "--s7", "--no-auto-decode") == 0
-        assert "S7 Packets              : 0" in capfd.readouterr().out
+        assert "no S7 traffic in this capture" in capfd.readouterr().out
         errors: list[str] = []
         assert (
             self._run(
@@ -169,7 +174,7 @@ class TestCli:
             == 0
         )
         assert any("Decode-as: tcp/10203 as s7 (user)" in e for e in errors)
-        assert f"S7 Packets              : {len(MAPNA_S7)}" in capfd.readouterr().out
+        assert f"{len(MAPNA_S7)} S7 packets" in capfd.readouterr().out
 
     def test_bad_spec_exits_2(self, tmp_path, monkeypatch) -> None:
         capture = tmp_path / "plc.pcap"

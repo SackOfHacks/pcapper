@@ -1,90 +1,73 @@
-"""Rendered output for safety analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for safety instrumented systems (SIS) traffic, with
+TriStation (Triconex) decoded: key switch, program state, project and the
+logic/state-changing commands a TRITON-class attack would issue."""
 
 from __future__ import annotations
-from ..coloring import (
-    header,
-)
-from ..utils import format_ts
 
-from ._common import (
-    _finalize_output,
-    _format_counter,
-    _format_kv,
-    _format_table,
-    _limit_value,
-)
+from . import _style as st
+from ._common import _ot_attack_for_title
+from ._kv import counter_line
+
+# The analyzer's always-present "traffic observed" note: the headline says it.
+_PRESENCE = "Safety PLC/SIS protocol traffic observed"
 
 
-def render_safety_summary(summary) -> str:
+def render_safety_summary(summary) -> str:  # type: ignore[no-untyped-def]
     if not summary:
         return ""
-    lines = [header("SAFETY SYSTEMS")]
-    lines.append(_format_kv("Packets", str(summary.total_packets)))
-    lines.append(_format_kv("Hits", str(len(summary.hits))))
-    if summary.service_counts:
-        lines.append(_format_kv("Services", _format_counter(summary.service_counts, 6)))
-    if summary.source_counts:
-        lines.append(
-            _format_kv("Top Sources", _format_counter(summary.source_counts, 6))
-        )
-    if summary.destination_counts:
-        lines.append(
-            _format_kv(
-                "Top Destinations", _format_counter(summary.destination_counts, 6)
-            )
-        )
+    rep = st.Report("Safety systems", summary.path)
+    detections = [d for d in (getattr(summary, "detections", None) or []) if d.get("summary") != _PRESENCE]
+    if not st.verbose():
+        detections = [d for d in detections if str(d.get("severity", "info")).lower() not in ("info", "informational")]
+    findings = [st.finding(d, _ot_attack_for_title) for d in detections]
     frames = int(getattr(summary, "tristation_frames", 0) or 0)
-    if frames:
-        lines.append(header("TriStation (Triconex)"))
-        lines.append(_format_kv("Frames", str(frames)))
-        lines.append(_format_kv("TCM Messages", _format_counter(summary.tristation_tcm, 6)))
-        lines.append(_format_kv("Requests", _format_counter(summary.tristation_requests, _limit_value(12), 50)))
-        lines.append(_format_kv("Replies", _format_counter(summary.tristation_replies, _limit_value(8), 50)))
-        if summary.tristation_rejects:
-            lines.append(_format_kv("Rejected", _format_counter(summary.tristation_rejects, 6, 50)))
-        if summary.key_states:
-            lines.append(_format_kv("Key Switch", _format_counter(summary.key_states, 4)))
-        if summary.run_states:
-            lines.append(_format_kv("Program State", _format_counter(summary.run_states, 4)))
-        if summary.projects:
-            lines.append(_format_kv("Project", _format_counter(summary.projects, 4)))
-        timeline = list(summary.tristation_timeline or [])
-        if timeline:
-            rows = [["Time", "Workstation -> Controller", "Function"]]
-            previous = None
-            for ts, src, dst, name in timeline:
-                if (src, dst, name) == previous:
-                    continue  # collapse runs of the same command
-                previous = (src, dst, name)
-                rows.append([format_ts(ts), f"{src} -> {dst}", name])
-                if len(rows) > _limit_value(25):
-                    break
-            lines.append(header("State-changing / logic commands (consecutive repeats collapsed)"))
-            lines.append(_format_table(rows))
-    for item in getattr(summary, "detections", []) or []:
-        if item.get("summary") == "Safety PLC/SIS protocol traffic observed":
-            continue
-        sev = str(item.get("severity", "info")).upper()
-        if sev in {"INFO"}:
-            continue
-        lines.append(f"[{sev}] {item.get('summary', '')}")
-        lines.append(f"  {item.get('details', '')}")
+    if not summary.hits and not frames and not st.material(findings):
+        return rep.absent("safety-system (SIS) traffic", summary.errors)
+    severity, text = st.verdict(
+        findings,
+        high="safety-system state or logic changes: confirm an authorized engineering session",
+        medium="safety-system activity to review",
+    )
+    rep.headline(severity, text, st.join([
+        st.plural(len(summary.hits), "safety-protocol packet"),
+        f"{st.count(frames)} TriStation frames" if frames else "",
+    ]))
+    rep.scope(st.join([
+        f"{st.plural(len(summary.source_counts or {}), 'source')} -> {st.plural(len(summary.destination_counts or {}), 'destination')}",
+        st.top(summary.service_counts, 4) if summary.service_counts else "",
+    ]))
     if summary.errors:
-        lines.append(_format_kv("Errors", "; ".join(summary.errors)))
-    if summary.hits:
-        rows = [["Proto", "Service", "Src", "Dst"]]
-        for hit in summary.hits[: _limit_value(10)]:
-            rows.append(
-                [
-                    hit.protocol,
-                    hit.service,
-                    f"{hit.src}:{hit.src_port}",
-                    f"{hit.dst}:{hit.dst_port}",
-                ]
-            )
-        lines.append(_format_table(rows))
-    return _finalize_output(lines)
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Findings", st.findings_block(findings))
+
+    if frames:
+        rep.section("TriStation (Triconex)", st.kv([
+            counter_line("Key switch", summary.key_states, 4),
+            counter_line("Program state", summary.run_states, 4),
+            counter_line("Project", summary.projects, 4),
+            counter_line("Requests", summary.tristation_requests, 12),
+            counter_line("Rejected", summary.tristation_rejects, 6),
+            counter_line("Replies", summary.tristation_replies, 8),
+            counter_line("TCM messages", summary.tristation_tcm, 6),
+        ]))
+        rows, previous = [], None
+        for when, src, dst, name in list(summary.tristation_timeline or []):
+            if (src, dst, name) == previous:
+                continue  # a run of the same command is one row
+            previous = (src, dst, name)
+            rows.append([st.ts(when), st.flow(src, dst), st.bad(name)])
+        rep.section("Logic and state commands", st.table(["Time", "Workstation -> controller", "Function"], rows,
+                                                         max_rows=12, noun="command"))
+
+    rep.section("Services", st.kv([
+        counter_line("Services", summary.service_counts, 6),
+        counter_line("Sources", summary.source_counts, 6),
+        counter_line("Destinations", summary.destination_counts, 6),
+    ]))
+    rep.section("Hits", st.table(
+        ["Protocol", "Service", "Source", "Destination"],
+        [[h.protocol, h.service, f"{h.src}:{h.src_port}", f"{h.dst}:{h.dst_port}"] for h in summary.hits],
+        max_rows=None,
+    ), detail=True)
+    rep.section("Capture", st.kv([("Total packets", st.count(summary.total_packets))]), detail=True)
+    return rep.render()

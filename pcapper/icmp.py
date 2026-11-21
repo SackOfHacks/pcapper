@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import PcapMeta, iter_packets
-from .utils import memoize_analysis, safe_float, shannon_entropy
+from .utils import memoize_analysis, ranked_slice, safe_float, shannon_entropy
 
 try:
     from scapy.layers.inet import ICMP, IP  # type: ignore
@@ -96,6 +96,7 @@ class IcmpSummary:
     role_drift_profiles: list[dict[str, object]] = field(default_factory=list)
     corroborated_findings: list[dict[str, object]] = field(default_factory=list)
     false_positive_context: list[str] = field(default_factory=list)
+    payload_digests: int = 0  # distinct payloads (payload_summaries keeps the top and the bottom 10)
 
 
 def _build_icmp_enrichment(
@@ -540,7 +541,7 @@ def analyze_icmp(
     payload_variants = len(payload_sizes)
     payload_summaries: list[dict[str, object]] = []
 
-    for digest, count in payload_counts.most_common(12):
+    for digest, count in ranked_slice(payload_counts.most_common(), 200):
         meta = payload_meta.get(digest, {})
         sample_bytes = meta.get("samples", b"")
         if isinstance(sample_bytes, bytearray):
@@ -803,6 +804,7 @@ def analyze_icmp(
         max_payload_bytes=payload_max,
         payload_size_variants=payload_variants,
         payload_summaries=payload_summaries,
+        payload_digests=len(payload_counts),
         detections=detections,
         conversations=list(conversations.values()),
         sessions=list(sessions.values()),

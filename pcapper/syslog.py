@@ -3,7 +3,7 @@ from __future__ import annotations
 from .utils import is_public_ip as _is_public_ip, packet_length, extract_ascii_strings as _extract_ascii_strings
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +25,8 @@ except Exception:  # pragma: no cover
 SYSLOG_UDP_PORTS = {514, 5514}
 SYSLOG_TCP_PORTS = {514, 601, 6514}
 SYSLOG_PORTS = SYSLOG_UDP_PORTS | SYSLOG_TCP_PORTS
+MAX_MESSAGES = 2000
+MAX_MESSAGE_CHARS = 1024
 _PRI_RE = re.compile(rb"^<\d{1,3}>")
 
 SYSLOG_PRI_RE = re.compile(r"^<(\d{1,3})>")
@@ -34,6 +36,11 @@ SYSLOG_5424_RE = re.compile(
 SYSLOG_3164_RE = re.compile(
     r"^<(\d{1,3})>([A-Z][a-z]{2}\s+\d{1,2}\s+\d{2}:\d{2}:\d{2})\s+(\S+)\s*(.*)$"
 )
+# rsyslog's high-precision template: an RFC 3339 timestamp in the RFC 3164
+# layout (no version field).
+SYSLOG_3339_RE = re.compile(r"^<(\d{1,3})>(\d{4}-\d{2}-\d{2}T\S+)\s+(\S+)\s*(.*)$")
+# The RFC 3164 TAG that starts the MSG part: "sshd[1234]: text", "su: text".
+SYSLOG_TAG_RE = re.compile(r"^([A-Za-z0-9_./@-]{1,48})(?:\[([^\]\s]{1,16})\])?:\s*(.*)$", re.DOTALL)
 
 FACILITY_NAMES = {
     0: "kernel",
@@ -128,7 +135,7 @@ SUSPICIOUS_PATTERNS = [
 ]
 
 FILE_NAME_RE = re.compile(
-    r"[\w\-.()\[\]/ ]+\.(?:exe|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|tar|gz|tgz|txt|csv|log|ps1|sh|bat|py|js|jar|apk|iso|img)",
+    r"[\w\-.()\[\]/](?:[\w\-.()\[\]/]| (?! ))*\.(?:exe|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|tar|gz|tgz|txt|csv|log|ps1|sh|bat|py|js|jar|apk|iso|img)\b",
     re.IGNORECASE,
 )
 
@@ -192,6 +199,9 @@ class SyslogSummary:
     first_seen: Optional[float]
     last_seen: Optional[float]
     duration_seconds: Optional[float]
+    # The parsed messages in capture order (the first MAX_MESSAGES): time,
+    # sender, receiver, facility, severity, host, app and text.
+    messages: list[dict[str, object]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
@@ -252,7 +262,18 @@ class SyslogSummary:
             "first_seen": self.first_seen,
             "last_seen": self.last_seen,
             "duration_seconds": self.duration_seconds,
+            "messages": list(self.messages),
         }
+
+
+def is_text_message(message: str) -> bool:
+    """True when ``message`` reads as text: at least 85% printable ASCII
+    (tabs and line breaks included, trailing NULs ignored)."""
+    body = (message or "").rstrip("\x00\r\n ")
+    if not body:
+        return False
+    printable = sum(1 for ch in body if (" " <= ch < "\x7f") or ch in "\t\r\n")
+    return printable >= 0.85 * len(body)
 
 
 def _parse_syslog(text: str) -> dict[str, Optional[str]]:
@@ -272,18 +293,27 @@ def _parse_syslog(text: str) -> dict[str, Optional[str]]:
             "message": message or "",
         }
 
-    match_3164 = SYSLOG_3164_RE.match(text)
+    match_3164 = SYSLOG_3164_RE.match(text) or SYSLOG_3339_RE.match(text)
     if match_3164:
         pri, timestamp, hostname, message = match_3164.groups()
+        rest: str = message or ""
+        # RFC 3164 lets a sender omit HOSTNAME: then the token after the
+        # timestamp is already the TAG ("robin: Hello" or "sshd[42]: ...").
+        if SYSLOG_TAG_RE.match(hostname + (" " + rest if rest else "")) and (hostname.endswith(":") or "[" in hostname):
+            rest, hostname = f"{hostname} {rest}".strip(), None
+        appname = procid = None
+        tag = SYSLOG_TAG_RE.match(rest)
+        if tag:
+            appname, procid = tag.group(1), tag.group(2)
         return {
             "pri": pri,
             "version": None,
             "timestamp": timestamp,
             "hostname": hostname,
-            "appname": None,
-            "procid": None,
+            "appname": appname,
+            "procid": procid,
             "msgid": None,
-            "message": message or "",
+            "message": rest,
         }
 
     match_pri = SYSLOG_PRI_RE.match(text)
@@ -361,6 +391,7 @@ def analyze_syslog(
     syslog_packets = 0
     total_bytes = 0
     total_messages = 0
+    messages: list[dict[str, object]] = []
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
 
@@ -508,6 +539,7 @@ def analyze_syslog(
 
             parsed = _parse_syslog(text)
             pri_text = parsed.get("pri")
+            facility = severity = None
             if pri_text and pri_text.isdigit() and int(pri_text) <= 191:
                 pri_val = int(pri_text)
                 facility = FACILITY_NAMES.get(pri_val // 8, f"facility_{pri_val // 8}")
@@ -515,6 +547,14 @@ def analyze_syslog(
                 facility_counts[facility] += 1
                 severity_counts[severity] += 1
                 response_codes[severity] += 1
+            if len(messages) < MAX_MESSAGES:
+                messages.append({
+                    "ts": ts, "src": client_ip, "dst": server_ip, "facility": facility,
+                    "severity": severity, "pri": int(pri_text) % 8 if pri_text and pri_text.isdigit() and int(pri_text) <= 191 else None,
+                    "hostname": parsed.get("hostname"), "appname": parsed.get("appname"),
+                    "logged": parsed.get("timestamp"),
+                    "message": (parsed.get("message") or text)[:MAX_MESSAGE_CHARS],
+                })
 
             version = parsed.get("version")
             if version:
@@ -538,7 +578,10 @@ def analyze_syslog(
                 msgid_counts[msgid] += 1
 
             message = parsed.get("message") or text
-            if message:
+            # Binary payloads on a syslog port (fuzzing, padding, another
+            # protocol) are not log messages: random bytes matched \bc2\b and
+            # raised "Malware indicator" on 1,000 such packets.
+            if message and is_text_message(message):
                 if len(plaintext_strings) < 2000 or message in plaintext_strings:
                     plaintext_strings[message] += 1
                 for match in FILE_NAME_RE.findall(message):
@@ -613,7 +656,7 @@ def analyze_syslog(
         # log-cleared / anti-forensics patterns handled separately at HIGH.
         anomalies.append(
             SyslogAnomaly(
-                title="High-severity syslog events",
+                title="Critical/Alert/Emergency syslog events",
                 details=(
                     f"{_high_sev} Critical/Alert/Emergency event(s) observed "
                     f"(Emergency={int(severity_counts.get('Emergency', 0) or 0)}, "
@@ -663,4 +706,5 @@ def analyze_syslog(
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
+        messages=messages,
     )

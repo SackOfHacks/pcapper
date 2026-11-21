@@ -8,7 +8,7 @@ from typing import Optional
 
 from .dnp3 import analyze_dnp3
 from .modbus import analyze_modbus
-from .utils import safe_float
+from .utils import memoize_analysis, safe_float
 
 
 @dataclass(frozen=True)
@@ -347,6 +347,7 @@ def build_control_loop_summary(
     )
 
 
+@memoize_analysis  # a plan root: one read for the Modbus and DNP3 analyses it combines
 def analyze_control_loop(path: Path, show_status: bool = True) -> ControlLoopSummary:
     errors: list[str] = []
     modbus_summary = analyze_modbus(path, show_status=show_status)

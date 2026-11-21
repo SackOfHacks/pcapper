@@ -1,38 +1,18 @@
-"""Rendered output for overview analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for --overview: the triage entry point. It leads with
+the posture verdict and why, the critical/high detections by name, and the
+immediate leads -- each with the pcapper command that scopes it and what to
+confirm -- then what the auto-run deep dives found, the threat-hunt /
+forensics / OT / CTF highlights (each line once), recommended actions and
+what not to chase, and the inventory (hosts, devices, protocols, services,
+notable flows). The capture counters and per-module extra highlights are
+-v detail."""
 
 from __future__ import annotations
-from ..coloring import (
-    danger,
-    header,
-    muted,
-    ok,
-    warn,
-)
-from ..overview import OverviewSummary
-from ..utils import (
-    format_bytes_as_mb,
-    format_duration,
-    format_speed_bps,
-    format_ts,
-)
 
-from ._common import (
-    SUBSECTION_BAR,
-    _always_full_render,
-    _finalize_output,
-    _format_counter,
-    _format_kv,
-    _format_table,
-    _highlight_public_ips,
-    _limit_value,
-    _redact_in_text,
-    _short_browser_role,
-    _truncate_text,
-)
+from ..overview import OverviewSummary
+from ..utils import format_bytes_as_mb, format_duration, format_speed_bps, format_ts
+from . import _style as st
+from ._common import _redact_in_text, _short_browser_role
 
 
 def _overview_metrics_text(metrics: dict[str, object]) -> str:
@@ -135,10 +115,10 @@ def _overview_rate_text(item: dict[str, object]) -> str:
 
 def _overview_priority_style(priority: str):
     if priority == "HIGH":
-        return danger
+        return st.bad
     if priority == "MEDIUM":
-        return warn
-    return muted
+        return st.caution
+    return st.dim
 
 
 _OVERVIEW_OT_SIGNAL_TOKENS = (
@@ -266,6 +246,8 @@ def _overview_detected_devices(
                 "services": hosted_text,
                 "ports": ", ".join(str(v) for v in ports[:4]) if ports else "-",
                 "when": when_text,
+                "first_seen": item.get("first_seen"),
+                "last_seen": item.get("last_seen"),
             }
         )
         seen_ips.add(ip_text)
@@ -316,512 +298,251 @@ def _overview_lead_lookfor(finding: str) -> str:
     return "Scope the entity, establish whether the behavior is sanctioned, and corroborate with endpoint/AD telemetry."
 
 
-def _overview_hunt_lead_section(summary: OverviewSummary, verbose: bool) -> list[str]:
-    """Front-load the overview with a hunt-lead briefing: posture verdict,
-    capture characterization, a prioritized triage queue with the exact command
-    to run for each lead, hunt hypotheses, and likely-benign guidance."""
-    lines: list[str] = []
-    detail = dict(getattr(summary, "summary_details", {}) or {})
-    module_lookup = {
-        result.module: result for result in getattr(summary, "module_results", []) or []
-    }
-    threats = module_lookup.get("threats")
+_METRIC_LABELS = {  # most telling first: the Result column is cut at its width
+    "detections": "detections", "high_severity": "critical/high", "ot_risk_score": "OT risk", "anomalies": "anomalies",
+    "findings": "findings", "candidates": "candidates", "hits": "hits", "decoded_hits": "decoded", "artifacts": "artifacts",
+    "executable_artifacts": "executable", "scanners": "scanners", "high_risk_ops": "high-risk operations",
+    "write_ops": "writes", "control_ops": "control operations", "total_changes": "value changes", "commands": "commands",
+    "requests": "requests", "responses": "responses", "pcaps": "captures",
+}
+
+
+def _metrics_result(metrics: dict) -> str:
+    """A deep dive's result in words: ``10 detections · 3 critical/high``."""
+    parts = []
+    for key, label_text in _METRIC_LABELS.items():
+        value = metrics.get(key)
+        if isinstance(value, (int, float)) and not isinstance(value, bool) and value:
+            parts.append(f"{st.count(value)} {label_text}" if key != "ot_risk_score" else f"OT risk {value}/100")
+    return st.join(parts) or "nothing found"
+
+
+def _posture(summary: OverviewSummary) -> tuple[object, str, list[str]]:
+    """The hunt posture: (severity, verdict, reasons)."""
+    detail = dict(summary.summary_details or {})
+    modules = {r.module: r for r in summary.module_results or []}
+    threats = modules.get("threats")
     high_sev = int(threats.metrics.get("high_severity", 0) or 0) if threats else 0
     ot_risk = int(threats.metrics.get("ot_risk_score", 0) or 0) if threats else 0
-    scanners = 0
-    scan_result = module_lookup.get("scan")
-    if scan_result:
-        scanners = int(scan_result.metrics.get("scanners", 0) or 0)
-    leads = list(getattr(summary, "hunt_leads", []) or [])
-    high_leads = [l for l in leads if str(l.get("priority", "")).lower() == "high"]
-    med_leads = [l for l in leads if str(l.get("priority", "")).lower() == "medium"]
+    scanners = int(modules["scan"].metrics.get("scanners", 0) or 0) if "scan" in modules else 0
+    leads = list(summary.hunt_leads or [])
+    high_leads = [lead for lead in leads if str(lead.get("priority", "")).lower() == "high"]
+    medium_leads = [lead for lead in leads if str(lead.get("priority", "")).lower() == "medium"]
     cross_zone_ot = int(detail.get("cross_zone_ot_iot_flows", 0) or 0)
-
-    # --- Posture verdict -------------------------------------------------
-    reasons: list[str] = []
-    if high_sev:
-        reasons.append(f"{high_sev} critical/high threat detection(s)")
-    if high_leads:
-        reasons.append(f"{len(high_leads)} high-priority lead(s)")
-    if scanners:
-        reasons.append(f"{scanners} scanning source(s)")
-    if cross_zone_ot:
-        reasons.append(f"{cross_zone_ot} OT/IoT cross-boundary flow(s)")
-    if ot_risk >= 60:
-        reasons.append(f"OT risk posture {ot_risk}/100")
-
+    reasons = [text for cond, text in (
+        (high_sev, f"{st.plural(high_sev, 'critical/high threat detection')}"),
+        (high_leads, f"{st.plural(len(high_leads), 'high-priority lead')}"),
+        (scanners, f"{st.plural(scanners, 'scanning source')}"),
+        (cross_zone_ot, f"{st.plural(cross_zone_ot, 'OT/IoT cross-boundary flow')}"),
+        (ot_risk >= 60, f"OT risk posture {ot_risk}/100"),
+    ) if cond]
     if high_sev >= 2 or (high_sev >= 1 and high_leads):
-        verdict = "ACTIVE THREAT INDICATORS - prioritize investigation now."
-        style = danger
-    elif high_sev >= 1 or high_leads:
-        verdict = "SUSPICIOUS - corroborate the leads below before escalating."
-        style = warn
-    elif scanners or cross_zone_ot or med_leads:
-        verdict = "ELEVATED EXPOSURE/RECON - review boundary and scan activity."
-        style = warn
-    else:
-        verdict = "BASELINE - no strong attack signal; treat as scoping/triage pass."
-        style = ok
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Hunt Lead Assessment"))
-    lines.append(style(verdict))
-    if reasons:
-        lines.append(muted("Why: " + "; ".join(reasons[: _limit_value(5)])))
-
-    # --- Capture characterization ---------------------------------------
-    ot_families = list(getattr(summary, "ot_protocols", []) or [])
-    env = "OT/ICS" if ot_families else "IT/enterprise"
-    internal_ips = int(detail.get("internal_ips", 0) or 0)
-    public_ips = int(detail.get("public_ips", 0) or 0)
-    span = int(detail.get("capture_span_seconds", 0) or 0)
-    char_bits = [
-        f"{env} capture",
-        f"{int(summary.total_packets)} pkts",
-    ]
-    if span > 0:
-        char_bits.append(format_duration(float(span)))
-    char_bits.append(f"{int(detail.get('unique_ips', 0) or 0)} hosts ({internal_ips} internal / {public_ips} public)")
-    if ot_families:
-        char_bits.append("families: " + ", ".join(ot_families[: _limit_value(6)]))
-    lines.append(muted("Capture: " + "; ".join(char_bits) + "."))
-
-    # --- Name the high/critical detections behind the count -------------
-    # Otherwise "N critical/high threat detection(s)" is an unexplained number
-    # the analyst cannot find anywhere else in the report.
-    if threats and high_sev > 0:
-        shown = [
-            h
-            for h in (getattr(threats, "highlights", []) or [])
-            if h
-            and not str(h).lower().startswith(("detections:", "ot risk score"))
-            and "no threat detections" not in str(h).lower()
-        ][: _limit_value(4)]
-        if shown:
-            lines.append(muted(f"Critical/high detections ({high_sev}):"))
-            for h in shown:
-                lines.append(
-                    muted(f"  - {_redact_in_text(_truncate_text(str(h), 150))}")
-                )
-
-    # --- Triage queue: where to focus first -----------------------------
-    queue = (high_leads + med_leads + leads)
-    seen_entities: set[str] = set()
-    ordered_queue: list[dict] = []
-    for lead in queue:
-        ent = str(lead.get("entity", "")).strip()
-        if ent in seen_entities:
-            continue
-        seen_entities.add(ent)
-        ordered_queue.append(lead)
-    if ordered_queue:
-        lines.append(header("Focus Here First"))
-        for idx, lead in enumerate(ordered_queue[: _limit_value(5)], start=1):
-            priority = str(lead.get("priority", "medium")).upper()
-            entity = str(lead.get("entity", "-")).strip()
-            finding = str(lead.get("finding", "")).strip()
-            pstyle = _overview_priority_style(priority)
-            lines.append(
-                pstyle(f"{idx}. [{priority}] {_highlight_public_ips(entity)} - {finding}")
-            )
-            cmd = _overview_next_command(entity)
-            if cmd:
-                lines.append(muted(f"   run:  pcapper <capture> {cmd}"))
-            lines.append(muted(f"   check: {_overview_lead_lookfor(finding)}"))
-
-    # --- Hunt hypotheses / recommended actions --------------------------
-    recs = list(getattr(summary, "recommendations", []) or [])
-    if recs:
-        lines.append(header("Recommended Hunt Actions"))
-        for rec in recs[: _limit_value(6)]:
-            lines.append(muted(f"- {_redact_in_text(_truncate_text(str(rec), 200))}"))
-
-    # --- Likely benign / don't chase ------------------------------------
-    benign: list[str] = []
-    if ot_families:
-        benign.append(
-            "OT is deterministic: steady internal HMI<->PLC polling and cyclic I/O are "
-            "baseline, not C2 - confirm against a process baseline before chasing periodicity."
-        )
-    if public_ips and not high_sev:
-        benign.append(
-            "Public peers without a high-severity detection are often CDN/cloud/update/NTP - "
-            "confirm reputation before treating egress as exfil."
-        )
-    benign.append(
-        "Anything inside a documented maintenance/change window with an open ticket is "
-        "false-positive by default - calendar the activity first."
-    )
-    lines.append(header("Likely Benign / Don't Chase"))
-    for item in benign[: _limit_value(4)]:
-        lines.append(muted(f"- {item}"))
-
-    gaps = list(getattr(summary, "errors", []) or [])
-    module_errors = int(detail.get("module_errors", 0) or 0)
-    if gaps or module_errors:
-        note = "Coverage gaps present"
-        if module_errors:
-            note += f" ({module_errors} deep-dive error(s))"
-        note += " - findings are lower-bound; see Errors/Gaps below."
-        lines.append(muted(f"Caveat: {note}"))
-
-    return lines
+        return "high", "active threat indicators: prioritize investigation now", reasons
+    if high_sev >= 1 or high_leads:
+        return "medium", "suspicious: corroborate the leads before escalating", reasons
+    if scanners or cross_zone_ot or medium_leads:
+        return "medium", "elevated exposure or reconnaissance: review boundary and scan activity", reasons
+    return None, "baseline: no strong attack signal (scoping / triage pass)", reasons
 
 
-@_always_full_render
+def _key(text: object) -> str:
+    return str(text or "").strip().lower().rstrip(".")
+
+
+def _window(start: object, end: object) -> str:
+    """A compact first..last time (exact with -v)."""
+    first, last = _overview_ts(start), _overview_ts(end)
+    if first is None and last is None:
+        return "-"
+    return st.ts_range(first if first is not None else last, last if last is not None else first)
+
+
 def render_overview_summary(summary: OverviewSummary, verbose: bool = False) -> str:
-    verbose = True  # --overview always shows the complete picture
-    lines = [header(f"THREAT HUNT LEAD :: {summary.path.name}")]
-    lines.append(_format_kv("Capture", str(summary.path)))
-    lines.append(_format_kv("Packets", str(summary.total_packets)))
-    lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
-    capture_window = _overview_window_text(
-        getattr(summary, "capture_start", None), getattr(summary, "capture_end", None)
-    )
-    if capture_window != "-":
-        lines.append(_format_kv("Capture Window", capture_window))
-    lines.append(_format_kv("Top Protocols", _format_counter(dict(summary.top_protocols), 8)))
-    lines.append(_format_kv("Top Services", _format_counter(dict(summary.top_services), 8)))
-    ip_activity_rows = list(getattr(summary, "ip_activity", []) or summary.observed_ips or [])
-    if ip_activity_rows:
-        top_talker = ip_activity_rows[0]
-        lines.append(
-            _format_kv(
-                "Top Talker",
-                (
-                    f"{top_talker.get('ip', '-')} "
-                    f"({int(top_talker.get('packets_total', 0) or 0)} pkts, "
-                    f"{format_bytes_as_mb(int(top_talker.get('bytes_total', 0) or 0))})"
-                ),
-            )
-        )
-    detail = dict(getattr(summary, "summary_details", {}) or {})
-    if detail:
-        lines.append(_format_kv("Unique IPs", str(int(detail.get("unique_ips", 0) or 0))))
-        lines.append(
-            _format_kv(
-                "Unique Protocols",
-                str(int(detail.get("unique_protocols", 0) or 0)),
-            )
-        )
-        lines.append(
-            _format_kv(
-                "Unique Services",
-                str(int(detail.get("unique_services", 0) or 0)),
-            )
-        )
-        lines.append(
-            _format_kv("Internal IPs", str(int(detail.get("internal_ips", 0) or 0)))
-        )
-        lines.append(
-            _format_kv("Public IPs", str(int(detail.get("public_ips", 0) or 0)))
-        )
-        lines.append(
-            _format_kv("Observed Flows", str(int(detail.get("flow_count", 0) or 0)))
-        )
-        lines.append(
-            _format_kv(
-                "Cross-Zone Flows",
-                str(int(detail.get("cross_zone_flows", 0) or 0)),
-            )
-        )
-        lines.append(
-            _format_kv(
-                "Cross-Zone OT/IoT Flows",
-                str(int(detail.get("cross_zone_ot_iot_flows", 0) or 0)),
-            )
-        )
-        lines.append(
-            _format_kv("Leads", str(int(detail.get("hunt_leads", 0) or 0)))
-        )
-        capture_span_seconds = int(detail.get("capture_span_seconds", 0) or 0)
-        if capture_span_seconds > 0:
-            lines.append(
-                _format_kv("Capture Span", format_duration(float(capture_span_seconds)))
-            )
-        lines.append(
-            _format_kv(
-                "Deep Dives Run",
-                str(int(detail.get("module_count", len(summary.modules_run)) or 0)),
-            )
-        )
-        lines.append(
-            _format_kv(
-                "Deep Dive Errors",
-                str(int(detail.get("module_errors", 0) or 0)),
-            )
-        )
-        lines.append(
-            _format_kv(
-                "Protocol Anomalies",
-                str(int(detail.get("protocol_anomalies", 0) or 0)),
-            )
-        )
-        lines.append(
-            _format_kv("Service Risks", str(int(detail.get("service_risks", 0) or 0)))
-        )
-    lines.append(
-        _format_kv(
-            "OT/ICS Families",
-            ", ".join(summary.ot_protocols[:10]) if summary.ot_protocols else "-",
-        )
-    )
-    iot_labels = [
-        str(label).strip()
-        for label in summary.ot_protocols
-        if str(label).strip()
-        and (
-            "mqtt" in str(label).lower()
-            or "coap" in str(label).lower()
-        )
-    ]
-    lines.append(
-        _format_kv(
-            "IoT Families",
-            ", ".join(iot_labels[:8]) if iot_labels else "-",
-        )
-    )
+    rep = st.Report("Overview", summary.path)
+    detail = dict(summary.summary_details or {})
+    modules = {r.module: r for r in summary.module_results or []}
+    severity, verdict, reasons = _posture(summary)
+    ot_families = list(summary.ot_protocols or [])
+    span = int(detail.get("capture_span_seconds", 0) or 0) or summary.duration_seconds
+    rep.headline(severity, verdict, st.join([
+        f"{'OT/ICS' if ot_families else 'IT/enterprise'} capture",
+        f"{st.count(summary.total_packets)} packets",
+        st.duration(span) if span else "",
+        f"{st.plural(int(detail.get('unique_ips', 0) or 0), 'host')} ({int(detail.get('internal_ips', 0) or 0)} internal, "
+        f"{int(detail.get('public_ips', 0) or 0)} public)",
+        st.ts_range(summary.capture_start, summary.capture_end) if summary.capture_start else "",
+    ]))
+    if reasons:
+        rep.scope("why: " + "; ".join(reasons))
+    if ot_families:
+        rep.scope("OT/ICS families: " + ", ".join(ot_families[:10]))
+    shown: set[str] = {_key(verdict), _key("Detected OT/ICS protocol families: " + ", ".join(ot_families[:10]))}
 
-    # Lead the report with the analyst-facing hunt briefing (verdict, triage
-    # queue with commands, hypotheses, benign guidance); the inventory tables
-    # below are the supporting evidence.
-    lines.extend(_overview_hunt_lead_section(summary, verbose))
+    threats = modules.get("threats")
+    high_sev = int(threats.metrics.get("high_severity", 0) or 0) if threats else 0
+    named = [h for h in (threats.highlights if threats else []) if h and not _key(h).startswith(("detections:", "ot risk score"))
+             and "no threat detections" not in _key(h)]
+    shown.update(_key(h) for h in named)
+    rep.section("Critical/high detections", (st.bullets([_redact_in_text(str(h)) for h in named], max_items=6)
+                                             + ([st.dim(f"  +{high_sev - len(named)} more: pcapper <capture> --threats")]
+                                                if high_sev > len(named) else [])) if high_sev else [])
 
-    if ip_activity_rows:
-        lines.append(header("Supporting Detail :: Observed IPs"))
-        rows = [["IP", "Role", "What", "When", "How Much", "Top Peers"]]
-        for item in ip_activity_rows[: _limit_value(15)]:
-            if not isinstance(item, dict):
-                continue
-            scope = str(item.get("scope", "") or "").strip()
-            role = str(item.get("role", "mixed") or "mixed").strip()
-            # Prefer the Browser-announced role (DC/SQL/master browser) when known.
-            nb_role = _short_browser_role(item.get("browser_roles", []) or [])
-            if nb_role:
-                role = nb_role
-            role_text = f"{scope}/{role}" if scope else role
-            ip_cell = str(item.get("ip", "-"))
-            nb_host = str(item.get("hostname", "") or "")
-            if nb_host:
-                ip_cell = f"{ip_cell} ({nb_host})"
-            when_text = _overview_window_text(item.get("first_seen"), item.get("last_seen"))
-            peer_text = _overview_list_preview(item.get("top_peers"), limit=2)
-            peer_count = int(item.get("peer_count", 0) or 0)
-            if peer_count > 0 and peer_text != "-":
-                peer_text = f"{peer_text} (total={peer_count})"
-            elif peer_count > 0:
-                peer_text = f"total={peer_count}"
-            volume = (
-                f"{int(item.get('packets_total', 0) or 0)} pkts / "
-                f"{format_bytes_as_mb(int(item.get('bytes_total', 0) or 0))} "
-                f"(s/r {int(item.get('packets_sent', 0) or 0)}/{int(item.get('packets_recv', 0) or 0)})"
-            )
-            rows.append(
-                [
-                    _truncate_text(ip_cell, 30),
-                    _truncate_text(role_text, 18),
-                    _truncate_text(_overview_activity_text(item), 54),
-                    _truncate_text(when_text, 54),
-                    _truncate_text(volume, 54),
-                    _truncate_text(peer_text, 50),
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
+    queue: list[dict] = []
+    seen_entities: set[str] = set()
+    rank = {"high": 0, "medium": 1, "low": 2}
+    for lead in sorted(summary.hunt_leads or [], key=lambda lead: (rank.get(str(lead.get("priority", "")).lower(), 3), -int(lead.get("score", 0) or 0))):
+        entity = str(lead.get("entity", "")).strip()
+        if entity and entity not in seen_entities:
+            seen_entities.add(entity)
+            queue.append(lead)
+    lead_lines: list[str] = []
+    pad = " " * (5 + st.BADGE_W + 1)
+    for idx, lead in enumerate(queue if st.verbose() else queue[:5], start=1):
+        priority = str(lead.get("priority", "medium")).lower()
+        entity = str(lead.get("entity", "-")).strip()
+        finding = str(lead.get("finding", "")).strip()
+        evidence = _redact_in_text(str(lead.get("evidence", "") or "").strip())
+        when = _window(lead.get("first_seen"), lead.get("last_seen"))
+        lead_lines.append(f"  {idx}. {st.badge(priority)} {st.strong(entity)}  {finding}")
+        if evidence and _key(evidence) not in shown:
+            lead_lines.append(pad + st.dim(st.cut("evidence: " + evidence, 140)))
+        if when != "-":
+            lead_lines.append(pad + st.dim(f"when: {when}"))
+        command = _overview_next_command(entity)
+        if command:
+            lead_lines.append(pad + st.dim(f"next: pcapper <capture> {command}"))
+        lead_lines.append(pad + st.dim(f"check: {_overview_lead_lookfor(finding)}"))
+        shown.update({_key(finding), _key(evidence), _key(f"{entity}: {finding}")})
+    if not st.verbose() and len(queue) > 5:
+        lead_lines.append(st.more(len(queue) - 5, "lead"))
+    rep.section("Immediate leads", lead_lines)
 
-        detected_devices = _overview_detected_devices(ip_activity_rows)
-        if detected_devices:
-            lines.append(header("Detected Devices Information"))
-            device_rows = [["Device", "Role", "Likely Type", "Signals", "Services", "Ports", "When"]]
-            for item in detected_devices:
-                device_rows.append(
-                    [
-                        _truncate_text(str(item.get("ip", "-")), 24),
-                        _truncate_text(str(item.get("role", "-")), 22),
-                        _truncate_text(str(item.get("profile", "-")), 24),
-                        _truncate_text(str(item.get("signals", "-")), 44),
-                        _truncate_text(str(item.get("services", "-")), 38),
-                        _truncate_text(str(item.get("ports", "-")), 20),
-                        _truncate_text(str(item.get("when", "-")), 42),
-                    ]
-                )
-            lines.append(_format_table(device_rows))
+    deep_rows = []
+    for result in summary.module_results or []:
+        top = next((h for h in result.highlights if _key(h) not in shown and not _key(h).startswith("no ")), "")
+        deep_rows.append([result.module, _metrics_result(result.metrics), _redact_in_text(str(top)) or "-", result.reason])
+        shown.add(_key(top))
+    rep.section("Deep dives (auto-run)", st.table(
+        ["Module", "Result", "Top finding"] + (["Why it ran"] if st.verbose() else []),
+        [row if st.verbose() else row[:3] for row in deep_rows], widths=(None, 50, 70), max_rows=None,
+    ))
 
-    protocol_activity_rows = list(getattr(summary, "protocol_activity", []) or [])
-    observed_protocols = list(getattr(summary, "observed_protocols", []) or [])
-    if protocol_activity_rows:
-        lines.append(header("Observed Protocols"))
-        rows = [["Protocol", "Pkts", "Bytes", "Flows", "Hosts", "When", "Ports"]]
-        for item in protocol_activity_rows[: _limit_value(15)]:
-            if not isinstance(item, dict):
-                continue
-            rows.append(
-                [
-                    _truncate_text(str(item.get("protocol", "-")), 26),
-                    str(int(item.get("packets", 0) or 0)),
-                    format_bytes_as_mb(int(item.get("bytes", 0) or 0)),
-                    str(int(item.get("flow_count", 0) or 0)),
-                    str(int(item.get("host_count", 0) or 0)),
-                    _truncate_text(
-                        _overview_window_text(
-                            item.get("first_seen"), item.get("last_seen")
-                        ),
-                        52,
-                    ),
-                    _truncate_text(_overview_list_preview(item.get("top_ports"), 3), 24),
-                ]
-            )
-        lines.append(_format_table(rows))
-    elif observed_protocols:
-        lines.append(header("Observed Protocols"))
-        proto_total = sum(int(count) for _name, count in observed_protocols) or 1
-        rows = [["Protocol", "Packets", "% Traffic"]]
-        for name, count in observed_protocols[: _limit_value(15)]:
-            pct = (int(count) / proto_total) * 100 if proto_total else 0.0
-            rows.append([str(name), str(int(count)), f"{pct:.1f}%"])
-        lines.append(_format_table(rows))
+    for title, items in (("Threat hunt", summary.hunt_highlights), ("Forensics", summary.forensics_highlights),
+                         ("OT/ICS", summary.ot_highlights), ("CTF", summary.ctf_highlights)):
+        fresh = []
+        for item in items or []:
+            if _key(item) not in shown:
+                shown.add(_key(item))
+                fresh.append(_redact_in_text(str(item)))
+        rep.section(f"{title} highlights", st.bullets(fresh, max_items=6))
 
-    service_activity_rows = list(getattr(summary, "service_activity", []) or [])
-    observed_services = list(getattr(summary, "observed_services", []) or [])
-    if service_activity_rows:
-        lines.append(header("Observed Services"))
-        rows = [["Service", "Assets", "Hosts/Clients", "When", "Traffic", "Top Hosts"]]
-        for item in service_activity_rows[: _limit_value(15)]:
-            if not isinstance(item, dict):
-                continue
-            rows.append(
-                [
-                    _truncate_text(str(item.get("service", "-")), 26),
-                    str(int(item.get("asset_count", 0) or 0)),
-                    (
-                        f"{int(item.get('host_count', 0) or 0)}/"
-                        f"{int(item.get('client_count', 0) or 0)}"
-                    ),
-                    _truncate_text(
-                        _overview_window_text(
-                            item.get("first_seen"), item.get("last_seen")
-                        ),
-                        52,
-                    ),
-                    _truncate_text(
-                        (
-                            f"{int(item.get('packets', 0) or 0)} pkts / "
-                            f"{format_bytes_as_mb(int(item.get('bytes', 0) or 0))}"
-                        ),
-                        42,
-                    ),
-                    _truncate_text(_overview_list_preview(item.get("top_hosts"), 2), 44),
-                ]
-            )
-        lines.append(_format_table(rows))
-    elif observed_services:
-        lines.append(header("Observed Services"))
-        svc_total = sum(int(count) for _name, count in observed_services) or 1
-        rows = [["Service", "Count", "% Service Share"]]
-        for name, count in observed_services[: _limit_value(15)]:
-            pct = (int(count) / svc_total) * 100 if svc_total else 0.0
-            rows.append([str(name), str(int(count)), f"{pct:.1f}%"])
-        lines.append(_format_table(rows))
+    rep.section("Recommended actions", st.bullets([_redact_in_text(str(r)) for r in (summary.recommendations or [])], max_items=4))
+    benign = []
+    if ot_families:
+        benign.append("OT is deterministic: steady internal HMI<->PLC polling and cyclic I/O are baseline, not C2 -- check a process "
+                      "baseline before chasing periodicity")
+    if int(detail.get("public_ips", 0) or 0) and not high_sev:
+        benign.append("public peers without a high-severity detection are often CDN / cloud / update / NTP -- confirm reputation "
+                      "before treating egress as exfiltration")
+    benign.append("activity inside a documented maintenance window with an open change ticket is a false positive by default")
+    rep.section("Likely benign", st.bullets(benign, max_items=None))
 
-    notable_flows = list(getattr(summary, "notable_flows", []) or [])
-    if notable_flows:
-        lines.append(header("Notable Flows"))
-        rows = [["Flow", "Protocol/Ports", "When", "Packets", "Bytes", "Rate"]]
-        for item in notable_flows[: _limit_value(12)]:
-            if not isinstance(item, dict):
-                continue
-            flow_text = f"{item.get('src', '-')} -> {item.get('dst', '-')}"
-            proto_text = str(item.get("protocol", "-"))
-            scope_pair = str(item.get("scope_pair", "") or "").strip()
-            if scope_pair:
-                proto_text = f"{proto_text} [{scope_pair}]"
-            ports = _overview_list_preview(item.get("ports"), 3)
-            if ports != "-":
-                proto_text = f"{proto_text} {ports}"
-            rows.append(
-                [
-                    _truncate_text(flow_text, 40),
-                    _truncate_text(proto_text, 46),
-                    _truncate_text(
-                        _overview_window_text(item.get("start_ts"), item.get("end_ts")),
-                        52,
-                    ),
-                    str(int(item.get("packets", 0) or 0)),
-                    format_bytes_as_mb(int(item.get("bytes", 0) or 0)),
-                    _truncate_text(_overview_rate_text(item), 32),
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
+    ip_rows = list(summary.ip_activity or summary.observed_ips or [])
+    # Ranked by volume: the top 10 and the bottom 10 (the analyzer keeps the
+    # tail of each ranking beyond its top 24).
+    host_items = ip_rows + (list(getattr(summary, "ip_activity_tail", None) or []) if summary.ip_activity else [])
+    host_table = []
+    for item in host_items:
+        if not isinstance(item, dict):
+            continue
+        role = _short_browser_role(item.get("browser_roles", []) or []) or str(item.get("role", "mixed") or "mixed")
+        scope = str(item.get("scope", "") or "")
+        peers = _overview_list_preview(item.get("top_peers"), limit=2)
+        peer_count = int(item.get("peer_count", 0) or 0)
+        host_table.append([
+            f"{item.get('ip', '-')}" + (f" ({item.get('hostname')})" if item.get("hostname") else ""), f"{scope}/{role}" if scope else role,
+            _overview_activity_text(item), _window(item.get("first_seen"), item.get("last_seen")),
+            f"{st.count(int(item.get('packets_total', 0) or 0))} pkts / {st.size(int(item.get('bytes_total', 0) or 0))}",
+            (f"{peers} (of {peer_count})" if peers != "-" else str(peer_count)) if peer_count else peers,
+        ])
+    rep.section("Hosts", st.ranked(["Host", "Role", "What", "When", "Volume", "Top peers"], host_table,
+                                   widths=(32, 26, 48, None, None, 44), noun="host",
+                                   total=int(getattr(summary, "ip_activity_total", 0) or 0) if summary.ip_activity else None))
+    devices = _overview_detected_devices(ip_rows, limit=10**6)
+    rep.section("Devices", st.table(
+        ["Device", "Role", "Likely type", "Signals", "Services", "Ports", "When"],
+        [[d["ip"], d["role"], d["profile"], d["signals"], d["services"], d["ports"], _window(d.get("first_seen"), d.get("last_seen"))
+          if d.get("first_seen") is not None else d["when"]] for d in devices],
+        widths=(32, 22, None, 44, 38, 20), max_rows=6, noun="device",
+    ))
+    protocols = [p for p in (summary.protocol_activity or []) if isinstance(p, dict)]
+    if protocols:
+        protocols += [p for p in (getattr(summary, "protocol_activity_tail", None) or []) if isinstance(p, dict)]
+        proto_table = st.ranked(
+            ["Protocol", "Packets", "Bytes", "Flows", "Hosts", "When", "Ports"],
+            [[p.get("protocol", "-"), st.count(int(p.get("packets", 0) or 0))]
+             # Link/transport layers carry packet counts only: "-" rather than 0 B / 0 flows.
+             + ([st.size(int(p.get("bytes", 0) or 0)), st.count(int(p.get("flow_count", 0) or 0)), int(p.get("host_count", 0) or 0)]
+                if int(p.get("flow_count", 0) or 0) or int(p.get("bytes", 0) or 0) else ["-", "-", "-"])
+             + [_window(p.get("first_seen"), p.get("last_seen")), _overview_list_preview(p.get("top_ports"), 3)]
+             for p in protocols], align="lrrrrll", noun="protocol",
+            total=int(getattr(summary, "protocol_activity_total", 0) or 0) or None)
+    else:
+        total = sum(int(c) for _n, c in summary.observed_protocols or []) or 1
+        proto_table = st.ranked(["Protocol", "Packets", "Share"], [[n, st.count(int(c)), f"{int(c) / total:.1%}"]
+                                                                  for n, c in summary.observed_protocols or []],
+                                align="lrr", noun="protocol")
+    rep.section("Protocols", proto_table)
+    services = [x for x in (summary.service_activity or []) if isinstance(x, dict)]
+    if services:
+        services += [x for x in (getattr(summary, "service_activity_tail", None) or []) if isinstance(x, dict)]
+        svc_table = st.ranked(
+            ["Service", "Assets", "Hosts/clients", "When", "Traffic", "Top hosts"],
+            [[x.get("service", "-"), int(x.get("asset_count", 0) or 0), f"{int(x.get('host_count', 0) or 0)}/{int(x.get('client_count', 0) or 0)}",
+              _window(x.get("first_seen"), x.get("last_seen")),
+              f"{st.count(int(x.get('packets', 0) or 0))} pkts / {st.size(int(x.get('bytes', 0) or 0))}", _overview_list_preview(x.get("top_hosts"), 2)]
+             for x in services], align="lrrlll", noun="service",
+            total=int(getattr(summary, "service_activity_total", 0) or 0) or None)
+    else:
+        total = sum(int(c) for _n, c in summary.observed_services or []) or 1
+        svc_table = st.ranked(["Service", "Count", "Share"], [[n, st.count(int(c)), f"{int(c) / total:.1%}"] for n, c in summary.observed_services or []],
+                              align="lrr", noun="service")
+    rep.section("Services", svc_table)
+    flows = [f for f in (summary.notable_flows or []) if isinstance(f, dict)]
+    rep.section("Notable flows", st.table(
+        ["Flow", "Protocol / ports", "When", "Packets", "Bytes", "Rate"],
+        [[st.flow(f.get("src", "-"), f.get("dst", "-")),
+          st.join([f.get("protocol", "-"), f"[{f.get('scope_pair')}]" if f.get("scope_pair") else "",
+                   _overview_list_preview(f.get("ports"), 3) if _overview_list_preview(f.get("ports"), 3) != "-" else ""], " "),
+          _window(f.get("start_ts"), f.get("end_ts")), st.count(int(f.get("packets", 0) or 0)), st.size(int(f.get("bytes", 0) or 0)),
+          _overview_rate_text(f)] for f in flows],
+        align="lllrrl", max_rows=6, noun="flow",
+    ))
+    gaps = list(summary.errors or [])
+    module_errors = int(detail.get("module_errors", 0) or 0)
+    rep.section("Errors and gaps", ([st.dim(f"  coverage gaps ({module_errors} deep-dive errors): findings are a lower bound")] if gaps or module_errors else [])
+                + [f"  {st.caution('!')} {_redact_in_text(str(g))}" for g in (gaps if st.verbose() else gaps[:8])])
 
-    hunt_leads = list(getattr(summary, "hunt_leads", []) or [])
-    if hunt_leads:
-        lines.append(header("Immediate Leads"))
-        for lead in hunt_leads[: _limit_value(10)]:
-            if not isinstance(lead, dict):
-                continue
-            priority = str(lead.get("priority", "medium") or "medium").upper()
-            entity = _truncate_text(str(lead.get("entity", "-")), 48)
-            finding = _truncate_text(str(lead.get("finding", "")), 120)
-            evidence = _truncate_text(str(lead.get("evidence", "")), 180)
-            when_text = _overview_window_text(
-                lead.get("first_seen"), lead.get("last_seen")
-            )
-            style = _overview_priority_style(priority)
-            lines.append(style(f"[{priority}] {entity} - {finding}"))
-            if when_text != "-":
-                lines.append(muted(f"  when: {when_text}"))
-            if evidence:
-                lines.append(muted(f"  evidence: {evidence}"))
-
-    if summary.module_results:
-        lines.append(header("Auto-Run Deep Dives"))
-        rows = [["Module", "Reason", "Metrics", "Top Highlight"]]
-        for result in summary.module_results[: _limit_value(14)]:
-            rows.append(
-                [
-                    _truncate_text(result.module, 18),
-                    _truncate_text(result.reason, 56),
-                    _truncate_text(_overview_metrics_text(result.metrics), 42),
-                    _truncate_text(result.highlights[0] if result.highlights else "-", 64),
-                ]
-            )
-        lines.append(_format_table(rows))
-        if verbose:
-            for result in summary.module_results[: _limit_value(8)]:
-                extra = list(result.highlights[1:3])
-                if not extra:
-                    continue
-                lines.append(muted(f"{result.module}:"))
-                for item in extra:
-                    lines.append(muted(f"  - {_truncate_text(item, 140)}"))
-
-    if summary.ot_highlights:
-        lines.append(header("OT/ICS Highlights"))
-        for item in summary.ot_highlights[: _limit_value(8)]:
-            lines.append(f"- {_truncate_text(item, 160)}")
-
-    if summary.hunt_highlights:
-        lines.append(header("Threat Hunt Highlights"))
-        for item in summary.hunt_highlights[: _limit_value(10)]:
-            lines.append(f"- {_truncate_text(item, 160)}")
-
-    if summary.forensics_highlights:
-        lines.append(header("Forensics Highlights"))
-        for item in summary.forensics_highlights[: _limit_value(10)]:
-            lines.append(f"- {_truncate_text(item, 160)}")
-
-    if summary.ctf_highlights:
-        lines.append(header("CTF Highlights"))
-        for item in summary.ctf_highlights[: _limit_value(8)]:
-            lines.append(f"- {_truncate_text(item, 160)}")
-
-    # Recommendations are surfaced in the Hunt Lead Assessment at the top
-    # (Recommended Hunt Actions); not repeated here to keep the briefing tight.
-
-    if summary.errors:
-        lines.append(header("Errors / Gaps"))
-        for item in summary.errors[: _limit_value(8)]:
-            lines.append(muted(f"- {_truncate_text(item, 180)}"))
-
-    return _finalize_output(lines)
+    top_talker = ip_rows[0] if ip_rows and isinstance(ip_rows[0], dict) else None
+    iot = [label_text for label_text in ot_families if any(t in str(label_text).lower() for t in ("mqtt", "coap"))]
+    rep.section("Capture", st.kv([
+        ("Path", str(summary.path)),
+        ("Window", f"{format_ts(summary.capture_start)} / {format_ts(summary.capture_end)}" if summary.capture_start else ""),
+        ("Duration", format_duration(summary.duration_seconds)),
+        ("Top protocols", st.top(dict(summary.top_protocols or []), None)),
+        ("Top services", st.top(dict(summary.top_services or []), None)),
+        ("Top talker", f"{top_talker.get('ip', '-')} ({int(top_talker.get('packets_total', 0) or 0)} packets, "
+                       f"{format_bytes_as_mb(int(top_talker.get('bytes_total', 0) or 0))})" if top_talker else ""),
+        ("Counts", st.join([f"{k.replace('_', ' ')} {v}" for k, v in detail.items() if isinstance(v, (int, float)) and not isinstance(v, bool)])),
+        ("IoT families", ", ".join(iot)),
+        ("Deep dives run", ", ".join(summary.modules_run or [])),
+    ]), detail=True)
+    extra = []
+    for result in summary.module_results or []:
+        more = [h for h in result.highlights[1:] if _key(h) not in shown]
+        if more:
+            extra.append(f"  {st.strong(result.module)}")
+            extra += st.bullets([_redact_in_text(str(h)) for h in more], max_items=None, indent=4)
+        extra += [f"    {st.caution('!')} {e}" for e in (result.errors or [])]
+    rep.section("Deep-dive detail", extra, detail=True)
+    return rep.render()

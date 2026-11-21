@@ -1,42 +1,18 @@
-"""Rendered output for email analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for email (SMTP, POP3, IMAP, webmail): the messages
+(senders, recipients, subjects, attachments and their hashes), sender
+authentication (SPF/DKIM/DMARC), cleartext mail credentials and the URLs and
+originating IPs to pivot on; protocol command detail is -v."""
 
 from __future__ import annotations
-from ..coloring import (
-    danger,
-    header,
-    muted,
-    ok,
-    warn,
-)
-from ..email import EmailSummary
-from ..utils import (
-    format_bytes_as_mb,
-    format_duration,
-    format_ts,
-)
 
-from ._common import (
-    SECTION_BAR,
-    SUBSECTION_BAR,
-    _apply_verbose_limit,
-    _counter_table,
-    _filtered_detections,
-    _finalize_output,
-    _format_client_server_table,
-    _format_counter,
-    _format_kv,
-    _format_sessions_table,
-    _format_table,
-    _limit_value,
-    _meaningful_plaintext_items,
-    _redact_in_text,
-    _render_deterministic_checks,
-    _truncate_text,
-)
+from ..email import EmailSummary
+from ..utils import format_duration, format_ts
+from . import _style as st
+from ._common import _meaningful_plaintext_items, _redact_in_text, _redact_secret, _render_deterministic_checks
+from ._kv import counter_line, findings_for
+from ._remote import counts, session_table
+
+_FAIL_VERDICTS = {"fail", "softfail", "none", "hardfail", "permerror", "temperror"}
 
 
 def _email_mitre_techniques(summary: EmailSummary) -> list[str]:
@@ -74,357 +50,144 @@ def _email_mitre_techniques(summary: EmailSummary) -> list[str]:
     return tids
 
 
-def render_email_summary(
-    summary: EmailSummary, verbose: bool = False, show_timeline: bool = False
-) -> str:
-    limit = _apply_verbose_limit(12)
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"EMAIL ANALYSIS :: {summary.path.name}"))
-
-    # ---- Analyst Verdict -------------------------------------------------
+def _headline(summary: EmailSummary) -> tuple[object, str, list[str]]:
     dc = summary.deterministic_checks or {}
 
     def _edc(key: str) -> list[str]:
         return [str(v) for v in (dc.get(key, []) or []) if str(v).strip()]
 
-    e_phish = _edc("phishing_indicators")
-    e_cred = _edc("credential_exposure") + _edc("webmail_credential_submission")
-    e_exfil = _edc("exfiltration_signals")
-    e_attach = _edc("suspicious_attachments")
-    e_authabuse = _edc("auth_abuse")
-    e_fanout = _edc("server_fanout")
-    e_spoof = _edc("sender_spoofing")
-    e_authfail = _edc("email_auth_failures")
-    e_urls = _edc("phishing_urls")
-    e_recon = _edc("smtp_recon")
-    e_beacon = _edc("beaconing")
-    reasons: list[str] = []
-    if e_cred:
-        reasons.append(f"cleartext/webmail credential exposure ({len(e_cred)})")
-    if e_spoof:
-        reasons.append(f"sender spoofing / BEC indicator(s) ({len(e_spoof)})")
-    if e_authfail:
-        reasons.append(f"email-auth (SPF/DKIM/DMARC) failure(s) ({len(e_authfail)})")
-    if e_phish:
-        reasons.append(f"phishing subject indicator(s) ({len(e_phish)})")
-    if e_urls:
-        reasons.append(f"suspicious URL(s) in mail ({len(e_urls)})")
-    if e_attach:
-        reasons.append(f"suspicious attachment(s) ({len(e_attach)})")
-    if e_exfil:
-        reasons.append(f"exfiltration signal(s) ({len(e_exfil)})")
-    if e_beacon:
-        reasons.append(f"mail-protocol beaconing ({len(e_beacon)})")
-    if e_authabuse:
-        reasons.append(f"mail auth abuse ({len(e_authabuse)})")
-    if e_fanout:
-        reasons.append(f"mail-server fan-out ({len(e_fanout)})")
-    if e_recon:
-        reasons.append(f"SMTP user-enumeration recon ({len(e_recon)})")
-    malicious = e_phish or e_exfil or e_attach or e_spoof
-    if malicious:
-        v_text, v_fn = "MALICIOUS EMAIL ACTIVITY", danger
-    elif e_authfail:
-        v_text, v_fn = "EMAIL SPOOFING / AUTH FAILURE — REVIEW", warn
-    elif e_cred:
-        v_text, v_fn = "CLEARTEXT MAIL CREDENTIALS EXPOSED", warn
-    elif e_urls or e_authabuse or e_fanout or e_beacon or e_recon:
-        v_text, v_fn = "SUSPICIOUS EMAIL ACTIVITY", warn
-    elif summary.total_messages > 0 or summary.email_packets > 0:
-        v_text, v_fn = "EMAIL TRAFFIC — NO HIGH-RISK SIGNAL", ok
-    else:
-        v_text, v_fn = "NO EMAIL ACTIVITY DETECTED", ok
-    lines.append(header("Analyst Verdict"))
-    lines.append(v_fn(f"[VERDICT] {v_text}"))
+    phish, cred = _edc("phishing_indicators"), _edc("credential_exposure") + _edc("webmail_credential_submission")
+    exfil, attach, authabuse = _edc("exfiltration_signals"), _edc("suspicious_attachments"), _edc("auth_abuse")
+    fanout, spoof, authfail = _edc("server_fanout"), _edc("sender_spoofing"), _edc("email_auth_failures")
+    urls, recon, beacon = _edc("phishing_urls"), _edc("smtp_recon"), _edc("beaconing")
+    reasons = [text for hits, text in (
+        (cred, f"cleartext/webmail credential exposure ({len(cred)})"),
+        (spoof, f"sender spoofing / BEC indicators ({len(spoof)})"),
+        (authfail, f"SPF/DKIM/DMARC failures ({len(authfail)})"),
+        (phish, f"phishing subject indicators ({len(phish)})"),
+        (urls, f"suspicious URLs in mail ({len(urls)})"),
+        (attach, f"suspicious attachments ({len(attach)})"),
+        (exfil, f"exfiltration signals ({len(exfil)})"),
+        (beacon, f"mail-protocol beaconing ({len(beacon)})"),
+        (authabuse, f"mail auth abuse ({len(authabuse)})"),
+        (fanout, f"mail-server fan-out ({len(fanout)})"),
+        (recon, f"SMTP user enumeration ({len(recon)})"),
+    ) if hits]
+    if phish or exfil or attach or spoof:
+        return "high", "malicious email activity: investigate", reasons
+    if authfail:
+        return "medium", "email spoofing / authentication failures: review", reasons
+    if cred:
+        return "medium", "cleartext mail credentials exposed", reasons
+    if urls or authabuse or fanout or beacon or recon:
+        return "medium", "suspicious email activity", reasons
+    return None, "email traffic, no high-risk signal", reasons
+
+
+def render_email_summary(summary: EmailSummary, verbose: bool = False, show_timeline: bool = False) -> str:
+    rep = st.Report("Email", summary.path)
+    findings = findings_for(summary, ot=False)
+    if not summary.email_packets and not summary.total_messages and not st.material(findings):
+        return rep.absent("email traffic (SMTP, POP3, IMAP or webmail)", summary.errors)
+    severity, text, reasons = _headline(summary)
+    worst = st.worst(findings) if findings else -1
+    if findings and (severity is None or worst > st.sev_rank(severity)):
+        severity = next(f.severity for f in findings if st.sev_rank(f.severity) == worst)
+    rep.headline(severity, st.join([st.plural(len(findings), "finding") if findings else "", text]), st.join([
+        f"{st.count(summary.email_packets)} mail packets · {st.plural(summary.total_messages, 'message')}",
+        st.duration(summary.duration_seconds) if summary.duration_seconds else "",
+        st.ts_range(summary.first_seen, summary.last_seen) if summary.first_seen else "",
+    ]))
+    rep.scope(st.join([f"{st.plural(summary.unique_clients, 'client')} -> {st.plural(summary.unique_servers, 'server')}",
+                       st.top(summary.protocol_counts, 4)]))
     for reason in reasons:
-        lines.append(warn(f"- {reason}"))
+        rep.scope(reason)
     tids = _email_mitre_techniques(summary)
     if tids:
-        lines.append(muted("  ATT&CK: " + ", ".join(tids)))
-    lines.append(SECTION_BAR)
-
+        rep.scope("ATT&CK: " + ", ".join(tids))
     if summary.errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        for err in summary.errors[: _limit_value(4)]:
-            lines.append(danger(f"- {err}"))
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Findings", st.findings_block(findings))
 
-    # ---- Overview --------------------------------------------------------
-    lines.append(_format_kv("Total Packets", str(summary.total_packets)))
-    lines.append(_format_kv("Email Packets", str(summary.email_packets)))
-    lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
-    lines.append(_format_kv("Start", format_ts(summary.first_seen)))
-    lines.append(_format_kv("End", format_ts(summary.last_seen)))
-    if summary.duration_seconds is not None:
-        lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
-    lines.append(_format_kv("Messages", str(summary.total_messages)))
-    lines.append(_format_kv("Unique Clients", str(summary.unique_clients)))
-    lines.append(_format_kv("Unique Servers", str(summary.unique_servers)))
-    if summary.protocol_counts:
-        lines.append(_format_kv("Protocols", _format_counter(summary.protocol_counts, 6)))
-
-    if summary.server_ports:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Server Ports"))
-        lines.append(_counter_table(summary.server_ports, "Port", limit=limit))
-
-    if summary.client_counts or summary.server_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Mail Clients & Servers"))
-        lines.append(
-            _format_client_server_table(summary.client_counts, summary.server_counts)
-        )
-
-    if summary.hostname_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Observed Hostnames (HELO/EHLO)"))
-        rows = [["Hostname", "Count"]]
-        for name, count in summary.hostname_counts.most_common(limit):
-            rows.append([_truncate_text(name, 50), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.smtp_command_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("SMTP Commands"))
-        lines.append(_counter_table(summary.smtp_command_counts, "Command", limit=limit))
-    if summary.pop3_command_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("POP3 Commands"))
-        lines.append(_counter_table(summary.pop3_command_counts, "Command", limit=limit))
-    if summary.imap_command_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("IMAP Commands"))
-        lines.append(_counter_table(summary.imap_command_counts, "Command", limit=limit))
-
-    if summary.response_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Response Codes"))
-        lines.append(_counter_table(summary.response_counts, "Code", limit=limit))
-
-    if summary.auth_methods:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Auth Methods"))
-        lines.append(_counter_table(summary.auth_methods, "Method", limit=limit))
-
-    if summary.auth_failure_ip_counts or summary.auth_success_ip_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Auth Outcomes (by client)"))
-        rows = [["Failures", "Successes"]]
-        fail_text = (
-            ", ".join(
-                f"{ip}({count})"
-                for ip, count in summary.auth_failure_ip_counts.most_common(
-                    _limit_value(6)
-                )
-            )
-            or "-"
-        )
-        succ_text = (
-            ", ".join(
-                f"{ip}({count})"
-                for ip, count in summary.auth_success_ip_counts.most_common(
-                    _limit_value(6)
-                )
-            )
-            or "-"
-        )
-        rows.append([fail_text, succ_text])
-        lines.append(_format_table(rows))
-
-    # ---- Email authentication (SPF/DKIM/DMARC) ---------------------------
-    if summary.auth_result_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Email Authentication (SPF/DKIM/DMARC)"))
-        rows = [["Verdict", "Count"]]
-        for token, count in summary.auth_result_counts.most_common(_limit_value(10)):
-            verdict = token.split("=", 1)[-1].lower()
-            label = token
-            if verdict in {
-                "fail", "softfail", "none", "hardfail", "permerror", "temperror",
-            }:
-                label = f"{token}  <-- FAIL"
-            rows.append([label, str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.from_counts or summary.to_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Senders / Recipients"))
-        lines.append(_format_kv("Top Senders", _format_counter(summary.from_counts, 8)))
-        lines.append(
-            _format_kv("Top Recipients", _format_counter(summary.to_counts, 8))
-        )
-
-    if summary.email_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Email Addresses"))
-        rows = [["Email", "Count"]]
-        for name, count in summary.email_counts.most_common(limit):
-            rows.append([_truncate_text(name, 70), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.domain_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Domains"))
-        rows = [["Domain", "Count"]]
-        for name, count in summary.domain_counts.most_common(limit):
-            rows.append([_truncate_text(name, 50), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.webmail_provider_counts or summary.webmail_host_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Webmail Activity"))
-        if summary.webmail_provider_counts:
-            lines.append(
-                _format_kv(
-                    "Providers", _format_counter(summary.webmail_provider_counts, 6)
-                )
-            )
-        if summary.webmail_host_counts:
-            lines.append(
-                _format_kv("Hosts", _format_counter(summary.webmail_host_counts, 6))
-            )
-        if summary.webmail_action_counts:
-            lines.append(
-                _format_kv("Actions", _format_counter(summary.webmail_action_counts, 8))
-            )
-
-    if summary.attachment_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Attachments"))
-        rows = [["Filename", "Count"]]
-        for name, count in summary.attachment_counts.most_common(limit):
-            rows.append([_truncate_text(name, 60), str(count)])
-        lines.append(_format_table(rows))
-
-    # ---- Detections ------------------------------------------------------
-    detections = _filtered_detections(summary, verbose)
-    if detections:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Detections"))
-        for item in detections[: _limit_value(14)]:
-            sev = str(item.get("severity", "info")).upper()
-            title = str(item.get("title") or item.get("summary") or "Detection")
-            details = _redact_in_text(str(item.get("details", "")))
-            paint = danger if sev in {"CRITICAL", "HIGH"} else warn
-            lines.append(paint(f"[{sev}] {title}"))
-            if details:
-                lines.append(muted(f"  {details}"))
-
-    # ---- IOC summary (pivot points for the investigation) ----------------
-    ioc_lines: list[str] = []
-    if summary.originating_ip_counts:
-        ioc_lines.append(
-            _format_kv(
-                "Originating IPs", _format_counter(summary.originating_ip_counts, 8)
-            )
-        )
-    susp_urls = [
-        a for a in (summary.artifacts or []) if getattr(a, "kind", "") == "suspicious_url"
-    ]
-    if susp_urls:
-        ioc_lines.append(muted("Suspicious URLs:"))
-        for art in susp_urls[: _limit_value(8)]:
-            ioc_lines.append(muted(f"  - {_truncate_text(str(art.detail), 110)}"))
-    elif summary.url_counts:
-        ioc_lines.append(
-            _format_kv("URLs in mail", _format_counter(summary.url_counts, 6))
-        )
-    attach_iocs = [
-        a
-        for a in (summary.artifacts or [])
-        if getattr(a, "kind", "") == "mime_attachment" and "sha256=" in str(a.detail)
-    ]
-    if attach_iocs:
-        ioc_lines.append(muted("Attachment hashes:"))
-        for art in attach_iocs[: _limit_value(8)]:
-            ioc_lines.append(muted(f"  - {_truncate_text(str(art.detail), 110)}"))
-    if summary.mailer_counts:
-        ioc_lines.append(
-            _format_kv("Mailer/X-Mailer", _format_counter(summary.mailer_counts, 5))
-        )
-    if ioc_lines:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("IOC Summary"))
-        lines.extend(ioc_lines)
-
-    # ---- Cleartext credentials ------------------------------------------
-    if summary.username_counts or summary.password_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Cleartext Credential Exposure"))
-        lines.append(
-            danger("Mail credentials observed in cleartext (rotate exposed accounts).")
-        )
-        if summary.username_counts:
-            lines.append(
-                _format_kv("Usernames", _format_counter(summary.username_counts, 8))
-            )
-        if summary.password_counts:
-            lines.append(
-                _format_kv("Passwords", _format_counter(summary.password_counts, 8))
-            )
-
-    # ---- Observed plaintext ---------------------------------------------
-    if summary.plaintext_strings:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Observed Plaintext"))
-        rows = [["String", "Count"]]
-        for text, count in _meaningful_plaintext_items(summary.plaintext_strings, limit):
-            rows.append([_truncate_text(text, 70), str(count)])
-        lines.append(_format_table(rows))
-
-    # ---- Sessions --------------------------------------------------------
-    if summary.conversations:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Mail Sessions"))
-        lines.append(
-            _format_sessions_table(
-                summary.conversations,
-                limit,
-                extra_cols=[("Proto", lambda c: getattr(c, "protocol", "-"))],
-            )
-        )
-
-    # ---- Artifacts -------------------------------------------------------
-    if summary.artifacts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Artifacts"))
-        rows = [["Type", "Detail", "Src", "Dst", "Pkt"]]
-        for item in summary.artifacts[: _limit_value(20)]:
-            rows.append(
-                [
-                    str(item.kind),
-                    _truncate_text(_redact_in_text(str(item.detail)), 56),
-                    str(item.src),
-                    str(item.dst),
-                    str(getattr(item, "packet", "") or "-"),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    # ---- Timeline --------------------------------------------------------
+    rep.section("Messages", st.kv([
+        counter_line("Senders", summary.from_counts, 8),
+        counter_line("Recipients", summary.to_counts, 8),
+        ("Subjects", st.top(summary.subject_counts, 6, fmt=lambda k, v: f"{_redact_in_text(str(k))} ({st.count(v)})")),
+        counter_line("Originating IPs", summary.originating_ip_counts, 8),
+        counter_line("Mailers", summary.mailer_counts, 4),
+        counter_line("HELO/EHLO", summary.hostname_counts, 6),
+    ]))
+    rep.section("Attachments", counts(summary.attachment_counts, "Filename", width=80, noun="attachment"))
+    hashes = [a for a in (summary.artifacts or []) if getattr(a, "kind", "") == "mime_attachment" and "sha256=" in str(a.detail)]
+    suspicious_urls = [a for a in (summary.artifacts or []) if getattr(a, "kind", "") == "suspicious_url"]
+    rep.section("IOCs", st.bullets([f"attachment  {a.detail}" for a in hashes], max_items=8, noun="hash")
+                + st.bullets([f"URL  {a.detail}" for a in suspicious_urls], max_items=8, noun="URL")
+                + (st.kv([counter_line("URLs in mail", summary.url_counts, 6)]) if not suspicious_urls else []))
+    auth_results = st.top(summary.auth_result_counts, 10, fmt=lambda k, v: (
+        st.bad(f"{k} ({v})") if str(k).split("=", 1)[-1].lower() in _FAIL_VERDICTS else f"{k} ({v})"))
+    rep.section("Sender authentication", st.kv([("SPF/DKIM/DMARC", auth_results)]))
+    rep.section("Credentials", st.kv([
+        counter_line("Users", summary.username_counts, 8),
+        ("Passwords", st.top(summary.password_counts, 8, fmt=lambda k, v: f"{_redact_secret(str(k))} ({v})")),
+        counter_line("Auth methods", summary.auth_methods, 6),
+        counter_line("Auth failures", summary.auth_failure_ip_counts, 6),
+        counter_line("Auth successes", summary.auth_success_ip_counts, 6),
+    ]))
+    rep.section("Webmail", st.kv([
+        counter_line("Providers", summary.webmail_provider_counts, 6),
+        counter_line("Hosts", summary.webmail_host_counts, 6),
+        counter_line("Actions", summary.webmail_action_counts, 8),
+    ]))
     if show_timeline and summary.timeline_events:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Timeline"))
-        rows = [["Time", "Protocol", "Direction", "Stage", "Detail"]]
-        for ev in summary.timeline_events[: _limit_value(20)]:
-            rows.append(
-                [
-                    format_ts(getattr(ev, "ts", None)),
-                    getattr(ev, "protocol", "-"),
-                    getattr(ev, "direction", "-"),
-                    getattr(ev, "stage", "-"),
-                    _truncate_text(getattr(ev, "detail", "-"), 64),
-                ]
-            )
-        lines.append(_format_table(rows))
+        rep.section("Timeline", st.table(
+            ["Time", "Protocol", "Direction", "Stage", "Detail"],
+            [[st.ts(getattr(e, "ts", None)), getattr(e, "protocol", "-"), getattr(e, "direction", "-"), getattr(e, "stage", "-"),
+              _redact_in_text(str(getattr(e, "detail", "-")))] for e in summary.timeline_events],
+            max_rows=20, noun="event",
+        ))
+    rep.section("Sessions", session_table(summary.conversations, [("Proto", lambda c: c.protocol)], max_rows=8))
 
-    # ---- Deterministic checks -------------------------------------------
-    _render_deterministic_checks(
-        lines,
-        summary,
-        "Deterministic Email Security Checks",
-        [
+    rep.section("Protocol", st.kv([
+        counter_line("SMTP", summary.smtp_command_counts, None),
+        counter_line("POP3", summary.pop3_command_counts, None),
+        counter_line("IMAP", summary.imap_command_counts, None),
+        counter_line("Replies", summary.response_counts, None),
+        counter_line("Ports", summary.server_ports, None),
+    ]), detail=True)
+    rep.section("Addresses and domains", st.kv([
+        counter_line("Addresses", summary.email_counts, None),
+        counter_line("Domains", summary.domain_counts, None),
+        counter_line("Message-IDs", summary.message_id_counts, None),
+        counter_line("Webmail pages", summary.webmail_page_counts, None),
+        ("Secrets", st.top(summary.secret_counts, None, fmt=lambda k, v: f"{_redact_secret(str(k))} ({v})")),
+    ]), detail=True)
+    rep.section("Plaintext", st.table(["String", "Count"], [[_redact_in_text(t), st.count(n)] for t, n in
+                                                          _meaningful_plaintext_items(summary.plaintext_strings, 10**9)],
+                                      align="lr", max_rows=None), detail=True)
+    rep.section("Artifacts", st.table(
+        ["Kind", "Detail", "Flow", "Packet"],
+        [[a.kind, _redact_in_text(str(a.detail)), st.flow(a.src, a.dst), getattr(a, "packet", "") or "-"] for a in summary.artifacts],
+        max_rows=None,
+    ), detail=True)
+    if not show_timeline:
+        rep.section("Timeline", st.table(
+            ["Time", "Protocol", "Direction", "Stage", "Detail"],
+            [[st.ts(getattr(e, "ts", None)), getattr(e, "protocol", "-"), getattr(e, "direction", "-"), getattr(e, "stage", "-"),
+              _redact_in_text(str(getattr(e, "detail", "-")))] for e in (summary.timeline_events or [])],
+            max_rows=None, noun="event",
+        ), detail=True)
+    rep.section("Traffic", st.kv([
+        ("Packets", f"{summary.total_packets} total · {summary.email_packets} mail"),
+        ("Bytes", st.size(summary.total_bytes)),
+        ("Start / end", f"{format_ts(summary.first_seen)} / {format_ts(summary.last_seen)}"),
+        ("Duration", format_duration(summary.duration_seconds) if summary.duration_seconds is not None else ""),
+        counter_line("Clients", summary.client_counts, None),
+        counter_line("Servers", summary.server_counts, None),
+    ]), detail=True)
+
+    if st.analysis_sections():
+        legacy: list[str] = []
+        _render_deterministic_checks(legacy, summary, "Deterministic Email Security Checks", [
             ("credential_exposure", "Cleartext Credential Exposure"),
             ("webmail_credential_submission", "Webmail Credential Submission"),
             ("email_auth_failures", "Email Auth Failures (SPF/DKIM/DMARC)"),
@@ -439,7 +202,6 @@ def render_email_summary(
             ("server_fanout", "Server Fan-out"),
             ("originating_ips", "Originating IPs"),
             ("webmail_activity", "Webmail Activity"),
-        ],
-    )
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+        ])
+        rep.section("Deterministic checks", legacy[2:])
+    return rep.render()

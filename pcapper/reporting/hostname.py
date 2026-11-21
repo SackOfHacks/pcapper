@@ -5,376 +5,120 @@ verbatim, only its location changed.
 """
 
 from __future__ import annotations
-from collections import Counter, defaultdict
-from ..coloring import (
-    danger,
-    header,
-    muted,
-    ok,
-    warn,
-)
-from ..hostname import HostnameSummary
-from ..utils import (
-    format_ts,
-)
 
+from collections import Counter, defaultdict
+
+from ..hostname import HostnameSummary
+from . import _style as st
 from ._common import (
-    SECTION_BAR,
-    SUBSECTION_BAR,
-    _apply_verbose_limit,
-    _finalize_output,
-    _format_kv,
-    _format_table,
-    _limit_value,
     _redact_in_text,
-    _truncate_text,
     _verbose_output,
     set_verbose_output,
 )
+from ._kv import counter_line
 
 
-def render_hostname_summary(
-    summary: HostnameSummary, limit: int = 25, verbose: bool = False
-) -> str:
-    force_full_output = bool(summary.target_ip) or bool(
-        str(getattr(summary, "hostname_query", "") or "").strip()
-    )
-    restore_verbose_flag: bool | None = None
-    if force_full_output and not _verbose_output():
-        restore_verbose_flag = _verbose_output()
+def render_hostname_summary(summary: HostnameSummary, limit: int = 25, verbose: bool = False) -> str:
+    """Hostname discovery: which names each IP used or was given (DNS,
+    NetBIOS, NTLM, HTTP Host, TLS SNI, DHCP ...), with naming conflicts,
+    drift and suspicious names first. A query for one IP or hostname shows
+    everything, as -v does."""
+    focused = bool(summary.target_ip) or bool(str(getattr(summary, "hostname_query", "") or "").strip())
+    restore = None
+    if focused and not _verbose_output():
+        restore = _verbose_output()
         set_verbose_output(True)
-    if force_full_output:
-        verbose = True
-
-    limit = _apply_verbose_limit(limit)
-    lines: list[str] = []
     try:
-        all_ip_mode = not bool(summary.target_ip)
-        lines.append(SECTION_BAR)
-        lines.append(header(f"HOSTNAME DISCOVERY :: {summary.path.name}"))
-        lines.append(SECTION_BAR)
-
-        if summary.errors:
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("Errors"))
-            error_rows = summary.errors if verbose else summary.errors[: _limit_value(25)]
-            for err in error_rows:
-                lines.append(danger(f"- {err}"))
-            if not verbose and len(summary.errors) > 25:
-                lines.append(muted(f"... {len(summary.errors) - 25} more errors"))
-
-        lines.append(_format_kv("Target IP", summary.target_ip or "ALL"))
-        if str(getattr(summary, "hostname_query", "") or "").strip():
-            lines.append(_format_kv("Hostname Filter", str(summary.hostname_query)))
-        if getattr(summary, "port_filter", None):
-            lines.append(_format_kv("Port Filter", str(summary.port_filter)))
-        if str(getattr(summary, "search_query", "") or "").strip():
-            lines.append(_format_kv("Search Filter", str(summary.search_query)))
-        lines.append(_format_kv("Packets Scanned", str(summary.total_packets)))
-        lines.append(_format_kv("Relevant Packets", str(summary.relevant_packets)))
-        lines.append(
-            _format_kv(
-                "Hostnames Found", str(len({item.hostname for item in summary.findings}))
-            )
-        )
-        lines.append(
-            _format_kv("Evidence Rows", str(sum(item.count for item in summary.findings)))
-        )
-
-        if summary.analyst_verdict:
-            verdict = str(summary.analyst_verdict)
-            confidence = str(
-                getattr(summary, "analyst_confidence", "low") or "low"
-            ).capitalize()
-            reasons = [
-                str(v)
-                for v in list(getattr(summary, "analyst_reasons", []) or [])
-                if str(v).strip()
-            ]
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("Analyst Verdict"))
-            if verdict.startswith("YES"):
-                lines.append(danger(verdict))
-            elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
-                lines.append(warn(verdict))
-            else:
-                lines.append(ok(verdict))
-            lines.append(_format_kv("Confidence", confidence))
-            if reasons:
-                lines.append(muted("Why confidence:"))
-                for reason in reasons[: _limit_value(8)]:
-                    lines.append(muted(f"- {_redact_in_text(reason)}"))
-
-        if summary.protocol_counts:
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("Protocol Evidence"))
-            rows = [["Protocol", "Count"]]
-            proto_limit = None if verbose else 10
-            for proto, count in summary.protocol_counts.most_common(proto_limit):
-                rows.append([str(proto), str(count)])
-            lines.append(_format_table(rows))
-
-        if summary.method_counts:
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("Discovery Methods"))
-            rows = [["Method", "Count"]]
-            method_limit = None if verbose else 12
-            for method, count in summary.method_counts.most_common(method_limit):
-                rows.append([str(method), str(count)])
-            lines.append(_format_table(rows))
-
-        conflict_profiles = list(getattr(summary, "conflict_profiles", []) or [])
-        if conflict_profiles:
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("Conflict Profiles"))
-            rows = [["Type", "Hostname/IP", "Scope", "Evidence", "Methods"]]
-            for item in conflict_profiles[: _limit_value(limit if verbose else 12)]:
-                profile_type = str(item.get("type", "-") or "-")
-                if profile_type == "hostname_to_many_ips":
-                    identity = str(item.get("hostname", "-"))
-                    scope = f"ips={int(item.get('ip_count', 0) or 0)}"
-                else:
-                    identity = str(item.get("ip", "-"))
-                    scope = f"hosts={int(item.get('host_count', 0) or 0)}"
-                methods = item.get("methods", [])
-                rows.append(
-                    [
-                        profile_type,
-                        identity,
-                        scope,
-                        str(item.get("evidence", "-")),
-                        _truncate_text(
-                            ", ".join(str(v) for v in methods[:4])
-                            if isinstance(methods, list)
-                            else "-",
-                            70,
-                        ),
-                    ]
-                )
-            lines.append(_format_table(rows))
-
-        drift_profiles = list(getattr(summary, "drift_profiles", []) or [])
-        if drift_profiles:
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("Temporal Drift Profiles"))
-            rows = [["Hostname", "First Seen", "Last Seen", "IP Count", "IPs"]]
-            for item in drift_profiles[: _limit_value(limit if verbose else 10)]:
-                ips = item.get("ips", [])
-                rows.append(
-                    [
-                        str(item.get("hostname", "-")),
-                        format_ts(item.get("first_seen")),
-                        format_ts(item.get("last_seen")),
-                        str(item.get("ip_count", "-")),
-                        _truncate_text(
-                            ", ".join(
-                                str(v) for v in (ips[:5] if isinstance(ips, list) else [])
-                            )
-                            or "-",
-                            80,
-                        ),
-                    ]
-                )
-            lines.append(_format_table(rows))
-
-        corroboration = list(getattr(summary, "cross_protocol_corroboration", []) or [])
-        if corroboration:
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("Cross-Protocol Corroboration"))
-            rows = [["Hostname", "Protocols", "Methods", "Confidence", "Evidence"]]
-            for item in corroboration[: _limit_value(limit if verbose else 12)]:
-                protocols = item.get("protocols", [])
-                methods = item.get("methods", [])
-                rows.append(
-                    [
-                        str(item.get("hostname", "-")),
-                        _truncate_text(
-                            ", ".join(
-                                str(v)
-                                for v in (
-                                    protocols[:4] if isinstance(protocols, list) else []
-                                )
-                            )
-                            or "-",
-                            50,
-                        ),
-                        _truncate_text(
-                            ", ".join(
-                                str(v)
-                                for v in (methods[:3] if isinstance(methods, list) else [])
-                            )
-                            or "-",
-                            70,
-                        ),
-                        str(item.get("confidence", "-")),
-                        str(item.get("evidence", "-")),
-                    ]
-                )
-            lines.append(_format_table(rows))
-
-        suspicious_names = list(getattr(summary, "suspicious_name_profiles", []) or [])
-        if suspicious_names:
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("Suspicious Naming Analytics"))
-            rows = [["Hostname", "Reasons", "Entropy", "Evidence", "Mapped IPs"]]
-            for item in suspicious_names[: _limit_value(limit if verbose else 12)]:
-                reasons_val = item.get("reasons", [])
-                ips = item.get("ips", [])
-                rows.append(
-                    [
-                        str(item.get("hostname", "-")),
-                        _truncate_text(
-                            ", ".join(
-                                str(v)
-                                for v in (
-                                    reasons_val[:4] if isinstance(reasons_val, list) else []
-                                )
-                            )
-                            or "-",
-                            70,
-                        ),
-                        str(item.get("entropy", "-")),
-                        str(item.get("evidence", "-")),
-                        _truncate_text(
-                            ", ".join(
-                                str(v) for v in (ips[:4] if isinstance(ips, list) else [])
-                            )
-                            or "-",
-                            70,
-                        ),
-                    ]
-                )
-            lines.append(_format_table(rows))
-
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("IP ↔ Hostname Correlation"))
-        if not summary.findings:
-            lines.append(
-                muted(
-                    "No hostname-to-IP correlation evidence found in inspected protocols."
-                )
-            )
-        else:
-            ip_hosts: dict[str, set[str]] = defaultdict(set)
-            ip_evidence: Counter[str] = Counter()
-            for finding in summary.findings:
-                if not finding.mapped_ip:
-                    continue
-                ip_hosts[finding.mapped_ip].add(finding.hostname)
-                ip_evidence[finding.mapped_ip] += finding.count
-
-            if not ip_hosts:
-                lines.append(
-                    muted(
-                        "No attributable IP mappings were extracted from hostname evidence."
-                    )
-                )
-            else:
-                rows = [["IP Address", "Hostnames", "Evidence"]]
-                corr_limit = None if verbose else limit
-                for ip_addr, evidence_count in ip_evidence.most_common(corr_limit):
-                    hosts = sorted(ip_hosts.get(ip_addr, set()))
-                    host_display = (
-                        ", ".join(hosts) if verbose else ", ".join(hosts[: _limit_value(3)])
-                    )
-                    rows.append([ip_addr, host_display, str(evidence_count)])
-                lines.append(_format_table(rows))
-                if not verbose and len(ip_evidence) > limit:
-                    lines.append(
-                        muted(
-                            f"... {len(ip_evidence) - limit} additional IP correlation rows"
-                        )
-                    )
-
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Discovered Hostnames"))
-        if not summary.findings:
-            if all_ip_mode:
-                lines.append(muted("No hostname evidence found in inspected protocols."))
-            else:
-                lines.append(
-                    muted(
-                        "No hostname evidence found for target IP in inspected protocols."
-                    )
-                )
-        else:
-            rows = [
-                [
-                    "Hostname",
-                    "Mapped IP",
-                    "Method",
-                    "Protocol",
-                    "Confidence",
-                    "Seen",
-                    "Flow",
-                    "Details",
-                ]
-            ]
-            row_findings = summary.findings if verbose else summary.findings[:limit]
-            for finding in row_findings:
-                confidence = str(finding.confidence)
-                if confidence == "HIGH":
-                    confidence_display = ok(confidence)
-                elif confidence == "MEDIUM":
-                    confidence_display = warn(confidence)
-                else:
-                    confidence_display = muted(confidence)
-
-                rows.append(
-                    [
-                        str(finding.hostname),
-                        str(finding.mapped_ip or "-"),
-                        str(finding.method),
-                        str(finding.protocol),
-                        confidence_display,
-                        str(finding.count),
-                        f"{finding.src_ip} -> {finding.dst_ip}",
-                        str(finding.details)
-                        if verbose
-                        else _truncate_text(str(finding.details), 70),
-                    ]
-                )
-            lines.append(_format_table(rows))
-            if not verbose and len(summary.findings) > limit:
-                lines.append(
-                    muted(
-                        f"... {len(summary.findings) - limit} additional hostname evidence rows"
-                    )
-                )
-
-        false_positive_context = [
-            str(v)
-            for v in list(getattr(summary, "false_positive_context", []) or [])
-            if str(v).strip()
-        ]
-        if false_positive_context:
-            lines.append(
-                SUBSECTION_BAR
-            )
-            lines.append(header("False-Positive Context"))
-            for note in false_positive_context[: _limit_value(8)]:
-                lines.append(muted(f"- {_redact_in_text(note)}"))
-
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Forensics Notes"))
-        lines.append(
-            muted(
-                "- DNS A/AAAA and PTR mappings are strongest hostname-to-IP attribution evidence."
-            )
-        )
-        lines.append(
-            muted(
-                "- HTTP Host and TLS SNI indicate intended server name and can reveal virtual-host targeting."
-            )
-        )
-        lines.append(
-            muted(
-                "- NTLM/NetBIOS names are contextual clues and may reflect client/workstation naming."
-            )
-        )
-
-        lines.append(SECTION_BAR)
-        return _finalize_output(lines)
+        return _render(summary, limit)
     finally:
-        if restore_verbose_flag is not None:
-            set_verbose_output(restore_verbose_flag)
+        if restore is not None:
+            set_verbose_output(restore)
+
+
+def _render(summary: HostnameSummary, limit: int) -> str:
+    rep = st.Report("Hostnames", summary.path)
+    findings = list(summary.findings or [])
+    names = {f.hostname for f in findings}
+    rep.headline(False, st.plural(len(names), "hostname"), st.join([
+        st.plural(sum(f.count for f in findings), "evidence row"),
+        f"{st.count(summary.relevant_packets)} of {st.count(summary.total_packets)} packets relevant",
+    ]))
+    rep.scope(st.join([
+        f"target {summary.target_ip}" if summary.target_ip else "",
+        f"hostname {summary.hostname_query}" if str(getattr(summary, "hostname_query", "") or "").strip() else "",
+        f"port {summary.port_filter}" if getattr(summary, "port_filter", None) else "",
+        f"search {summary.search_query!r}" if str(getattr(summary, "search_query", "") or "").strip() else "",
+    ]))
+    if summary.errors:
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+
+    def _list(value: object, n: int = 6) -> str:
+        items = [str(v) for v in value] if isinstance(value, (list, tuple, set)) else [str(value)] if value else []
+        return ", ".join(items if st.verbose() else items[:n]) + (st.dim(f", +{len(items) - n}") if len(items) > n and not st.verbose() else "")
+
+    suspicious = [p for p in (getattr(summary, "suspicious_name_profiles", None) or []) if isinstance(p, dict)]
+    rep.section("Suspicious names", st.table(
+        ["Hostname", "Reasons", "Entropy", "Evidence", "Addresses"],
+        [[p.get("hostname", "-"), _list(p.get("reasons", [])), p.get("entropy", "-"), p.get("evidence", "-"), _list(p.get("ips", []))]
+         for p in suspicious], max_rows=12, noun="name",
+    ))
+    conflicts = [p for p in (getattr(summary, "conflict_profiles", None) or []) if isinstance(p, dict)]
+    rep.section("Conflicts", st.table(
+        ["Type", "Name / IP", "Scope", "Evidence", "Methods"],
+        [[p.get("type", "-"), p.get("hostname", "-") if p.get("type") == "hostname_to_many_ips" else p.get("ip", "-"),
+          f"{int(p.get('ip_count', 0) or 0)} IPs" if p.get("type") == "hostname_to_many_ips" else f"{int(p.get('host_count', 0) or 0)} names",
+          p.get("evidence", "-"), _list(p.get("methods", []), 4)] for p in conflicts],
+        max_rows=12, noun="conflict",
+    ))
+    drift = [p for p in (getattr(summary, "drift_profiles", None) or []) if isinstance(p, dict)]
+    rep.section("Drift", st.table(
+        ["Hostname", "First", "Last", "Addresses"],
+        [[p.get("hostname", "-"), st.ts(p.get("first_seen")), st.ts(p.get("last_seen")), _list(p.get("ips", []), 5)] for p in drift],
+        max_rows=10, noun="name",
+    ))
+    ip_hosts: dict[str, set[str]] = defaultdict(set)
+    ip_evidence: Counter[str] = Counter()
+    for f in findings:
+        if f.mapped_ip:
+            ip_hosts[f.mapped_ip].add(f.hostname)
+            ip_evidence[f.mapped_ip] += f.count
+    rep.section("Addresses", st.table(
+        ["IP", "Hostnames", "Evidence"],
+        [[ip, _list(sorted(ip_hosts[ip]), 4), st.count(n)] for ip, n in ip_evidence.most_common()],
+        align="llr", noun="address", **({"max_rows": None} if limit is None else {"max_rows": st.TOP_ROWS, "tail": st.TOP_ROWS}),
+    ))
+
+    def _conf(value: str) -> str:
+        return st.good(value) if value == "HIGH" else st.caution(value) if value == "MEDIUM" else st.dim(value)
+
+    rep.section("Evidence", st.table(
+        ["Hostname", "IP", "Method", "Protocol", "Confidence", "Seen", "Flow", "Details"],
+        [[f.hostname, f.mapped_ip or "-", f.method, f.protocol, _conf(str(f.confidence)), st.count(f.count),
+          st.flow(f.src_ip, f.dst_ip), _redact_in_text(str(f.details))] for f in findings],
+        align="lllllrll", widths=(48, None, None, None, None, None, None, 60), max_rows=15, noun="row",
+    ))
+
+    rep.section("Sources", st.kv([counter_line("Protocols", summary.protocol_counts, None),
+                                  counter_line("Methods", summary.method_counts, None)]), detail=True)
+    corroboration = [p for p in (getattr(summary, "cross_protocol_corroboration", None) or []) if isinstance(p, dict)]
+    rep.section("Corroboration", st.table(
+        ["Hostname", "Protocols", "Methods", "Confidence", "Evidence"],
+        [[p.get("hostname", "-"), _list(p.get("protocols", []), 4), _list(p.get("methods", []), 3), p.get("confidence", "-"),
+          p.get("evidence", "-")] for p in corroboration], max_rows=None,
+    ), detail=True)
+    macs = getattr(summary, "ip_to_macs", None) or {}
+    rep.section("MAC addresses", st.table(["IP", "MACs"], [[ip, ", ".join(sorted(m))] for ip, m in sorted(macs.items())], max_rows=None),
+                detail=True)
+    rep.section("Assessment", st.kv([("Verdict", str(summary.analyst_verdict or "")),
+                                     ("Confidence", str(getattr(summary, "analyst_confidence", "") or ""))])
+                + st.bullets([_redact_in_text(str(r)) for r in (getattr(summary, "analyst_reasons", None) or [])], max_items=None),
+                detail=True)
+    rep.section("False-positive context", st.bullets(
+        [_redact_in_text(str(v)) for v in (getattr(summary, "false_positive_context", None) or []) if str(v).strip()],
+        max_items=None), detail=True)
+    rep.section("Method", st.bullets([
+        "DNS A/AAAA and PTR mappings are the strongest hostname-to-IP attribution evidence.",
+        "HTTP Host and TLS SNI name the server a client intended and can reveal virtual-host targeting.",
+        "NTLM/NetBIOS names are contextual and may reflect client/workstation naming.",
+    ], max_items=None), detail=True)
+    return rep.render()

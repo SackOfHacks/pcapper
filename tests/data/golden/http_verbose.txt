@@ -1,0 +1,58 @@
+
+HTTP · http.pcap
+════════════════════════════════════════════════════════════════════════════════
+  OK        no findings
+            1 requests / 1 responses · 10.0 ms · 2021-01-01T00:00:00.030000Z → 00:00:00.040000Z
+            1 client -> 1 server · 1 host name
+
+Hosts ──────────────────────────────────────────────────────────────────────────
+  HOST                   REQUESTS  IPS                NOTE
+  intranet.corp.example         1  93.184.216.34 (1)
+
+URLs ───────────────────────────────────────────────────────────────────────────
+  URL                                  REQUESTS
+  http://intranet.corp.example/status         1
+
+User agents ────────────────────────────────────────────────────────────────────
+  USER-AGENT         REQUESTS
+  pcapper-tests/1.0         1
+
+Clients ────────────────────────────────────────────────────────────────────────
+  CLIENT         REQUESTS  HOSTS
+  192.168.10.50         2  -
+
+Requests and responses ─────────────────────────────────────────────────────────
+  Methods:   GET (1)
+  Statuses:  200 OK (1)
+  Versions:  HTTP/1.1 (2)
+
+Assessment ─────────────────────────────────────────────────────────────────────
+  Verdict:     NO STRONG SIGNAL - no convincing malicious HTTP pattern
+  Confidence:  Low (score=0)
+  • No high-confidence HTTP threat heuristic crossed threshold
+
+Traffic ────────────────────────────────────────────────────────────────────────
+  Requests / responses:  1 / 1
+  Clients / servers:     1 / 1
+  Start / end:           2021-01-01T00:00:00.030000Z / 2021-01-01T00:00:00.040000Z
+  Duration:              10.0 ms
+
+Servers ────────────────────────────────────────────────────────────────────────
+  SERVER         RESPONSES  HOSTS
+  93.184.216.34          2  intranet.corp.example
+
+Referrers ──────────────────────────────────────────────────────────────────────
+  Present / missing:         0 / 1
+  Unique referrers / hosts:  0 / 0
+  Cross-host:                0
+  HTTPS→HTTP:                0
+  With tokens:               0
+  With IP hosts:             0
+
+Server software ────────────────────────────────────────────────────────────────
+  Server headers:  test-httpd/1.0 (1)
+  Content types:   text/plain (1)
+
+Sessions ───────────────────────────────────────────────────────────────────────
+  CLIENT         SERVER         START                        END                          DURATION  REQUESTS   SIZE  RESPONSES  METHODS  STATUSES
+  192.168.10.50  93.184.216.34  2021-01-01T00:00:00.030000Z  2021-01-01T00:00:00.040000Z  10.0 ms          1  338 B  1          GET(1)   200(1)

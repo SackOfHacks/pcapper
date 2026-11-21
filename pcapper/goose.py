@@ -8,7 +8,8 @@ from pathlib import Path
 from typing import Optional
 
 from .industrial_helpers import _strip_padding
-from .pcap_cache import PcapMeta, iter_packets
+from .lite import UNSUPPORTED, LitePacket
+from .pcap_cache import PassStats, PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, is_public_ip, safe_float
 
 try:
@@ -215,6 +216,51 @@ def _rgoose_from_packet(pkt: object) -> tuple[RGooseSession, str, str, int, int]
         int(getattr(udp, "sport", 0) or 0),
         int(getattr(udp, "dport", 0) or 0),
     )
+
+
+_RGOOSE_MAGIC = b"\x01\x40"
+
+
+def _rgoose_from_lite(pkt: LitePacket) -> object:
+    """:func:`_rgoose_from_packet` answered from a lite record's headers:
+    the same result, None, or UNSUPPORTED (ask the scapy packet)."""
+    l4 = pkt.lite_l4()
+    if l4 is None or l4 is UNSUPPORTED:
+        return l4
+    if l4[0]:
+        return None  # its only transport is TCP: getlayer(UDP) finds nothing
+    data = pkt.original
+    body = l4[7]
+    # The padding-stripped payload is a prefix of the captured one, so a
+    # payload that does not start with the session header never will.
+    if data[body : body + 2] != _RGOOSE_MAGIC:
+        return None
+    if l4[5] < 0:
+        return UNSUPPORTED  # scapy dissects that port's payload into a layer
+    payload = data[l4[5] : l4[6]]
+    if payload[:2] != _RGOOSE_MAGIC:
+        return None
+    session = parse_rgoose(payload)
+    if session is None:
+        return None
+    src_ip, dst_ip = extract_packet_endpoints(pkt)
+    return (session, src_ip or "?", dst_ip or "?", l4[1], l4[2])
+
+
+def _goose_prefilter(record: LitePacket) -> bool:
+    """Records the loop below can use: GOOSE frames, UDP payloads opening
+    with an R-GOOSE session header, and whatever the headers cannot settle."""
+    if record.lite_ether(GOOSE_ETHERTYPE) is not None:
+        return True
+    l4 = record.lite_l4()
+    if l4 is None:
+        return False
+    if l4 is UNSUPPORTED:
+        return True
+    if l4[0]:
+        return False
+    body = l4[7]
+    return record.original[body : body + 2] == _RGOOSE_MAGIC
 
 
 def _l2_goose_payload(appid: int, pdu: bytes) -> bytes:
@@ -924,9 +970,36 @@ def analyze_goose(
                         True,
                     )
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    # Read from disk, only GOOSE and R-GOOSE candidates are handed over (the
+    # totals come from the pass), as lite records parsed from their bytes.
+    stats = PassStats()
+    for pkt in iter_packets(
+        path,
+        packets=packets,
+        meta=meta,
+        show_status=show_status,
+        lite=True,
+        prefilter=_goose_prefilter,
+        stats=stats,
+    ):
         total_packets += 1
         ts = safe_float(getattr(pkt, "time", None))
+
+        if type(pkt) is LitePacket:
+            lite = pkt.lite_ether(GOOSE_ETHERTYPE)
+            if lite is None:
+                found = _rgoose_from_lite(pkt)
+                if found is None:
+                    continue
+                if found is not UNSUPPORTED:
+                    _process_rgoose(found, ts)  # type: ignore[arg-type]
+                    continue
+            elif lite is not UNSUPPORTED:
+                # The GOOSE EtherType's bytes are left as Raw by scapy, so its
+                # bytes(layer) is exactly the rest of the frame.
+                _process_frame(lite[0], lite[1], lite[2], ts, False)  # type: ignore[index]
+                continue
+            pkt = pkt.materialize()
 
         if not pkt.haslayer(Ether):  # type: ignore[truthy-bool]
             # Cooked/raw-IP captures have no Ethernet header; R-GOOSE rides
@@ -960,6 +1033,8 @@ def analyze_goose(
             ts,
             False,
         )
+    if stats.active:
+        total_packets = stats.packets
 
     if goose_packets:
         add_detection(

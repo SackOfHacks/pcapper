@@ -1,217 +1,100 @@
-"""Rendered output for summary analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for the capture summary (the report with no analyzer
+flag): what the capture is -- size, packets, time span, who captured it on
+what -- its hashes for chain of custody, the protocols present, and the
+quality caveats (drops, snaplen-truncated packets, retransmissions) that
+bound every later conclusion. Interface detail and the full protocol table
+are -v."""
 
 from __future__ import annotations
+
 from collections import Counter
-from ..coloring import (
-    header,
-    muted,
-)
+
 from ..capture_parts import capture_parts
 from ..models import PcapSummary
-from ..utils import (
-    format_bytes_as_mb,
-    format_duration,
-    format_ts,
-)
-
-from ._common import (
-    SECTION_BAR,
-    SUBSECTION_BAR,
-    _FULL_OUTPUT_LIMIT,
-    _finalize_output,
-    _format_kv,
-    _format_table,
-)
+from ..utils import format_duration, format_ts, is_gzip_file
+from . import _style as st
+from .pcapmeta import linktype_text
 
 
 def _format_linktype(value: object | None) -> str:
-    if value is None:
-        return "-"
-    try:
-        if isinstance(value, str) and value.isdigit():
-            value = int(value)
-        if isinstance(value, int):
-            common = {
-                0: "Null/Loopback",
-                1: "Ethernet",
-                6: "802.5 Token Ring",
-                7: "ARCnet",
-                8: "SLIP",
-                9: "PPP",
-                101: "Raw IP",
-                105: "IEEE 802.11",
-                113: "Linux cooked capture",
-            }
-            if value in common:
-                return common[value]
-            try:
-                from scapy.data import l2types  # type: ignore
-
-                mapped = l2types.get(value)
-                if mapped is not None:
-                    return str(mapped)
-            except Exception:
-                pass
-            return f"LINKTYPE_{value}"
-        return str(value)
-    except Exception:
-        return str(value)
+    """Kept for callers outside this module (re-exported by the package)."""
+    return linktype_text(value, number=False)
 
 
-def _protocol_rows(
-    protocol_counts: Counter[str], packet_count: int, limit: int
-) -> list[list[str]]:
+def _protocol_rows(protocol_counts: Counter[str], packet_count: int, limit: int) -> list[list[str]]:
+    """Kept for callers outside this module: ``Protocol / Packets /
+    Presence`` rows with a header row."""
     rows = [["Protocol", "Packets", "Presence"]]
-    for name, count in protocol_counts.most_common(limit):
-        pct = "-"
-        if packet_count:
-            pct = f"{(count / packet_count) * 100:.1f}%"
-        rows.append([name, str(count), pct])
+    for name, n in protocol_counts.most_common(limit):
+        rows.append([name, str(n), f"{(n / packet_count) * 100:.1f}%" if packet_count else "-"])
     return rows
 
 
 def render_summary(summary: PcapSummary, protocol_limit: int = 15) -> str:
     del protocol_limit
-    protocol_limit = _FULL_OUTPUT_LIMIT
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"PCAPPER REPORT :: {summary.path.name}"))
-    lines.append(SECTION_BAR)
-
-    lines.append(_format_kv("Path", str(summary.path)))
+    rep = st.Report("Capture", summary.path)
     parts = capture_parts(summary.path)
+    ifaces = list(summary.interface_stats or [])
+    linktypes = sorted({i.linktype for i in ifaces if i.linktype}, key=str)
+    snaplens = sorted({i.snaplen for i in ifaces if i.snaplen is not None})
+    drops = [i.dropped_packets for i in ifaces if i.dropped_packets is not None]
+    gzipped = " (gzip)" if is_gzip_file(summary.path) else ""
+    rep.headline(False, st.join([
+        f"{st.count(summary.packet_count)} packets", st.size(summary.size_bytes),
+        st.duration(summary.duration_seconds) if summary.duration_seconds else "",
+        st.ts_range(summary.start_ts, summary.end_ts) if summary.start_ts else "",
+    ]), st.join([
+        f"{summary.file_type}{gzipped}", ", ".join(linktype_text(v, number=False) for v in linktypes),
+        f"snaplen {', '.join(str(v) for v in snaplens)}" if snaplens else "",
+        st.plural(len(ifaces), "interface") if ifaces else "",
+        (st.bad(f"{sum(drops)} packets dropped") if sum(drops) else "no drops recorded") if drops else "",
+    ]))
     if len(parts) > 1:
-        lines.append(
-            _format_kv(
-                "Parts",
-                f"{len(parts)} split-capture parts joined as one "
-                f"({parts[0].name} .. {parts[-1].name})",
-            )
-        )
-    lines.append(_format_kv("Type", summary.file_type))
-    lines.append(_format_kv("Size", format_bytes_as_mb(summary.size_bytes)))
-    lines.append(_format_kv("Packets", str(summary.packet_count)))
-    lines.append(_format_kv("Start", format_ts(summary.start_ts)))
-    lines.append(_format_kv("End", format_ts(summary.end_ts)))
-    lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
-    lines.append(_format_kv("Interfaces", str(len(summary.interface_stats))))
-    linktypes = sorted(
-        {iface.linktype for iface in summary.interface_stats if iface.linktype}
-    )
-    snaplens = sorted(
-        {
-            iface.snaplen
-            for iface in summary.interface_stats
-            if iface.snaplen is not None
-        }
-    )
-    if linktypes:
-        lines.append(_format_kv("LinkTypes", ", ".join(linktypes)))
-    if snaplens:
-        lines.append(_format_kv("SnapLen", ", ".join(str(val) for val in snaplens)))
-    encapsulations = sorted({_format_linktype(value) for value in linktypes})
-    lines.append(
-        _format_kv(
-            "Encapsulation", ", ".join(encapsulations) if encapsulations else "-"
-        )
-    )
-    hash_note = " (all parts, in order)" if len(parts) > 1 else ""
-    lines.append(_format_kv("Hash (SHA256)", (summary.hash_sha256 or "-") + hash_note))
-    lines.append(_format_kv("Hash (SHA1)", (summary.hash_sha1 or "-") + hash_note))
+        rep.scope(f"{len(parts)} split-capture parts joined as one ({parts[0].name} .. {parts[-1].name})")
+    origin = st.join([summary.capture_application, f"on {summary.capture_os}" if summary.capture_os else "",
+                      f"({summary.capture_hardware})" if summary.capture_hardware else ""], " ")
+    if origin:
+        rep.scope(f"captured with {origin}")
+    truncated = int(getattr(summary, "truncated_packets", 0) or 0)
+    if truncated:
+        rep.scope(st.caution(f"{st.count(truncated)} packets cut short by the snaplen: byte totals are lower bounds"))
 
-    def _capture_value(value: object | None) -> str:
-        text = str(value or "").strip()
-        return text if text else "not recorded"
+    hash_note = st.dim(" (all parts, in order)") if len(parts) > 1 else ""
+    rep.section("Integrity", st.kv([("SHA-256", (summary.hash_sha256 or "-") + hash_note), ("SHA-1", (summary.hash_sha1 or "-") + hash_note)]))
+    rep.section("Protocols", st.table(
+        ["Protocol", "Packets", "Share"],
+        [[name, st.count(n), f"{n / summary.packet_count:.1%}" if summary.packet_count else "-"]
+         for name, n in summary.protocol_counts.most_common()],
+        align="lrr", max_rows=st.TOP_ROWS, tail=st.TOP_ROWS, noun="protocol",
+    ))
+    vlans = sorted({v for i in ifaces for v in i.vlan_ids})
+    tcp = int(getattr(summary, "tcp_packets", 0) or 0)
+    retrans = int(getattr(summary, "retransmissions", 0) or 0)
+    rate = float(getattr(summary, "retransmission_rate", 0.0) or 0.0)
+    rep.section("Quality", st.kv([
+        ("Retransmissions", f"{retrans} ({rate:.2%} of {st.count(tcp)} TCP packets)" if tcp and (retrans or st.verbose()) else
+         ("no TCP packets" if st.verbose() and not tcp else "")),
+        ("Truncated packets", st.count(truncated) if st.verbose() else ""),
+        ("VLANs", f"{len(vlans)}: {st.listing(vlans, 12)}" if vlans else ("none tagged" if st.verbose() else "")),
+    ]))
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Capture"))
-    lines.append(_format_kv("Hardware", _capture_value(summary.capture_hardware)))
-    lines.append(_format_kv("OS", _capture_value(summary.capture_os)))
-    lines.append(
-        _format_kv("Application", _capture_value(summary.capture_application))
-    )
+    def _dropped(i) -> str:
+        if i.dropped_packets is not None:
+            return str(i.dropped_packets)
+        return "not recorded" if summary.file_type == "pcap" else "-"
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Interface Statistics"))
-    rows = [
-        [
-            "Interface Name",
-            "Dropped Packets",
-            "Capture Filter",
-            "Link Type",
-            "Packet Size Limit",
-        ]
-    ]
-    for iface in summary.interface_stats:
-        if summary.file_type == "pcap":
-            dropped = (
-                str(iface.dropped_packets)
-                if iface.dropped_packets is not None
-                else "not recorded"
-            )
-            capture_filter = iface.capture_filter or "not recorded"
-        else:
-            dropped = (
-                str(iface.dropped_packets) if iface.dropped_packets is not None else "-"
-            )
-            capture_filter = iface.capture_filter or "-"
-        link_type = _format_linktype(iface.linktype)
-        snaplen = str(iface.snaplen) if iface.snaplen is not None else "-"
-        rows.append(
-            [
-                iface.name,
-                dropped,
-                capture_filter,
-                link_type,
-                snaplen,
-            ]
-        )
-    lines.append(_format_table(rows))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Protocol Summary (presence across packets)"))
-    lines.append(
-        _format_table(
-            _protocol_rows(
-                summary.protocol_counts, summary.packet_count, protocol_limit
-            )
-        )
-    )
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("VLAN Summary"))
-    vlan_ids: set[int] = set()
-    for iface in summary.interface_stats:
-        vlan_ids.update(iface.vlan_ids)
-    if vlan_ids:
-        vlan_list = ", ".join(str(vlan) for vlan in sorted(vlan_ids))
-        lines.append(_format_kv("VLANs Observed", str(len(vlan_ids))))
-        lines.append(_format_kv("VLAN IDs", vlan_list))
-    else:
-        lines.append(muted("No VLAN-tagged traffic detected."))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Retransmissions"))
-    lines.append(
-        _format_kv(
-            "TCP Retransmissions", str(int(getattr(summary, "retransmissions", 0) or 0))
-        )
-    )
-    lines.append(
-        _format_kv(
-            "Retransmission Rate",
-            f"{float(getattr(summary, 'retransmission_rate', 0.0) or 0.0):.2%}",
-        )
-    )
-    tcp_packets = int(getattr(summary, "tcp_packets", 0) or 0)
-    if tcp_packets == 0:
-        lines.append(
-            muted("No TCP packets observed; retransmission heuristics not applicable.")
-        )
-    lines.append(SECTION_BAR)
-
-    return _finalize_output(lines, show_truncation_note=False)
+    rep.section("Interfaces", st.table(
+        ["Name", "Link type", "Snaplen", "Packets", "Dropped", "Filter", "Description", "Speed", "MAC", "OS"],
+        [[i.name, linktype_text(i.linktype), i.snaplen if i.snaplen is not None else "-", i.packet_count if i.packet_count is not None else "-",
+          _dropped(i), i.capture_filter or ("not recorded" if summary.file_type == "pcap" else "-"), i.description or "-",
+          f"{i.speed_bps} bps" if i.speed_bps else "-", i.mac or "-", i.os or "-"] for i in ifaces],
+        max_rows=None,
+    ), detail=True)
+    rep.section("File", st.kv([
+        ("Path", str(summary.path)), ("Type", f"{summary.file_type}{gzipped}"), ("Size", f"{summary.size_bytes} bytes"),
+        ("Start / end", f"{format_ts(summary.start_ts)} / {format_ts(summary.end_ts)}"),
+        ("Duration", format_duration(summary.duration_seconds)),
+        ("Capture hardware / OS / application", " / ".join(str(v or "not recorded") for v in
+                                                           (summary.capture_hardware, summary.capture_os, summary.capture_application))),
+    ]), detail=True)
+    return rep.render()

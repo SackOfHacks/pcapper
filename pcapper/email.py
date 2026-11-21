@@ -13,6 +13,7 @@ from typing import Iterable, Optional
 from .device_detection import device_fingerprints_from_text
 from .pcap_cache import iter_packets
 from .utils import (
+    memoize_analysis,
     beacon_score,
     extract_packet_endpoints,
     is_private_ip,
@@ -55,7 +56,7 @@ IMAP_LINE_RE = re.compile(r"^([A-Za-z0-9._-]+)\s+([A-Za-z]+)\s*(.*)$")
 IMAP_STATUS_RE = re.compile(r"^[A-Za-z0-9._-]+\s+(OK|NO|BAD)\b", re.IGNORECASE)
 POP3_STATUS_RE = re.compile(r"^(\+OK|-ERR)\b", re.IGNORECASE)
 FILE_NAME_RE = re.compile(
-    r"[\w\-.()\[\]/ ]+\.(?:exe|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|tar|gz|tgz|txt|csv|log|ps1|sh|bat|py|js|jar|apk|iso|img|eml|msg)",
+    r"[\w\-.()\[\]/](?:[\w\-.()\[\]/]| (?! ))*\.(?:exe|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|tar|gz|tgz|txt|csv|log|ps1|sh|bat|py|js|jar|apk|iso|img|eml|msg)\b",
     re.IGNORECASE,
 )
 ATTACHMENT_RE = re.compile(r'filename\*?="?([^";\r\n]+)', re.IGNORECASE)
@@ -630,6 +631,9 @@ def _is_qp_artifact(token: str) -> bool:
     real creds recovered from the base64 AUTH path are unaffected."""
     if token in {"=", "=3D"}:
         return True
+    # Nothing left once the quoted-printable escapes go: "=0D" (CR), "=20=0A".
+    if not re.sub(r"=[0-9A-Fa-f]{2}|=", "", token).strip():
+        return True
     return bool(re.fullmatch(r"(?:3D)(?:=?3D)*", token, re.IGNORECASE))
 
 
@@ -821,6 +825,7 @@ def _classify_url(url: str) -> list[str]:
     return reasons
 
 
+@memoize_analysis
 def analyze_email(
     path: Path,
     show_status: bool = True,
@@ -2109,10 +2114,13 @@ def analyze_email(
             deterministic_checks["credential_exposure"].append(
                 f"passwords: {top_passwords}"
             )
+        # A token in a message body (an HTML link's token= parameter) is not
+        # a mail login: only usernames or passwords make this HIGH.
+        logins = bool(username_counts or password_counts)
         detections.append(
             {
-                "severity": "high",
-                "summary": "Email credential exposure detected",
+                "severity": "high" if logins else "medium",
+                "summary": "Email credential exposure detected" if logins else "Token or secret in email content",
                 "details": f"Observed {sum(password_counts.values())} password and {sum(secret_counts.values())} secret artifacts.",
                 "source": "EMAIL",
             }

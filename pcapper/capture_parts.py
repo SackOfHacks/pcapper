@@ -27,6 +27,8 @@ PART_NAME_RE = re.compile(
 )
 
 _PARTS: dict[str, tuple[Path, ...]] = {}
+# Each registered part file: (head, index, parts) of its group.
+_MEMBERS: dict[str, tuple[Path, int, tuple[Path, ...]]] = {}
 _DISPLAY: dict[str, str] = {}
 
 
@@ -115,6 +117,9 @@ def register_capture_parts(parts: tuple[Path, ...] | list[Path], display: str | 
         raise ValueError("a capture group needs at least one part")
     head = ordered[0]
     _PARTS[_key(head)] = ordered
+    if len(ordered) > 1:
+        for index, part in enumerate(ordered):
+            _MEMBERS[_key(part)] = (head, index, ordered)
     if display:
         _DISPLAY[head.name] = display
     return head
@@ -123,6 +128,13 @@ def register_capture_parts(parts: tuple[Path, ...] | list[Path], display: str | 
 def capture_parts(path: Path) -> tuple[Path, ...]:
     """The files behind ``path``: its parts when it heads a group, else itself."""
     return _PARTS.get(_key(path), (path,))
+
+
+def part_group(path: Path) -> tuple[Path, int, tuple[Path, ...]] | None:
+    """``(head, index, parts)`` when ``path`` is one part of a joined capture."""
+    if not _MEMBERS:
+        return None
+    return _MEMBERS.get(_key(path))
 
 
 def is_joined_capture(path: Path) -> bool:
@@ -146,6 +158,7 @@ def apply_display_names(text: str) -> str:
 
 def clear_capture_parts() -> None:
     _PARTS.clear()
+    _MEMBERS.clear()
     _DISPLAY.clear()
 
 

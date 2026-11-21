@@ -1,57 +1,30 @@
-"""Rendered output for qos analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for QoS marking analysis (DSCP/ECN, VLAN PCP, WMM)."""
 
 from __future__ import annotations
-from ..coloring import (
-    header,
-    muted,
-    warn,
-)
-from ..qos import QosSummary
 
-from ._common import (
-    _filtered_detections,
-    _finalize_output,
-    _format_counter,
-    _format_kv,
-    _limit_value,
-    _render_protocol_verdict,
-)
+from ..qos import QosSummary
+from ._kv import counter_line, simple_report
 
 
 def render_qos_summary(summary: QosSummary, verbose: bool = False) -> str:
-    lines = [header("QOS ANALYSIS")]
-    _render_protocol_verdict(
-        lines,
-        label="QoS",
-        detections=getattr(summary, "detections", None),
-        anomalies=getattr(summary, "anomalies", None),
+    return simple_report(
+        "QoS", summary, packets=summary.qos_packets, unit="QoS-marked packets",
+        facts_title="Markings",
+        facts=[("Marked packets", f"{summary.qos_packets} of {summary.total_packets} "
+                                  f"({summary.ip_qos_packets} IP, {summary.wireless_qos_packets} wireless)"),
+               ("High priority", str(summary.high_priority_packets)),
+               counter_line("DSCP", summary.dscp_counts, 8), counter_line("ECN", summary.ecn_counts, 4),
+               counter_line("VLAN PCP", summary.vlan_pcp_counts, 6), counter_line("WMM TID", summary.wmm_tid_counts, 8),
+               counter_line("Sources", summary.src_counts, 6), counter_line("Destinations", summary.dst_counts, 6)],
+        details=[("IP packets", str(summary.total_ip_packets)),
+                 ("Wireless QoS open / protected", f"{summary.wireless_qos_open_packets} / {summary.wireless_qos_protected_packets}"),
+                 counter_line("Services", summary.service_counts, None),
+                 counter_line("WLAN TID direction", summary.wlan_tid_direction_counts, None),
+                 counter_line("WLAN sources", summary.wlan_src_counts, None),
+                 counter_line("WLAN destinations", summary.wlan_dst_counts, None),
+                 ("Flows", "; ".join(str(r) for r in (summary.flow_rows or []))),
+                 ("WLAN flows", "; ".join(str(r) for r in (summary.wlan_flow_rows or []))),
+                 ("Plaintext hits", "; ".join(str(r) for r in (summary.plaintext_hits or [])))],
+        high="QoS abuse (priority flooding, covert marking): investigate", medium="QoS markings to review",
+        absent="QoS-marked traffic",
     )
-    lines.append(_format_kv("Packets", str(summary.total_packets)))
-    lines.append(_format_kv("IP Packets", str(summary.total_ip_packets)))
-    lines.append(_format_kv("QoS Packets", str(summary.qos_packets)))
-    lines.append(_format_kv("IP QoS", str(summary.ip_qos_packets)))
-    lines.append(_format_kv("Wireless QoS", str(summary.wireless_qos_packets)))
-    lines.append(_format_kv("High Priority", str(summary.high_priority_packets)))
-    lines.append(_format_kv("DSCP", _format_counter(summary.dscp_counts, 8)))
-    lines.append(_format_kv("ECN", _format_counter(summary.ecn_counts, 4)))
-    lines.append(_format_kv("VLAN PCP", _format_counter(summary.vlan_pcp_counts, 6)))
-    lines.append(_format_kv("WMM TID", _format_counter(summary.wmm_tid_counts, 8)))
-    lines.append(_format_kv("Top Sources", _format_counter(summary.src_counts, 6)))
-    lines.append(_format_kv("Top Destinations", _format_counter(summary.dst_counts, 6)))
-    detections = _filtered_detections(summary, verbose)
-    if detections:
-        lines.append(header("Detections"))
-        for item in detections[: _limit_value(8)]:
-            sev = str(item.get("severity", "info")).upper()
-            title = str(item.get("title") or item.get("summary") or "Detection")
-            details = str(item.get("details", ""))
-            lines.append(warn(f"[{sev}] {title}"))
-            if details:
-                lines.append(muted(f"  {details}"))
-    if summary.errors:
-        lines.append(_format_kv("Errors", "; ".join(summary.errors[: _limit_value(4)])))
-    return _finalize_output(lines)

@@ -5,29 +5,17 @@ verbatim, only its location changed.
 """
 
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
-from ..coloring import (
-    danger,
-    header,
-    muted,
-    ok,
-    warn,
-)
+
 from ..services import ServiceSummary
-from ..utils import (
-    format_bytes_as_mb,
-)
+from . import _style as st
+from ._common import _render_deterministic_checks
+from ._kv import counter_line
+
 if TYPE_CHECKING:
     from ..services import ServiceAsset
 
-from ._common import (
-    SECTION_BAR,
-    SUBSECTION_BAR,
-    _finalize_output,
-    _format_kv,
-    _format_table,
-    _limit_value,
-)
 
 
 def _service_asset_key(asset: ServiceAsset) -> str:
@@ -63,312 +51,90 @@ def _services_mitre_techniques(summary: ServiceSummary) -> list[str]:
 
 
 def render_services_summary(summary: ServiceSummary, verbose: bool = False) -> str:
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"SERVICE DISCOVERY & RISK ANALYSIS :: {summary.path.name}"))
-    lines.append(SECTION_BAR)
-
+    """Services observed acting as servers: risks first, then the internet-
+    exposed surface and the handshake-confirmed TCP services (address, port,
+    service, software banner, clients); inferred/UDP services, prevalence and
+    the analyzer's profiles are -v."""
+    rep = st.Report("Services", summary.path)
+    show_all = st.verbose() or verbose
+    confirmed = [a for a in summary.assets if a.protocol == "TCP" and bool(getattr(a, "handshake_confirmed", False))]
+    shown = summary.assets if show_all else confirmed
+    shown_keys = {_service_asset_key(a) for a in shown}
+    risks = list(summary.risks)
+    if not show_all:
+        risks = [r for r in risks if str(r.severity or "").upper() in {"CRITICAL", "HIGH", "MEDIUM"}
+                 and str(r.affected_asset or "").split("/", 1)[0] in shown_keys]
+    findings = [st.finding({"severity": r.severity, "title": r.title, "details": r.description,
+                            "dst": str(r.affected_asset or "")}) for r in risks]
+    if not summary.total_services and not st.material(findings):
+        return rep.absent("services", summary.errors)
+    severity, text = st.verdict(findings, high="high-risk services exposed: investigate", medium="service risks to review")
+    rep.headline(severity, text, st.join([
+        st.plural(summary.total_services, "service"), f"{len(confirmed)} confirmed TCP",
+        f"{summary.total_services - len(confirmed)} inferred/UDP (-v)" if not show_all and summary.total_services > len(confirmed) else "",
+    ]))
+    tids = _services_mitre_techniques(summary)
+    if tids:
+        rep.scope("ATT&CK: " + ", ".join(tids))
     if summary.errors:
-        lines.append(SUBSECTION_BAR)
-        for err in summary.errors:
-            lines.append(danger(f"Error: {err}"))
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Findings", st.findings_block(findings))
+    # A public server address is an external site in a client capture and
+    # internet exposure when the server is yours: the Scope column says
+    # which side of the boundary it is on, the analyst knows which applies.
+    from ..utils import is_public_ip
 
-    confirmed_assets = [
-        asset
-        for asset in summary.assets
-        if asset.protocol == "TCP" and bool(getattr(asset, "handshake_confirmed", False))
-    ]
-    displayed_assets = summary.assets if verbose else confirmed_assets
-    displayed_keys = {_service_asset_key(asset) for asset in displayed_assets}
+    rep.section("Services", st.table(
+        ["Address", "Port", "Proto", "Service", "Software", "Clients", "Bytes", "Scope"] + (["Discovery"] if show_all else []),
+        [[a.ip, a.port, a.protocol, a.service_name, a.software or "-", st.count(len(a.clients)), st.size(a.bytes),
+          "public" if is_public_ip(a.ip) else "private"]
+         + ([getattr(a, "discovery_method", "observed")] if show_all else []) for a in shown],
+        align="lrlllrrl", widths=(None, None, None, None, 50), max_rows=25, noun="service",
+    ) or [f"  {st.dim('no handshake-confirmed TCP services (-v includes inferred and UDP services)')}"])
+    exposed = [p for p in (getattr(summary, "boundary_exposure_profiles", None) or []) if isinstance(p, dict)]
+    rep.section("Boundary exposure", st.table(
+        ["Asset", "Service", "Clients", "Packets"],
+        [[p.get("asset", "-"), p.get("service", "-"), st.count(p.get("clients", 0)), st.count(p.get("packets", 0))]
+         for p in exposed], align="llrr", max_rows=None, noun="service",
+    ), detail=True)
 
-    lines.append(_format_kv("Total Services", str(summary.total_services)))
-    lines.append(_format_kv("Confirmed TCP Services", str(len(confirmed_assets))))
-    if not verbose:
-        hidden_count = max(0, summary.total_services - len(confirmed_assets))
-        lines.append(_format_kv("Hidden (Unconfirmed/UDP)", str(hidden_count)))
+    rep.section("Assessment", st.kv([
+        ("Verdict", str(getattr(summary, "analyst_verdict", "") or "")),
+        ("Confidence", str(getattr(summary, "analyst_confidence", "") or "")),
+    ]) + st.bullets([str(r) for r in (getattr(summary, "analyst_reasons", None) or [])], max_items=None), detail=True)
+    rep.section("Prevalence", st.kv([counter_line("Services", summary.hierarchy, None)]), detail=True)
+    rep.section("Banners", st.table(["Address", "Port", "Service", "Banner"],
+                                    [[a.ip, a.port, a.service_name, a.software] for a in shown if a.software], max_rows=None),
+                detail=True)
 
-    # 1. Active Services Inventory
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Active Services (Servers)"))
-
-    if not displayed_assets:
-        lines.append(
-            muted(
-                "No handshake-confirmed TCP services identified. Use `-v` to include inferred/UDP service observations."
-            )
-        )
-    else:
-        rows = [["Address", "Port", "Proto", "Service", "Software", "Clients", "Vol"]]
-        if verbose:
-            rows[0].append("Discovery")
-        for asset in displayed_assets:
-            software = asset.software or "-"
-            vol = format_bytes_as_mb(asset.bytes)
-            row = [
-                asset.ip,
-                str(asset.port),
-                asset.protocol,
-                asset.service_name,
-                software,
-                str(len(asset.clients)),
-                vol,
-            ]
-            if verbose:
-                row.append(str(getattr(asset, "discovery_method", "observed")))
-            rows.append(row)
-        lines.append(_format_table(rows))
-
-    # Internet-exposed attack surface — public-IP-bound services. High-value
-    # triage, shown by default (not gated on -v).
-    boundary_profiles = list(getattr(summary, "boundary_exposure_profiles", []) or [])
-    if boundary_profiles:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Internet-Exposed Attack Surface (public IPs)"))
-        lines.append(
-            danger(
-                f"{len(boundary_profiles)} service(s) bound to public IP(s) — "
-                "reachable from the internet."
-            )
-        )
-        rows = [["Asset", "Service", "Clients", "Packets"]]
-        for profile in boundary_profiles[: _limit_value(15)]:
-            if not isinstance(profile, dict):
+    def _profile(title: str, field: str, header_row: list[str], keys: list[str]) -> None:
+        rows = []
+        for p in getattr(summary, field, None) or []:
+            if not isinstance(p, dict):
                 continue
-            rows.append(
-                [
-                    str(profile.get("asset", "-")),
-                    str(profile.get("service", "-")),
-                    str(profile.get("clients", 0)),
-                    str(profile.get("packets", 0)),
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
+            rows.append([", ".join(str(v) for v in p.get(k)) if isinstance(p.get(k), (list, tuple, set)) else p.get(k, "-")
+                         for k in keys])
+        rep.section(title, st.table(header_row, rows, max_rows=None), detail=True)
 
-    if summary.hierarchy and verbose:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Service Prevalence"))
-        rows = [["Service", "Count"]]
-        for name, count in sorted(
-            summary.hierarchy.items(), key=lambda item: item[1], reverse=True
-        ):
-            rows.append([name, str(count)])
-        lines.append(_format_table(rows))
-
-    banners = [asset for asset in displayed_assets if asset.software]
-    if banners and verbose:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Observed Service Banners"))
-        rows = [["Address", "Port", "Service", "Banner"]]
-        for asset in banners:
-            rows.append(
-                [
-                    asset.ip,
-                    str(asset.port),
-                    asset.service_name,
-                    asset.software or "-",
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    # 2. Risks / Threats
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Cybersecurity Risks"))
-
-    risk_pool = list(summary.risks)
-    if not verbose:
-        risk_pool = [
-            risk
-            for risk in risk_pool
-            if str(risk.severity or "").upper() in {"CRITICAL", "HIGH", "MEDIUM"}
-            and str(risk.affected_asset or "").split("/", 1)[0] in displayed_keys
-        ]
-    if not risk_pool:
-        lines.append(ok("No high-confidence service risks detected."))
-    else:
-        severity_rank = {"CRITICAL": 0, "HIGH": 1, "MEDIUM": 2, "LOW": 3}
-        sorted_risks = sorted(
-            risk_pool,
-            key=lambda x: (
-                severity_rank.get(str(x.severity or "").upper(), 99),
-                str(x.title or ""),
-            ),
-        )
-        for risk in sorted_risks:
-            sev_color = danger if risk.severity in ("CRITICAL", "HIGH") else warn
-            if risk.severity == "LOW":
-                sev_color = muted
-            lines.append(sev_color(f"[{risk.severity}] {risk.title}"))
-            lines.append(f"  Target: {risk.affected_asset}")
-            lines.append(muted(f"  Details: {risk.description}"))
-            lines.append("")
-
-    verdict = str(getattr(summary, "analyst_verdict", "") or "")
-    confidence = str(getattr(summary, "analyst_confidence", "") or "").upper()
-    reasons = [str(v) for v in list(getattr(summary, "analyst_reasons", []) or [])]
-    if verdict:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Analyst Verdict"))
-        if confidence:
-            lines.append(_format_kv("Verdict", f"{verdict} (confidence: {confidence})"))
-        else:
-            lines.append(_format_kv("Verdict", verdict))
-        if reasons:
-            for reason in reasons:
-                lines.append(muted(f"- {reason}"))
-        tids = _services_mitre_techniques(summary)
-        if tids:
-            lines.append(muted("  ATT&CK: " + ", ".join(tids)))
-
-    checks = dict(getattr(summary, "deterministic_checks", {}) or {})
-    if checks:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Deterministic Service Security Checks"))
-        check_labels = {
-            "exposed_datastores": "Exposed databases/datastores",
-            "internet_exposed_surface": "Internet-exposed services",
-            "service_identity_mismatch": "Service identity mismatch",
-            "lateral_admin_surface": "Lateral admin surface",
-            "public_edge_admin_exposure": "Public edge admin exposure",
-            "ot_it_boundary_mix": "OT/IT boundary mix",
-            "udp_amplification_readiness": "UDP amplification readiness",
-            "legacy_or_weak_service_hygiene": "Legacy/weak hygiene",
-            "protocol_confusion_false_positive": "Protocol-confusion false-positive context",
-            "evidence_provenance": "Evidence provenance",
-        }
-        for key, label_text in check_labels.items():
-            values = [str(v) for v in list(checks.get(key, []) or [])]
-            if values:
-                lines.append(warn(f"[!] {label_text}: {len(values)}"))
-                for item in values:
-                    lines.append(muted(f"  - {item}"))
-            else:
-                lines.append(ok(f"[ ] {label_text}: none"))
-
-
-    mismatch_profiles = list(getattr(summary, "service_mismatch_profiles", []) or [])
-    if mismatch_profiles and verbose:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Service Mismatch Profiles"))
-        rows = [["Asset", "Service", "Software", "Reasons"]]
-        for profile in mismatch_profiles:
-            if not isinstance(profile, dict):
-                continue
-            rows.append(
-                [
-                    str(profile.get("asset", "-")),
-                    str(profile.get("service", "-")),
-                    str(profile.get("software", "-")),
-                    ", ".join(str(v) for v in list(profile.get("reasons", []) or []))
-                    or "-",
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
-
-    drift_profiles = list(getattr(summary, "service_drift_profiles", []) or [])
-    if drift_profiles and verbose:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Service Drift Profiles"))
-        rows = [["Host", "Service", "Ports", "Banner Count"]]
-        for profile in drift_profiles:
-            if not isinstance(profile, dict):
-                continue
-            rows.append(
-                [
-                    str(profile.get("host", "-")),
-                    str(profile.get("service", "-")),
-                    ",".join(str(v) for v in list(profile.get("ports", []) or []))
-                    or "-",
-                    str(profile.get("banner_count", 0)),
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
-
-    lateral_profiles = list(getattr(summary, "lateral_surface_profiles", []) or [])
-    if lateral_profiles and verbose:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Lateral Surface Profiles"))
-        rows = [["Host", "Admin Ports", "Count", "Confidence"]]
-        for profile in lateral_profiles:
-            if not isinstance(profile, dict):
-                continue
-            rows.append(
-                [
-                    str(profile.get("host", "-")),
-                    ",".join(str(v) for v in list(profile.get("admin_ports", []) or []))
-                    or "-",
-                    str(profile.get("admin_port_count", 0)),
-                    str(profile.get("confidence", "-")),
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
-
-    boundary_profiles = list(getattr(summary, "boundary_exposure_profiles", []) or [])
-    if boundary_profiles and verbose:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Boundary Exposure Profiles"))
-        rows = [["Asset", "Service", "Clients", "Packets"]]
-        for profile in boundary_profiles:
-            if not isinstance(profile, dict):
-                continue
-            rows.append(
-                [
-                    str(profile.get("asset", "-")),
-                    str(profile.get("service", "-")),
-                    str(profile.get("clients", 0)),
-                    str(profile.get("packets", 0)),
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
-
-    ot_it_profiles = list(getattr(summary, "ot_it_crossing_profiles", []) or [])
-    if ot_it_profiles and verbose:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("OT/IT Crossing Profiles"))
-        rows = [["Host", "OT Ports", "Admin Ports", "Confidence"]]
-        for profile in ot_it_profiles:
-            if not isinstance(profile, dict):
-                continue
-            rows.append(
-                [
-                    str(profile.get("host", "-")),
-                    ",".join(str(v) for v in list(profile.get("ot_ports", []) or []))
-                    or "-",
-                    ",".join(str(v) for v in list(profile.get("admin_ports", []) or []))
-                    or "-",
-                    str(profile.get("confidence", "-")),
-                ]
-            )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
-
-    false_positive_context = [
-        str(v)
-        for v in list(getattr(summary, "false_positive_context", []) or [])
-        if str(v).strip()
-    ]
-    if false_positive_context:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("False-Positive Context"))
-        for item in false_positive_context:
-            lines.append(muted(f"- {item}"))
-
-    if not verbose:
-        lines.append(SUBSECTION_BAR)
-        lines.append(
-            muted(
-                "Default view shows handshake-confirmed TCP services and likely risks only."
-            )
-        )
-        lines.append(
-            muted(
-                "Use `-v` to include inferred TCP/UDP services, low-severity risks, and full deterministic profile detail."
-            )
-        )
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines, show_truncation_note=False)
+    _profile("Identity mismatches", "service_mismatch_profiles", ["Asset", "Service", "Software", "Reasons"],
+             ["asset", "service", "software", "reasons"])
+    _profile("Service drift", "service_drift_profiles", ["Host", "Service", "Ports", "Banners"], ["host", "service", "ports", "banner_count"])
+    _profile("Lateral surface", "lateral_surface_profiles", ["Host", "Admin ports", "Count", "Confidence"],
+             ["host", "admin_ports", "admin_port_count", "confidence"])
+    _profile("OT/IT crossings", "ot_it_crossing_profiles", ["Host", "OT ports", "Admin ports", "Confidence"],
+             ["host", "ot_ports", "admin_ports", "confidence"])
+    rep.section("False-positive context", st.bullets([str(v) for v in (summary.false_positive_context or []) if str(v).strip()],
+                                                     max_items=None), detail=True)
+    if st.analysis_sections():
+        legacy: list[str] = []
+        _render_deterministic_checks(legacy, summary, "Deterministic Service Security Checks", [
+            ("exposed_datastores", "Exposed databases/datastores"), ("internet_exposed_surface", "Internet-exposed services"),
+            ("service_identity_mismatch", "Service identity mismatch"), ("lateral_admin_surface", "Lateral admin surface"),
+            ("public_edge_admin_exposure", "Public edge admin exposure"), ("ot_it_boundary_mix", "OT/IT boundary mix"),
+            ("udp_amplification_readiness", "UDP amplification readiness"),
+            ("legacy_or_weak_service_hygiene", "Legacy/weak hygiene"),
+            ("protocol_confusion_false_positive", "Protocol-confusion false-positive context"),
+            ("evidence_provenance", "Evidence provenance"),
+        ])
+        rep.section("Deterministic checks", legacy[2:])
+    return rep.render()

@@ -1,72 +1,51 @@
-"""Rendered output for vpn analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for VPN and tunnel analysis (IPsec/IKE, OpenVPN,
+WireGuard, PPTP/L2TP, GRE, SSL VPNs): which tunnels exist, to where, and
+what their certificates say."""
 
 from __future__ import annotations
-from ..coloring import (
-    header,
-    muted,
-)
-from ..vpn import VpnSummary
 
-from ._common import (
-    SUBSECTION_BAR,
-    _finalize_output,
-    _format_counter,
-    _format_kv,
-    _limit_value,
-    _render_protocol_verdict,
-)
+from ..vpn import VpnSummary
+from . import _style as st
+from ._kv import counter_line, findings_for
 
 
 def render_vpn_summary(summary: VpnSummary) -> str:
-    lines = [header("VPN/TUNNEL ANALYSIS")]
-    _render_protocol_verdict(
-        lines, label="VPN", detections=getattr(summary, "detections", None)
-    )
-    lines.append(_format_kv("VPN Packets", str(summary.vpn_packets)))
-    lines.append(_format_kv("Services", _format_counter(summary.service_counts, 6)))
-    if summary.protocol_counts:
-        lines.append(_format_kv("Protocols", _format_counter(summary.protocol_counts, 6)))
-    if summary.server_port_counts:
-        lines.append(
-            _format_kv("Server Ports", _format_counter(summary.server_port_counts, 6))
-        )
-    if summary.handshake_counts:
-        lines.append(_format_kv("Handshakes", _format_counter(summary.handshake_counts, 6)))
+    rep = st.Report("VPN and tunnels", summary.path)
+    findings = findings_for(summary, ot=False)
+    if not summary.vpn_packets and not st.material(findings):
+        return rep.absent("VPN or tunnel traffic", summary.errors)
+    severity, text = st.verdict(findings, high="high-severity tunnel activity (unsanctioned VPN, weak crypto): investigate",
+                                medium="tunnel activity to review")
+    rep.headline(severity, text, st.join([
+        f"{st.count(summary.vpn_packets)} VPN packets", st.top(summary.service_counts, 4),
+        st.duration(summary.duration_seconds) if summary.duration_seconds else "",
+        st.ts_range(summary.first_seen, summary.last_seen) if summary.first_seen else "",
+    ]))
+    rep.scope(f"{st.plural(len(summary.client_counts), 'client')} -> {st.plural(len(summary.server_counts), 'server')}")
+    if summary.errors:
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Findings", st.findings_block(findings))
+    rep.section("Tunnels", st.kv([
+        counter_line("Services", summary.service_counts, 6), counter_line("Protocols", summary.protocol_counts, 6),
+        counter_line("Server ports", summary.server_port_counts, 6), counter_line("Handshakes", summary.handshake_counts, 6),
+        counter_line("Clients", summary.client_counts, 5), counter_line("Servers", summary.server_counts, 5),
+    ]))
     if summary.certificate_count:
-        lines.append(_format_kv("Certificates", str(summary.certificate_count)))
-        if summary.certificate_subjects:
-            lines.append(
-                _format_kv(
-                    "Cert Subjects",
-                    _format_counter(summary.certificate_subjects, 4, key_max=36),
-                )
-            )
-        if summary.certificate_issuers:
-            lines.append(
-                _format_kv(
-                    "Cert Issuers",
-                    _format_counter(summary.certificate_issuers, 4, key_max=36),
-                )
-            )
-        if summary.self_signed_cert_count:
-            lines.append(
-                _format_kv("Self-Signed Certs", str(summary.self_signed_cert_count))
-            )
-        if summary.weak_cert_count:
-            lines.append(_format_kv("Weak Certs", str(summary.weak_cert_count)))
-    if summary.threat_counts:
-        lines.append(_format_kv("Threats", _format_counter(summary.threat_counts, 5)))
-    if summary.anomaly_counts:
-        lines.append(_format_kv("Anomalies", _format_counter(summary.anomaly_counts, 5)))
-    lines.append(_format_kv("Top Clients", _format_counter(summary.client_counts, 5)))
-    lines.append(_format_kv("Top Servers", _format_counter(summary.server_counts, 5)))
-    if summary.artifact_correlations:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Artifact/Client/Server Correlation"))
-        for relation, count in summary.artifact_correlations.most_common(_limit_value(10)):
-            lines.append(muted(f"- {relation} ({count})"))
-    return _finalize_output(lines)
+        rep.section("Certificates", st.kv([
+            ("Certificates", f"{summary.certificate_count}"
+                             + (f" · {st.caution(str(summary.self_signed_cert_count) + ' self-signed')}" if summary.self_signed_cert_count else "")
+                             + (f" · {st.bad(str(summary.weak_cert_count) + ' weak')}" if summary.weak_cert_count else "")),
+            counter_line("Subjects", summary.certificate_subjects, 4), counter_line("Issuers", summary.certificate_issuers, 4),
+        ]))
+    rep.section("Indicators", st.kv([
+        counter_line("Threats", summary.threat_counts, 5), counter_line("Anomalies", summary.anomaly_counts, 5),
+    ]))
+    rep.section("Correlations", st.table(
+        ["Artifact / client / server", "Count"],
+        [[r, st.count(n)] for r, n in (summary.artifact_correlations or {}).items()] if not hasattr(summary.artifact_correlations, "most_common")
+        else [[r, st.count(n)] for r, n in summary.artifact_correlations.most_common()],
+        align="lr", max_rows=None,
+    ), detail=True)
+    rep.section("Certificate names", st.kv([counter_line("SANs", summary.certificate_sans, None)]), detail=True)
+    rep.section("Capture", st.kv([("Total packets", st.count(summary.total_packets))]), detail=True)
+    return rep.render()

@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 from .openvpn import is_openvpn_tcp_control, tcp_flow_id
 from .pcap_cache import PcapMeta, iter_packets
-from .utils import get_packet_ports, memoize_analysis, safe_float
+from .utils import dns_message, get_packet_ports, memoize_analysis, safe_float
 
 try:
     from scapy.layers.dhcp import BOOTP, DHCP
@@ -427,6 +427,35 @@ def _safe_dns_attr(dns_layer, attr: str, default=None):
         return default
 
 
+def _dns_section(dns_layer, section_attr: str, count_attr: str) -> list[object]:
+    """The records of one DNS section. scapy >= 2.6 holds them in a list;
+    before, the first record carried the rest as its payload chain (walked
+    for ``count_attr`` records). Reading a 2.6 list the old way -- attribute
+    access proxied to its first record, then ``.payload`` -- saw only the
+    first record of every section (and warned on each packet)."""
+    records = _safe_dns_attr(dns_layer, section_attr, None)
+    if records is None:
+        return []
+    if isinstance(records, (list, tuple)):
+        return list(records)
+    rows: list[object] = []
+    current = records
+    for _ in range(int(_safe_dns_attr(dns_layer, count_attr, 0) or 0)):
+        if current is None:
+            break
+        rows.append(current)
+        current = getattr(current, "payload", None)
+    return rows
+
+
+def _first_dns_question(dns_layer):
+    """The first question record (a list of them in scapy >= 2.6), or None."""
+    questions = _safe_dns_attr(dns_layer, "qd", None)
+    if isinstance(questions, (list, tuple)):
+        return questions[0] if questions else None
+    return questions
+
+
 def _iter_dns_rrs(dns_layer) -> list[tuple[object, str]]:
     rows: list[tuple[object, str]] = []
     for section_attr, count_attr in (
@@ -434,13 +463,7 @@ def _iter_dns_rrs(dns_layer) -> list[tuple[object, str]]:
         ("ns", "nscount"),
         ("ar", "arcount"),
     ):
-        current = _safe_dns_attr(dns_layer, section_attr, None)
-        rr_count = int(_safe_dns_attr(dns_layer, count_attr, 0) or 0)
-        for _ in range(rr_count):
-            if current is None:
-                break
-            rows.append((current, section_attr))
-            current = getattr(current, "payload", None)
+        rows.extend((record, section_attr) for record in _dns_section(dns_layer, section_attr, count_attr))
     return rows
 
 
@@ -2418,7 +2441,7 @@ def analyze_hostname(
             # for other packets.
             if DNS is not None and (udp_layer is not None or tcp_layer is not None):
                 try:
-                    dns_layer = pkt.getlayer(DNS)
+                    dns_layer = dns_message(pkt)  # DNS, or LLMNR (a separate scapy layer)
                 except Exception:
                     dns_layer = None
                 if dns_layer is not None:
@@ -2430,7 +2453,7 @@ def analyze_hostname(
                     else:
                         dns_protocol = "DNS"
 
-                    qd = _safe_dns_attr(dns_layer, "qd", None)
+                    qd = _first_dns_question(dns_layer)
                     qname = ""
                     qtype = 0
                     if qd is not None:

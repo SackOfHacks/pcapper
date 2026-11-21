@@ -13,6 +13,31 @@ Use `-summarize` (single dash) to aggregate selected analyses across all resolve
 - Summarize renders merged rollup output only (no per‑pcap sections).
 - Recursive directory traversal is enabled only with `-r/--recursive`.
 
+## DNS Queries
+
+`--dnsqueries` lists every DNS lookup in a capture with the response observed
+for it: the client, the server it asked (for LLMNR, the host that answered), the
+name and type, and what came back -- the answers, NXDOMAIN or another error,
+`no response`, or `(query not captured)` for a response whose query predates the
+capture. LLMNR and mDNS lookups use the DNS wire format and are included,
+labelled by protocol.
+
+- The default view lists each distinct lookup once, at its first sighting, with
+  how often it repeated (×N); `-v` lists every query in time order with its
+  packet number, transaction ID and round-trip time.
+- `-ip <IP>` lists only that host's lookups (as client or as server), like every
+  other step; `-summarize` merges captures and names each row's capture; `-vt`
+  adds a VirusTotal column; `--json` / `--csv` / `--sqlite` carry every record.
+- `--timeline` and `--hostdetails` no longer list DNS lookups: they say how many
+  there were and point here (a lookup VirusTotal flags stays on the timeline).
+- `PCAPPER_MAX_DNS_QUERY_RECORDS` (default 200000) caps the records kept per
+  capture; the rest are counted.
+
+```bash
+python -m pcapper capture.pcapng --dnsqueries -ip 10.0.0.5
+python -m pcapper ./captures/ -r --dnsqueries -summarize -v
+```
+
 ## Decryption
 
 Pcapper can drive a tshark-based TLS/SSH decryption workflow when key logs are available.
@@ -62,7 +87,27 @@ python -m pcapper capture.pcap --safety
 ## Capture Input
 
 - A target is a capture when its header says so (pcap, nanosecond pcap, modified pcap, pcapng); the extension is never consulted, so `cap_00001_20210318035345` is accepted. A directory scan names any `*.pcap` file without a capture header instead of dropping it.
+- A gzip-compressed capture (`.pcap.gz`, `.pcapng.gz`, or any gzip file holding a capture) is read decompressed, like any other capture; its report names, sizes and hashes the file as given (`Type : pcap (gzip)`). It cannot be cut into `--split` windows, and its packet count (for the memory budget) is estimated from its start.
 - Split captures (`X.pcap.part000.pcap`, `X.pcap.part001.pcap` ...) found together are analysed as one capture, streamed part by part: one timeline, one conversation table, titled `X.pcap [N parts joined]`, hashed over the parts in order. Suricata and `--decrypt` run per part. `--no-join-parts` analyses them one by one; a single part named on its own is always analysed alone.
+
+## Large Captures
+
+A capture larger than the in-memory budget is read from disk. Several things keep that fast without changing what any analysis reports:
+
+- **Lightweight records.** Every OT analyzer (the port- and EtherType-based ones, Modbus, DNP3, CIP, ENIP, GOOSE and R-GOOSE, SV, PTP, LLDP/PROFINET-DCP, IEC 101/103, synchrophasor, safety/TriStation, OPC Classic), the `--files` stream pass and auto-decode parse a few header bytes per packet instead of a full scapy dissection, and fall back to scapy for anything the header parser does not reproduce exactly. Ethernet, Linux cooked, raw-IP and BSD-loopback captures are parsed this way. `PCAPPER_RAW_READER=0` disables it.
+- **Prefilters.** Those analyzers skip packets they can never claim before parsing them; totals and time spans still count every packet. An analyzer covering several encodings (POWERLINK: EtherType, UDP and v1; PROFINET: PNIO-CM ports and the RT EtherType) analyses them all in one read.
+- **One read per run.** A run plans every analysis its steps start -- the steps' own and the ones they nest (the file analysis behind `--http`, QUIC and certificates behind `--tls`, the dozens behind `--threats` or `--overview`) -- with one dry run, and computes them all from one read of the capture: held in memory when it fits (a single step that nests others is kept in memory too), else in one shared pass from disk where they run concurrently. Analyses that combine others read their own packets first and combine afterwards, so they share that pass rather than adding one. The capture's SHA-256/SHA-1 come from the same read, and so do a pcapng's interface and section details (the summary's capture details). A single analysis streams the capture. From disk, the decode-as port detection reads up to the first 50,000 packets before the analyses run; the records are kept (up to `PCAPPER_PRIME_MAX_BYTES`, default 64 MiB) and the read that follows replays them and carries on where the detection stopped, so it adds no read. `PCAPPER_SHARED_PASS=0` disables shared passes, `PCAPPER_SHARED_PASS_DEBUG=1` prints every read and the analyses it fed.
+- **`--jobs N`** spreads those analyses over N processes (0 = one per CPU, 1 = a single process); the report is identical. A capture held in memory is shared with forked workers -- each starts once the analyses it needs are done and reads the packets and those results from shared memory, no read and no copy. From disk, workers read no file: the main process's own read copies every byte into a pipe per worker (buffered up to `PCAPPER_TEE_BUFFER_BYTES`, 64 MiB, per worker), and each parses the capture from there -- replaying the head the decode-as check kept, from the memory it inherits -- for the analyses that need no other, while the main process runs the rest at the same time, waiting for a worker's result rather than computing it again. A worker whose copy falls short of the file computes nothing from it. Without `--jobs`: when the run is worth it (packets × analyses 500,000+) one process per usable CPU, at most 8, never more than the plan has analyses; in memory no more than half the available memory allows (~6 KB per packet per worker); from disk only as many workers as keep pace with the main process (`--overview`: 3). A run that queries VirusTotal or geolocation stays in one process unless `--jobs` says otherwise: concurrent queries could meet a rate limit a single process does not.
+- **Suricata** (`--suricata`) is fed the capture through a FIFO, from the read the run makes anyway (or one made for it), and the capture's hash comes from that read: one read of the file for pcapper and Suricata together. A split capture's parts are scanned one Suricata run each, each fed its part (started as the read nears it); a gzip-compressed capture is fed inflated. `PCAPPER_SURICATA_FEED=0`, or a system without FIFOs (Windows), has Suricata read the file itself (a compressed one from an inflated copy). With a copy waiting, the run reads the capture before the steps, even for one analysis. Each alert's examples are its five earliest events, whatever order Suricata's threads wrote them in.
+- **`--decrypt`** lists the TLS/SSH streams with tshark fed the same way -- down its standard input where there are no FIFOs (`PCAPPER_TSHARK_FEED=0` has it read the file) -- then follows them all -- TLS and SSH together -- in one tshark run of its own (up to 200 streams per run) that stops at the last frame they need: at most two reads of the capture in all, whatever the number of streams.
+- **Filtered runs** (`--bpf`, `--time-start`/`--time-end`) read once too: tcpdump filters a copy of pcapper's read down its standard input (macOS: tcpdump reads the file), and every analysis, nested ones included, sees the filtered packets. `--split N` reads the capture twice: once to index the windows (equal packet counts need the total first; the capture's hashes come from that walk), once in the windows.
+- **Split and compressed captures** read once too: a split capture's hashes carry on from part to part through the run's read, and `--jobs` workers are copied every part (framed by its size) from it; a gzip-compressed capture is inflated by pcapper's own reader, so what wants it inflated (Suricata, tshark, a pcapng's details) takes it from the same read.
+- **`--split N`** cuts the capture into N contiguous windows (at record boundaries, equal packet counts) and analyses them in parallel, printing one report per window. Each report is exact for its window; conversations and detections spanning windows are seen in parts. Packet filters, exports, `-summarize`, `--correlate`, baselines and `--packet`/`--streams`/`--carve`/`--extract`/`--decrypt`/`--suricata` analyse the capture whole.
+- **Memory budget.** A capture is kept in memory when its estimated packet count fits `PCAPPER_CACHE_MAX_PACKETS` (default a quarter of available memory at ~6 KB per dissected packet, 100k–4M packets), in addition to the byte budget below.
+- **`--timeline` keeps each record's time** (8 bytes) for its first `PCAPPER_TIMELINE_TIMES_MAX` records (default 16,000,000) to date the file transfers it lists; transfers past them are dated from a scan of the record times.
+- **Notice.** Above `PCAPPER_LARGE_CAPTURE_PACKETS` (default 1,000,000) pcapper prints the estimated packet count, how long one full read takes on this machine, whether the capture stays in memory, and the options above.
+
+For one question about a huge capture, the fastest route is still a narrower input: a single protocol flag, or `editcap -A/-B` for a time window and `tcpdump -r IN -w OUT 'tcp port 502'` for one protocol.
 
 ## OT Protocols on Non-Standard Ports
 
@@ -263,6 +308,7 @@ python -m pcapper --help
 - `--decrypt-out DIR`
 - `--cache-mb MB`
 - `--ioc-file PATH`
+- `--jobs N` / `-j N`
 - `--json PATH`
 - `--list-plugins`
 - `--log-file PATH`
@@ -273,6 +319,7 @@ python -m pcapper --help
 - `--no-status`
 - `--packet N`
 - `--profile`
+- `--split N`
 - `--profile-out PATH`
 - `--rules PATH`
 - `--search STRING`
@@ -322,6 +369,7 @@ python -m pcapper --help
 - `--ctf`
 - `--dhcp`
 - `--dns`
+- `--dnsqueries`
 - `--domain`
 - `--email`
 - `--encrypted-dns`
@@ -400,6 +448,7 @@ Count: 78 flags
 - `--c1222`
 - `--cip`
 - `--coap`
+- `--codesys`
 - `--control-loop`
 - `--crimson`
 - `--csp`
@@ -424,7 +473,6 @@ Count: 78 flags
 - `--modicon`
 - `--mqtt`
 - `--niagara`
-- `--odesys`
 - `--opc`
 - `--ot-commands`
 - `--ot-commands-config`
@@ -520,17 +568,19 @@ mistaken for media).
 
 - For timeline mode, supply `-ip` with `--timeline`.
 - Use `-categories`/`--timeline-categories` with `--timeline` to filter event categories (comma-separated). Use `-categories false` or an empty value to print the supported list.
-- Timeline output always shows all events (independent of `-v`) and includes TCP SYN/SYN-ACK connection events with port visibility.
+- Timeline output keeps every event and includes TCP SYN/SYN-ACK connection events with port visibility. The default view shows each distinct event once at its first sighting (×N and the last time); `-v` lists every event in time order with exact timestamps and links between related events.
+- Every report is concise by default and complete with `-v`: the footer of the default view names the sections `-v` adds, and truncated tables say how many rows `-v` shows. Rankings of artifacts (domains, hosts, URLs, user agents, server names, fingerprints, commands, ports, protocols, conversations ...) show the top 10 and the bottom 10 -- the rarest, where the long tail of an investigation lives -- with a line saying how many sit between them. The scored "Analyst Verdict" of a report is a `-v` "Assessment" section; threat-hunt/forensics/CTF/OT highlights, immediate leads and the auto-run deep dives are part of `--overview` only.
 - Use `--timeline-bins` to control OT activity sparkline resolution and `--timeline-storyline-off` to disable the storyline block.
 - If your shell expands wildcards (for example `Un*`), pcapper now accepts the resulting multiple target arguments directly.
-- Use `--no-status` for cleaner output in logs/pipelines.
+- While captures are analysed, stderr shows one progress bar per capture (`[2/5] name.pcap ━━━━━━──── 62% 0:41`) and nothing else; it moves with each read pass and each finished analysis, weighted by cost, and disappears when the capture is done. `-v` shows the detail instead: each read pass's percentage, each analysis's spinner and start/finish timing, scapy's and Python's warnings, and the large-capture and auto decode-as notices — each on its own line. Errors are shown either way.
+- Use `--no-status` for cleaner output in logs/pipelines (no bar is drawn when stderr is not a terminal either).
 - `--ot-commands-config` accepts JSON/YAML with `write_markers` and `protocol_markers` overrides (YAML requires PyYAML).
 - Use `--ot-commands-sessions` to change the number of session rows in the OT commands block.
 - VirusTotal lookups require `VT_API_KEY` and `-vt`/`--vt`.
 - Set `PCAPPER_QUOTE` to override the banner quote, or `PCAPPER_QUOTE_SEED` for deterministic rotation.
 - Output ordering is deterministic by default; set `PCAPPER_DETERMINISTIC=0` to restore Python's default Counter tie ordering.
 - Use `--self-check` for a quick dependency and environment check, and `--list-plugins` to inspect loaded plugins.
-- Chained steps (e.g. `--ssh --tls --dns`) parse the capture once and share the packet list across all analyzers. Captures are held in memory when they fit the cache budget (default 256 MB total / 64 MB per file; chained runs raise the per-file limit to the total budget). For larger captures, raise the budget with `--cache-mb` (e.g. `--cache-mb 1024`) so multi-step runs avoid re-parsing the file per step — parsed packets occupy roughly 5–10x the file size in RAM. Env equivalents: `PCAPPER_CACHE_MAX_BYTES`, `PCAPPER_CACHE_FILE_MAX_BYTES`, `PCAPPER_CACHE_ENABLED=0`.
+- Chained steps (e.g. `--ssh --tls --dns`), and a single step that runs others (`--http` the file analysis, `--tls` QUIC and certificates, `--ips` host names), parse the capture once and share the packet list across all analyzers. Captures are held in memory when they fit the cache budget (default 256 MB total / 64 MB per file; chained runs raise the per-file limit to the total budget). For larger captures, raise the budget with `--cache-mb` (e.g. `--cache-mb 1024`) so multi-step runs avoid re-parsing the file per step — a dissected packet takes ~6 KB, 30–90x the file size for typical captures, and a capture is also held only when its estimated packets fit `PCAPPER_CACHE_MAX_PACKETS`. Captures that are not held are read in shared passes (see Large Captures). Env equivalents: `PCAPPER_CACHE_MAX_BYTES`, `PCAPPER_CACHE_FILE_MAX_BYTES`, `PCAPPER_CACHE_ENABLED=0`.
 - Analyzers invoked multiple times in one run (top-level step plus internal fan-out from `--threats`, `--overview`, `--hostdetails`, `--ips`, `--files`) are computed once and replayed from an in-memory result cache. Disable with `PCAPPER_ANALYSIS_MEMO=0`. The cached object is shared, not copied, on a replay (results are immutable by contract); set `PCAPPER_ANALYSIS_MEMO_COPY=1` to restore deep copies.
 - **Roles.** In every per-protocol view the *client* is the end that talks to the service port and the *server* is the end that holds it, regardless of which way a given packet travels. A service port on the source side only identifies the service when the destination is an ephemeral port (>= 1024), so a flow from ephemeral 389 to 443 is not LDAP.
 - **Windows.** `First Seen` / `Last Seen` / `Duration` in a per-protocol view span that protocol's packets, not the whole capture; the capture-wide window is in the base summary and `--health`. Per-second rates in a protocol view are computed over the protocol window.

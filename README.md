@@ -2,9 +2,9 @@
 
 ![Python](https://img.shields.io/badge/python-3.9%20%E2%80%93%203.13-0B7285)
 ![CI](https://github.com/SackOfHacks/pcapper/actions/workflows/ci.yml/badge.svg)
-![Tests](https://img.shields.io/badge/tests-584%20passing-1B5E20)
+![Tests](https://img.shields.io/badge/tests-1141%20passing-1B5E20)
 ![Analyzers](https://img.shields.io/badge/analyzers-120%2B-3D5A80)
-![Version](https://img.shields.io/badge/release-v2.9.0-7C3AED)
+![Version](https://img.shields.io/badge/release-v3.0.0-7C3AED)
 ![License](https://img.shields.io/badge/license-MIT-6C757D)
 ![CLI](https://img.shields.io/badge/cli-incident--grade-1B5E20)
 ![OT/ICS](https://img.shields.io/badge/ot%2Fics-ready-3D5A80)
@@ -49,9 +49,9 @@ And nothing internal leaves the box: reputation lookups (`-vt`, `--ip-geo`) only
 | You Need | Pcapper Delivers |
 | --- | --- |
 | Fast first-pass triage | One-pass summaries across hosts, services, protocols, and threats |
-| Forensic depth when needed | Deterministic checks, pivots, timelines, and risk matrices |
+| Forensic depth when needed | `-v` on any report: every row, exact timestamps, evidence behind each finding |
 | OT + IT in one workflow | Industrial protocol decoding plus enterprise threat-hunting views |
-| Output that can be actioned | Analyst verdicts and evidence lines built for investigations |
+| Output that can be actioned | Findings first, each with its flow, time, ATT&CK technique and the next command to run |
 
 ## Built for Real Incidents
 
@@ -62,7 +62,8 @@ And nothing internal leaves the box: reputation lookups (`-vt`, `--ip-geo`) only
 
 ## Product Highlights
 
-- **Analyst-grade reporting**: verdict, confidence, deterministic checks, risk matrix, pivots, and false-positive context.
+- **Concise by default, complete with `-v`**: every report leads with a severity headline and its findings, folds repeats, and says what `-v` adds. Rankings (domains, hosts, URLs, user agents, fingerprints, commands ...) show the top 10 and the bottom 10, the rarest. While it works, pcapper shows one progress bar per capture; `-v` shows the processing detail instead (read-pass percentages, per-analysis timing, library warnings).
+- **`--dnsqueries`**: every DNS / LLMNR / mDNS lookup with the response observed (answers, NXDOMAIN, no response), per host with `-ip`, across captures with `-summarize`.
 - **MITRE ATT&CK mapping**: enterprise + ICS TTP alignment with technique heat and host-centric attack paths.
 - **Suricata integration**: local IDS execution with structured metadata, event coverage, and pivots.
 - **Protocol depth**: broad IT plus OT/ICS protocol coverage for mixed-network environments.
@@ -110,7 +111,7 @@ flowchart LR
   A[PCAP / PCAPNG Input] --> B[Packet Decode + Stream Reassembly]
   B --> C[IT + OT/ICS Protocol Analyzers]
   C --> D[Detections + Correlation]
-  D --> E[Analyst Verdict + Deterministic Checks]
+  D --> E[Severity headline + findings first]
   E --> F[Reports + Exports]
 
   C --> C1[Enterprise: DNS/HTTP/TLS/SMB/LDAP/Kerberos]
@@ -141,27 +142,32 @@ flowchart LR
 
 ## Sample Analyst Report
 
+`pcapper 2017-11-02-Smoke-Loader-traffic.pcap --overview` (a public malware-traffic-analysis.net sample), the first sections:
+
 ```text
-ANALYST VERDICT
-LIKELY - MULTIPLE CORROBORATING RISK INDICATORS DETECTED (confidence: MEDIUM)
+OVERVIEW · 2017-11-02-Smoke-Loader-traffic.pcap
+════════════════════════════════════════════════════════════════════════════════
+  HIGH      active threat indicators: prioritize investigation now
+            IT/enterprise capture · 1,775 packets · 3m 59s · 13 hosts (2 internal, 11 public) · 2017-11-02T17:20:43Z → 17:24:42Z
+            why: 3 critical/high threat detections; 1 high-priority lead
 
-DETERMINISTIC CHECKS
-[!] Indicator quality gate: 3
-  - 203.0.113.44 quality=4 AbuseIPDB score=85 reports=12
-[!] Boundary cross-zone contact: 2
-  - 10.0.0.10->203.0.113.44 TCP packets=600
-[!] Intent heuristics: 2
-  - 10.0.0.10->203.0.113.44 admin ports observed 445,3389
+Critical/high detections ───────────────────────────────────────────────────────
+  • Malware: Executable payload downloaded
+  • Obfuscation: Encoded payload content matches attack tradecraft patterns
+  • Obfuscation: IOCs recovered from encoded payloads
 
-RISK MATRIX
-Category                   Risk   Confidence   Evidence
-Indicator Quality          High   High         3
-Boundary Exposure          Medium Medium       2
-Critical Asset Contact     High   High         1
+Immediate leads ────────────────────────────────────────────────────────────────
+  1. HIGH     threat-correlation  Critical/high detections observed (3)
+              evidence: Detections: 10 (critical/high: 3).
+              next: pcapper <capture> --threats -v   (then --threats --mitre to map ATT&CK)
+              check: Triage the underlying detections in --threats; verify before escalating.
 
-TOP HUNT PIVOTS
-- flow=10.0.0.10->203.0.113.44 proto=TCP packets=600 bytes=2.9 MB
-  reasons=Lateral movement posture score; Cross-zone outbound contact
+Deep dives (auto-run) ──────────────────────────────────────────────────────────
+  MODULE   RESULT                           TOP FINDING
+  threats  10 detections · 3 critical/high  -
+  scan     nothing found                    -
+  ctf      nothing found                    -
+  files    3 detections · 2 artifacts       File artifacts=2 across protocols: HTTP(2).
 ```
 
 The goal is actionable signal, not noisy packet dumps.
@@ -171,7 +177,7 @@ The goal is actionable signal, not noisy packet dumps.
 | Traditional PCAP Workflow | With Pcapper |
 | --- | --- |
 | Manually pivot protocol by protocol | Single command gives cross-protocol triage |
-| Raw packet dumps with limited context | Deterministic checks + verdict + confidence |
+| Raw packet dumps with limited context | Severity-ranked findings with their evidence |
 | Ad-hoc analyst notes for evidence | Built-in pivots and evidence-rich summaries |
 | Separate OT and IT tooling chains | Unified OT/ICS + enterprise workflow |
 | Time-consuming report assembly | Case-ready exports (JSON/CSV/SQLite + metadata) |
@@ -200,6 +206,19 @@ Promotional highlights:
 - Phone-over-IP forensics (`--voip`): SIP/SDP, Skinny, MGCP, MEGACO, IAX2 and H.323 signalling; RTP/RTCP/SRTP and T.38 fax media; DTMF keypad digits; recovered credentials; and G.711 call audio to WAV.
 - OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
 - Evidence-first reporting that surfaces context, not just counts.
+
+## What's New in v3.0.0 ⚡
+
+Built for captures too large to keep in memory, which used to be read, and every packet dissected, once per analyzer (`--threats` made 96 full passes). The large-capture changes give the same report as 2.9.0, checked byte for byte on 200 captures.
+
+- **Reports redesigned:** every report is short by default and complete with `-v` (checked token by token against the old `-v` output): a severity headline, findings first with their flow, time and ATT&CK technique, aligned tables that say what `-v` adds, repeats folded. Highlights, leads and auto-run deep dives appear in `--overview` only, each line once. Reading every report against real captures also fixed false positives in `--scan` (DNS servers as scanners, nmap's top-1000 as ICS recon), OT port coincidences (Modbus replies counted as EtherNet/IP, CIP, KNX, ROC Plus or DLMS), OpenVPN mislabels and IT-only "OT risk" scores, and added detections that were missing: DCSync whose bind is not in the capture, IS-IS over 802.3/LLC, reverse VNC backconnects with their UltraVNC repeater ID, and Schneider UMAS program reads. `-summarize` now merges every analyzer into its own report, and `--correlate` / baselines compare hosts as well as services. While it works, pcapper shows one progress bar per capture and nothing else; `-v` shows the processing detail (pass percentages, per-analysis timing, library warnings).
+- **Read once:** whatever the flags, a run reads the capture once -- held in memory when it fits, else in one shared pass from disk -- and computes every analysis of every step from that read (`--http --dns`, `--overview`, `--threats`, `--timeline -ip` ...), its hashes and a pcapng's interface details included, split and gzip-compressed captures too; Suricata reads a copy of it, and `--decrypt` reads the capture at most twice whatever the number of streams. `--threats` from disk: 359 s → 47 s on a 20k-packet slice.
+- **`--jobs N`** spreads those analyses over N processes with an identical report, still reading the capture once: in memory the processes share its packets, from disk the main process's read is copied to them through pipes. By default it picks one per usable CPU (at most 8) when the run is big enough to gain: `--overview` of a 20k-packet capture 34 s → 14 s in memory, 56 s → 23 s from disk.
+- **`--split N`** reports N windows of a capture in parallel: what `editcap -c` plus one run per part gives.
+- **Lightweight packets and prefiltered reads:** the OT analyzers read records without full scapy dissection and skip packets they can never claim.
+- **Large-capture notice:** above ~1M packets pcapper says how many packets the capture holds, how long one full read takes on this machine, and what makes it faster.
+- **Gzip-compressed captures** (`.pcap.gz`, `.pcapng.gz`) are read directly.
+- **`--files`** extracts large HTTP downloads it used to miss, pairs filenames with the right responses, and flags known malware filenames and internal executable staging.
 
 ## What's New in v2.9.0 🏭
 
@@ -418,6 +437,15 @@ python -m pcapper "~/Downloads/pcaps/Un*" -summarize --ips
 python -m pcapper one.pcap two.pcapng ~/Downloads/pcaps/ -summarize --timeline -ip 10.182.207.28
 ```
 
+Large captures (millions of packets) are read from disk with lightweight packet parsing in one shared pass, and pcapper says up front how long one full read takes on your machine. The analyses of a multi-flag or fan-out run go to one process per CPU (at most 8; `--jobs N` to choose) with an identical report; `--split N` reports N windows of the capture in parallel:
+
+```bash
+python -m pcapper big_ot_day.pcapng --ot-commands --modbus --dnp3
+python -m pcapper big_ot_day.pcapng --threats --split 16
+```
+
+See [Large Captures](docs/reference.md#large-captures) for how each works.
+
 ## Quick Demo
 
 ```text
@@ -451,7 +479,7 @@ Client                   Server                   Start                     End 
 
 Secrets/credentials are displayed in reports by default.
 Exports (JSON/CSV/SQLite) include full values by default.
-Use `-v/--verbose` to include additional evidence lines in summaries (for example file artifacts, LDAP anomalies, and OT/ICS command details).
+Use `-v/--verbose` to include additional evidence lines in summaries (for example file artifacts, LDAP anomalies, and OT/ICS command details), and to see the processing detail on stderr (read-pass percentages, per-analysis start/finish timing, scapy and Python warnings, large-capture and decode-as notices) in place of the progress bar.
 
 ## Documentation
 

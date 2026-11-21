@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-
-from .utils import is_public_ip as _is_public_ip
 import base64
 import binascii
 import re
@@ -12,7 +10,8 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import PcapMeta, iter_packets
-from .utils import dns_questions, extract_packet_endpoints, memoize_analysis, safe_float
+from .utils import dns_questions, extract_packet_endpoints, fan_out, memoize_analysis, safe_float
+from .utils import is_public_ip as _is_public_ip
 
 try:
     from scapy.layers.dns import DNS, DNSQR, DNSRR  # type: ignore
@@ -124,6 +123,10 @@ def _extract_payload(pkt) -> bytes:
     return b""
 
 
+# ``key=value`` with a real value (not just base64 ``=`` padding).
+_PARAM_VALUE_RE = re.compile(r"^[A-Za-z0-9_.\[\]-]{1,40}=([^=].*)$")
+
+
 def _iter_decode_candidates(token: str, max_depth: int = 3) -> list[tuple[str, str]]:
     queue: list[tuple[str, str, int]] = [(token, "raw", 0)]
     seen: set[str] = {token}
@@ -134,6 +137,13 @@ def _iter_decode_candidates(token: str, max_depth: int = 3) -> list[tuple[str, s
         out.append((value, chain))
         if depth >= max_depth:
             continue
+
+        # A ``key=value`` token (query string, form body, cookie): decode the
+        # value on its own -- ``d=<base64>`` never decodes as one string.
+        param = _PARAM_VALUE_RE.match(value)
+        if param and param.group(1) not in seen:
+            seen.add(param.group(1))
+            queue.append((param.group(1), f"{chain}->param", depth + 1))
 
         # URL decode
         try:
@@ -244,6 +254,7 @@ def _proto_label(pkt) -> str:
     return "OTHER"
 
 
+@fan_out
 @memoize_analysis
 def analyze_ctf(
     path: Path,

@@ -1,41 +1,29 @@
-"""Rendered output for rules analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for --rules: which user rules matched, how often, from
+which sources, with example matches (all examples with -v)."""
 
 from __future__ import annotations
-from ..coloring import (
-    header,
-    muted,
-)
 
-from ._common import (
-    _finalize_output,
-    _format_kv,
-    _format_table,
-    _limit_value,
-)
+from . import _style as st
 
 
 def render_rules_summary(summary) -> str:
     if not summary:
         return ""
-    lines = [header("RULES ANALYSIS")]
-    lines.append(_format_kv("Rules Loaded", str(summary.total_rules)))
-    lines.append(_format_kv("Matches", str(summary.total_matches)))
+    rep = st.Report("Rules", summary.path)
+    hits = sorted(summary.hits or [], key=lambda h: (-st.sev_rank(h.severity), -h.count, h.title))
+    severity = next((h.severity for h in hits), None)
+    rep.headline(severity, f"{st.plural(summary.total_matches, 'match', 'matches')} from {st.plural(len(hits), 'rule')}"
+                 if hits else "no rule matched", f"{st.plural(summary.total_rules, 'rule')} loaded")
     if summary.errors:
-        lines.append(_format_kv("Errors", "; ".join(summary.errors)))
-    if summary.hits:
-        lines.append(header("Rule Hits"))
-        rows = [["Rule", "Severity", "Count", "Sources"]]
-        for hit in summary.hits[: _limit_value(10)]:
-            sources = ", ".join(hit.sources) if hit.sources else "-"
-            rows.append([hit.title, hit.severity.upper(), str(hit.count), sources])
-        lines.append(_format_table(rows))
-        for hit in summary.hits[: _limit_value(5)]:
-            if hit.examples:
-                lines.append(muted(f"{hit.title} examples:"))
-                for example in hit.examples[: _limit_value(3)]:
-                    lines.append(muted(f"  {example}"))
-    return _finalize_output(lines)
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Matches", st.table(
+        ["Severity", "Rule", "Matches", "Sources"],
+        [[st.badge(h.severity), h.title, st.count(h.count), ", ".join(h.sources) if h.sources else "-"] for h in hits],
+        align="llrl", widths=(None, 60, None, 60), max_rows=15, noun="rule",
+    ))
+    rep.section("Examples", st.table(
+        ["Rule", "Example"],
+        [[h.title, example] for h in (hits if st.verbose() else hits[:5]) for example in (h.examples or [])[: None if st.verbose() else 1]],
+        widths=(None, 120), max_rows=None,
+    ))
+    return rep.render()

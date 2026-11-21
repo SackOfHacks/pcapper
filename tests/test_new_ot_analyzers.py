@@ -218,6 +218,6 @@ def test_flag_and_overview_wiring(tmp_path, monkeypatch, capfd) -> None:
     _udp(capture, [(False, _roc(17, b"OP1\x12\x34\x01")), (True, _roc(17, b""))] * 2, dport=4000)
     monkeypatch.setattr(sys, "argv", ["pcapper", str(capture), "--rocplus"])
     assert cli.main() == 0
-    assert "ROC PLUS ANALYSIS" in capfd.readouterr().out
+    assert "ROC PLUS · roc.pcap" in capfd.readouterr().out
     overview = analyze_overview(capture, show_status=False)
     assert "rocplus" in overview.modules_run
