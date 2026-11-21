@@ -240,7 +240,7 @@ CBC_CIPHERS = {
 ETM_MAC_SUFFIX = "-etm@openssh.com"
 
 FILE_NAME_RE = re.compile(
-    r"[\w\-.()\[\]/ ]+\.(?:exe|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|tar|gz|tgz|txt|csv|log|ps1|sh|bat|py|js|jar|apk|iso|img)",
+    r"[\w\-.()\[\]/](?:[\w\-.()\[\]/]| (?! ))*\.(?:exe|dll|pdf|doc|docx|xls|xlsx|ppt|pptx|zip|rar|7z|tar|gz|tgz|txt|csv|log|ps1|sh|bat|py|js|jar|apk|iso|img)\b",
     re.IGNORECASE,
 )
 

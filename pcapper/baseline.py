@@ -9,7 +9,7 @@ from typing import Iterable
 from .hosts import HostSummary, merge_hosts_summaries
 from .ot_commands import OtCommandSummary
 from .services import ServiceSummary, merge_services_summaries
-from .utils import safe_read_text
+from .utils import is_unicast_host_ip, safe_read_text
 
 
 @dataclass(frozen=True)
@@ -154,6 +154,8 @@ def build_baseline(
 
     if host_summary and host_summary.hosts:
         for host in host_summary.hosts:
+            if not is_unicast_host_ip(str(getattr(host, "ip", "") or "")):
+                continue  # multicast / broadcast: not a host to baseline
             ports = []
             for port in getattr(host, "open_ports", []) or []:
                 ports.append(
@@ -174,7 +176,7 @@ def build_baseline(
                 }
             )
     else:
-        notes.append("Host inventory unavailable in current CLI mode.")
+        notes.append("Host inventory unavailable: the host analysis did not run or failed for this baseline.")
 
     if service_summary and service_summary.assets:
         for asset in service_summary.assets:
@@ -264,14 +266,24 @@ def compare_baseline(
         if removed_macs:
             changes["missing_macs"] = removed_macs
 
-        curr_ports = {_port_key(p) for p in (curr.get("open_ports", []) or [])}
-        base_ports = {_port_key(p) for p in (base.get("open_ports", []) or [])}
-        added_ports = sorted(curr_ports - base_ports)
-        removed_ports = sorted(base_ports - curr_ports)
+        # A port is its number and protocol: a changed service name or
+        # banner on the same port is a change to it, not one port closing
+        # and another opening.
+        curr_ports = {key[:2]: key for key in sorted(_port_key(p) for p in (curr.get("open_ports", []) or []))}
+        base_ports = {key[:2]: key for key in sorted(_port_key(p) for p in (base.get("open_ports", []) or []))}
+        added_ports = [curr_ports[k] for k in sorted(curr_ports.keys() - base_ports.keys())]
+        removed_ports = [base_ports[k] for k in sorted(base_ports.keys() - curr_ports.keys())]
+        relabelled = [
+            {"port": k[0], "protocol": k[1], "from": list(base_ports[k][2:]), "to": list(curr_ports[k][2:])}
+            for k in sorted(curr_ports.keys() & base_ports.keys())
+            if curr_ports[k] != base_ports[k]
+        ]
         if added_ports:
             changes["new_ports"] = added_ports
         if removed_ports:
             changes["missing_ports"] = removed_ports
+        if relabelled:
+            changes["port_changes"] = relabelled
 
         base_os = str(base.get("os", "") or "")
         curr_os = str(curr.get("os", "") or "")

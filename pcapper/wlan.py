@@ -458,6 +458,9 @@ def analyze_wlan(
     deauth_by_src: Counter[str] = Counter()
     disassoc_by_src: Counter[str] = Counter()
     eapol_pair_counts: Counter[tuple[str, str]] = Counter()
+    # The pair is sorted so both directions of a 4-way handshake count
+    # together; which side is the access point is kept here.
+    eapol_pair_roles: dict[tuple[str, str], tuple[str, str]] = {}
     wep_iv_counts: dict[str, Counter[str]] = defaultdict(Counter)
     wep_keyid_counts: Counter[str] = Counter()
     ssid_bssids: dict[str, set[str]] = defaultdict(set)
@@ -616,6 +619,7 @@ def analyze_wlan(
                 if bssid and station:
                     pair = tuple(sorted([bssid, station]))
                     eapol_pair_counts[pair] += 1
+                    eapol_pair_roles.setdefault(pair, (bssid, station))
                     state = network_state.setdefault(
                         bssid,
                         {
@@ -992,8 +996,9 @@ def analyze_wlan(
             checks["possible_handshake_capture"].append(
                 f"{pair[0]}<->{pair[1]} eapol_frames={count}"
             )
+            bssid_mac, station_mac = eapol_pair_roles.get(pair, pair)
             checks["wpa_handshake_observed"].append(
-                f"bssid={pair[0]} station={pair[1]} eapol_frames={count}"
+                f"bssid={bssid_mac} station={station_mac} eapol_frames={count}"
             )
 
     for ssid, bssids in ssid_bssids.items():
@@ -1082,10 +1087,11 @@ def analyze_wlan(
     ):
         if count < 2:
             continue
+        bssid_mac, station_mac = eapol_pair_roles.get(pair, pair)
         wpa_handshakes.append(
             {
-                "bssid": pair[0],
-                "station": pair[1],
+                "bssid": bssid_mac,
+                "station": station_mac,
                 "eapol_frames": int(count),
             }
         )

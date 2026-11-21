@@ -1,79 +1,58 @@
-"""Rendered output for lldp_dcp analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for LLDP and PROFINET DCP (layer-2 discovery): which
+devices announced themselves, and who enumerated or renamed them."""
 
 from __future__ import annotations
-from collections import Counter
-from ..coloring import (
-    danger,
-    header,
-    muted,
-    warn,
-)
-from ..lldp_dcp import LldpDcpSummary
 
-from ._common import (
-    _filtered_detections,
-    _finalize_output,
-    _format_counter,
-    _format_kv,
-    _limit_value,
-    _render_protocol_verdict,
-    _truncate_text,
-)
+from collections import Counter
+
+from ..lldp_dcp import LldpDcpSummary
+from . import _style as st
+from ._kv import counter_line, findings_for, window
 
 
 def render_lldp_dcp_summary(summary: LldpDcpSummary, verbose: bool = False) -> str:
-    lines = [header("LLDP/DCP ANALYSIS")]
-    _render_protocol_verdict(
-        lines,
-        label="LLDP/DCP",
-        detections=getattr(summary, "detections", None),
-        anomalies=getattr(summary, "anomalies", None),
+    rep = st.Report("LLDP/DCP", summary.path)
+    findings = findings_for(summary)
+    if not summary.lldp_packets and not summary.dcp_packets and not st.material(findings):
+        return rep.absent("LLDP or PROFINET DCP traffic", summary.errors)
+    severity, text = st.verdict(
+        findings,
+        high="high-severity discovery activity (e.g. DCP Set): confirm the change is authorized",
+        medium="discovery activity to review",
     )
-    lines.append(_format_kv("LLDP Packets", str(summary.lldp_packets)))
-    lines.append(_format_kv("DCP Packets", str(summary.dcp_packets)))
-    lines.append(_format_kv("System Names", _format_counter(summary.system_names, 5)))
-    lines.append(_format_kv("Chassis IDs", _format_counter(summary.chassis_ids, 5)))
-    lines.append(_format_kv("Port IDs", _format_counter(summary.port_ids, 5)))
-    lines.append(_format_kv("DCP Frame IDs", _format_counter(summary.dcp_frame_ids, 5)))
-    if getattr(summary, "dcp_services", None):
-        lines.append(
-            _format_kv("DCP Services", _format_counter(summary.dcp_services, 5))
-        )
-    if getattr(summary, "dcp_device_names", None):
-        lines.append(
-            _format_kv("DCP Device Names", _format_counter(summary.dcp_device_names, 5))
-        )
-    if getattr(summary, "dcp_ips", None):
-        lines.append(_format_kv("DCP IPs", _format_counter(summary.dcp_ips, 5)))
-    if getattr(summary, "artifacts", None):
-        device_counts = Counter(
-            str(getattr(item, "detail", ""))
-            for item in summary.artifacts
-            if str(getattr(item, "kind", "")) == "device"
-        )
-        if device_counts:
-            preview = ", ".join(
-                f"{_truncate_text(detail, 60)}({count})"
-                for detail, count in device_counts.most_common(5)
-            )
-            lines.append(_format_kv("Device Fingerprints", preview))
+    rep.headline(severity, text, st.join([
+        f"{st.count(summary.lldp_packets)} LLDP",
+        f"{st.count(summary.dcp_packets)} DCP packets",
+        st.duration(summary.duration_seconds) if summary.duration_seconds else "",
+        window(summary),
+    ]))
+    rep.scope(st.join([
+        st.plural(len(summary.system_names or {}), "LLDP system") if summary.system_names else "",
+        st.plural(len(summary.dcp_device_names or {}), "DCP device name") if summary.dcp_device_names else "",
+    ]))
     if summary.errors:
-        lines.append(_format_kv("Errors", "; ".join(summary.errors)))
-    detections = _filtered_detections(summary, verbose)
-    if detections:
-        lines.append(header("Detections"))
-        for item in detections[: _limit_value(6)]:
-            sev = str(item.get("severity", "info")).upper()
-            summary_text = str(item.get("summary", ""))
-            details = str(item.get("details", ""))
-            sev_color = danger if sev in {"CRITICAL", "HIGH"} else warn
-            if sev in {"INFO", "LOW"}:
-                sev_color = muted
-            lines.append(sev_color(f"[{sev}] {summary_text}"))
-            if details:
-                lines.append(muted(f"  {details}"))
-    return _finalize_output(lines)
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Findings", st.findings_block(findings))
+    fingerprints = Counter(
+        str(getattr(a, "detail", "")) for a in (summary.artifacts or []) if str(getattr(a, "kind", "")) == "device"
+    )
+    rep.section("Devices", st.kv([
+        counter_line("LLDP system names", summary.system_names),
+        counter_line("DCP device names", summary.dcp_device_names),
+        counter_line("DCP IPs", summary.dcp_ips),
+        ("Fingerprints", st.top(fingerprints, 5, lambda k, v: f"{st.cut(k, 60)} ({st.count(v)})") if fingerprints else ""),
+    ]))
+    rep.section("DCP", st.kv([counter_line("Services", summary.dcp_services)]))
+    other = [a for a in (summary.artifacts or []) if str(getattr(a, "kind", "")) != "device"]
+    rep.section("Identifiers", st.kv([
+        counter_line("Chassis IDs", summary.chassis_ids),
+        counter_line("Port IDs", summary.port_ids),
+        counter_line("DCP frame IDs", summary.dcp_frame_ids),
+        ("Total packets", st.count(summary.total_packets)),
+    ]), detail=True)
+    rep.section("Artifacts", st.table(
+        ["Kind", "Detail", "Flow"],
+        [[a.kind, a.detail, st.flow(a.src, a.dst)] for a in other],
+        max_rows=None,
+    ), detail=True)
+    return rep.render()

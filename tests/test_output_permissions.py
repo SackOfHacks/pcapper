@@ -13,6 +13,7 @@ asserting something the platform does not implement.
 
 from __future__ import annotations
 
+import contextlib
 import sqlite3
 import stat
 from pathlib import Path
@@ -102,7 +103,8 @@ class TestWritePaths:
         export_sqlite(_bundle(), target)
         assert _mode(target) == 0o600
         # And it is still a usable database.
-        with sqlite3.connect(str(target)) as conn:
+        # A connection's context manager commits; closing it is separate.
+        with contextlib.closing(sqlite3.connect(str(target))) as conn:
             names = {
                 row[0]
                 for row in conn.execute(

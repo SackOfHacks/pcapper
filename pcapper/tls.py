@@ -1590,6 +1590,22 @@ def analyze_tls(
     expired_cert_endpoints: Counter[str] = Counter()
     self_signed_endpoints: Counter[str] = Counter()
     now_dt = datetime.now(timezone.utc)
+    # Expiry is judged when the certificate was presented: the first packet
+    # of the server's flow to that client, else the capture's own window --
+    # never the analysis date (a 2017 incident's certificate that lapsed in
+    # 2018 was valid evidence then).
+    flow_first_seen: dict[tuple[str, str], float] = {}
+    for row in conversation_rows:
+        if row.first_seen is not None:
+            key = (str(row.server_ip), str(row.client_ip))
+            flow_first_seen[key] = min(flow_first_seen.get(key, row.first_seen), row.first_seen)
+
+    def _presented_at(cert: object) -> datetime:
+        ts = flow_first_seen.get((str(getattr(cert, "src_ip", "")), str(getattr(cert, "dst_ip", ""))))
+        if ts is None:
+            ts = last_seen if last_seen is not None else None
+        return datetime.fromtimestamp(ts, timezone.utc) if ts else now_dt
+
     for cert in filtered_cert_artifacts:
         marker = _cert_endpoint_marker(cert)
         if is_weak_pubkey(str(cert.pubkey_type or ""), int(cert.pubkey_size or 0)):
@@ -1597,7 +1613,7 @@ def analyze_tls(
         if str(cert.subject or "").strip() and str(cert.subject) == str(cert.issuer):
             self_signed_endpoints[marker] += 1
         end_dt = _parse_iso_ts(cert.not_after)
-        if end_dt is not None and end_dt < now_dt:
+        if end_dt is not None and end_dt < _presented_at(cert):
             expired_cert_endpoints[marker] += 1
     weak_certs = sum(weak_cert_endpoints.values())
     expired_certs = sum(expired_cert_endpoints.values())

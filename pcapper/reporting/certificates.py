@@ -5,339 +5,139 @@ verbatim, only its location changed.
 """
 
 from __future__ import annotations
-from ..certificates import CertificateSummary
-from ..coloring import (
-    danger,
-    header,
-    label,
-    muted,
-    ok,
-    warn,
-)
 
+from ..certificates import CertificateSummary
+from . import _style as st
 from ._common import (
-    SECTION_BAR,
-    SUBSECTION_BAR,
-    _counter_table,
-    _finalize_output,
-    _format_kv,
-    _format_table,
-    _limit_value,
     _redact_in_text,
-    _truncate_text,
 )
+from ._kv import counter_line
+
+# Each analyzer issue list as a finding: (field, title, severity).
+_ISSUES = [
+    ("issuer_impersonation", "Issuer/SAN impersonation", "high"),
+    ("weak_keys", "Weak certificate key", "medium"),
+    ("weak_signatures", "Weak signature algorithm", "medium"),
+    ("expired", "Expired or invalid certificate", "medium"),
+    ("name_mismatches", "Name/SAN mismatch", "medium"),
+    ("self_signed", "Self-signed certificate", "low"),
+    ("eku_mismatches", "EKU mismatch", "low"),
+    ("key_usage_issues", "KeyUsage issue", "low"),
+    ("validity_outliers", "Validity outlier", "low"),
+    ("fingerprint_reuse", "Certificate fingerprint reused across contexts", "low"),
+    ("serial_reuse", "Certificate serial reused across contexts", "low"),
+    ("chain_gaps", "Chain/trust gap", "info"),
+    ("revocation_gaps", "Revocation posture gap", "info"),
+]
+
+
+def _detail(item: object) -> str:
+    if not isinstance(item, dict):
+        return str(item)
+    if "subject" in item and "reason" in item:
+        return f"{item.get('subject')}: {item.get('reason')}"
+    if "sha256" in item and "count" in item:
+        return f"sha256={item.get('sha256')} in {item.get('count')} contexts"
+    if "serial" in item and "count" in item:
+        return f"serial={item.get('serial')} in {item.get('count')} contexts"
+    if "subject" in item:
+        extra = {k: v for k, v in item.items() if k not in ("subject", "src", "dst")}
+        return str(item.get("subject")) + (" (" + ", ".join(f"{k}={v}" for k, v in extra.items()) + ")" if extra else "")
+    return ", ".join(f"{k}={v}" for k, v in item.items() if k not in ("src", "dst"))
+
+
+def _assessment(summary: CertificateSummary) -> tuple[str, str, int, list[str]]:
+    score = 0
+    reasons: list[str] = []
+    known_bad = list(getattr(summary, "known_bad_certs", []) or [])
+    if known_bad:
+        score += 8
+        reasons.append("known-malicious certificate present (" + ", ".join(sorted({str(i.get("label", "known-bad")) for i in known_bad})) + ")")
+    for hit, weight, text in (
+        (summary.weak_keys, min(2, len(summary.weak_keys)), f"weak-key certificates ({len(summary.weak_keys)})"),
+        (summary.weak_signatures, min(2, len(summary.weak_signatures)), f"weak signature algorithms ({len(summary.weak_signatures)})"),
+        (summary.expired, 1, f"expired/invalid certificates ({len(summary.expired)})"),
+        (summary.eku_mismatches or summary.key_usage_issues, 1, "EKU/KeyUsage mismatches"),
+        (summary.name_mismatches, 1, f"name/SAN mismatches ({len(summary.name_mismatches)})"),
+        (summary.issuer_impersonation, 2, f"issuer/SAN impersonation signals ({len(summary.issuer_impersonation)})"),
+        (summary.fingerprint_reuse or summary.serial_reuse, 1, "fingerprint/serial reuse across contexts"),
+    ):
+        if hit:
+            score += weight
+            reasons.append(text)
+    if score >= 7:
+        return "YES - high-confidence certificate risks or interception indicators", "High", score, reasons
+    if score >= 4:
+        return "LIKELY - significant certificate anomalies to investigate", "Medium", score, reasons
+    if score >= 2:
+        return "POSSIBLE - certificate anomalies; corroboration recommended", "Low", score, reasons
+    return "NO STRONG SIGNAL from the current heuristics", "Low", score, reasons
 
 
 def render_certificates_summary(summary: CertificateSummary) -> str:
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"TLS CERTIFICATES :: {summary.path.name}"))
-    lines.append(SECTION_BAR)
-
+    """Certificates carried in TLS (and OpenVPN): known-malicious matches and
+    certificate problems as findings, then every certificate with its
+    subject, issuer, validity, key, flags and the flow that carried it;
+    subjects/issuers/SANs counters, endpoint profiles and the timeline are -v."""
+    rep = st.Report("Certificates", summary.path)
+    findings = [st.finding({"severity": "critical", "title": f"Known-malicious certificate: {i.get('label', 'IOC match')}",
+                            "details": f"serial={i.get('serial', '-')} sha256={i.get('sha256', '-')}", "src": i.get("src"),
+                            "dst": i.get("dst")}) for i in (getattr(summary, "known_bad_certs", None) or [])]
+    for field, title, severity in _ISSUES:
+        for item in getattr(summary, field, None) or []:
+            src = item.get("src") if isinstance(item, dict) else None
+            dst = item.get("dst") if isinstance(item, dict) else None
+            findings.append(st.finding({"severity": severity, "title": title, "details": _redact_in_text(_detail(item)),
+                                        "src": src, "dst": dst}))
+    if not summary.cert_count and not st.material(findings):
+        return rep.absent("TLS certificates", summary.errors)
+    severity, text = st.verdict(findings, high="malicious or abused certificates: investigate", medium="certificate problems to review")
+    rep.headline(severity, text, st.join([st.plural(summary.cert_count, "certificate"), f"{st.count(summary.tls_packets)} TLS packets"]))
     if summary.errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        for err in summary.errors:
-            lines.append(danger(f"- {err}"))
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Findings", st.findings_block(findings))
 
-    lines.append(_format_kv("TLS Packets", str(summary.tls_packets)))
-    lines.append(_format_kv("Certificates", str(summary.cert_count)))
+    flag_sets = {field: {(i.get("subject"), i.get("src"), i.get("dst")) for i in (getattr(summary, field, None) or [])
+                         if isinstance(i, dict)} for field in ("self_signed", "expired", "weak_keys")}
 
-    known_bad = list(getattr(summary, "known_bad_certs", []) or [])
-    if known_bad:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Known-Malicious Certificate IOC Match"))
-        for item in known_bad[:10]:
-            lines.append(
-                danger(
-                    f"[CRITICAL] {item.get('label', 'known-bad certificate')} — "
-                    f"{item.get('src', '?')} -> {item.get('dst', '?')}"
-                )
-            )
-            lines.append(
-                muted(
-                    f"  serial={item.get('serial', '-')} "
-                    f"sha256={item.get('sha256', '-')}"
-                )
-            )
+    def _flags(c: object) -> str:
+        key = (c.subject, c.src_ip, c.dst_ip)
+        flags = [label for field, label in (("self_signed", "self-signed"), ("expired", "expired"), ("weak_keys", "weak key"))
+                 if key in flag_sets[field]]
+        if getattr(c, "is_ca", False):
+            flags.append("CA")
+        return st.caution(", ".join(flags)) if flags else ""
 
-    def _cert_verdict() -> tuple[str, str, list[str], int]:
-        score = 0
-        reasons: list[str] = []
-        known_bad = list(getattr(summary, "known_bad_certs", []) or [])
-        if known_bad:
-            score += 8  # a default C2-framework cert is a definitive IOC
-            labels = ", ".join(
-                sorted({str(item.get("label", "known-bad cert")) for item in known_bad})
-            )
-            reasons.append(f"Known-malicious certificate present ({labels})")
-        if summary.weak_keys:
-            score += min(2, len(summary.weak_keys))
-            reasons.append(f"Weak key certificates detected ({len(summary.weak_keys)})")
-        if summary.weak_signatures:
-            score += min(2, len(summary.weak_signatures))
-            reasons.append(
-                f"Weak signature algorithms detected ({len(summary.weak_signatures)})"
-            )
-        if summary.expired:
-            score += 1
-            reasons.append(
-                f"Expired/invalid certificates detected ({len(summary.expired)})"
-            )
-        if summary.eku_mismatches or summary.key_usage_issues:
-            score += 1
-            reasons.append("EKU/KeyUsage mismatches observed")
-        if summary.name_mismatches:
-            score += 1
-            reasons.append(
-                f"Name/SAN mismatches observed ({len(summary.name_mismatches)})"
-            )
-        if summary.issuer_impersonation:
-            score += 2
-            reasons.append(
-                f"Issuer/SAN impersonation signals observed ({len(summary.issuer_impersonation)})"
-            )
-        if summary.fingerprint_reuse or summary.serial_reuse:
-            score += 1
-            reasons.append("Fingerprint/serial reuse across contexts observed")
+    verbose = st.verbose()
+    rep.section("Certificates", st.table(
+        ["Subject", "Issuer", "SNI", "Not after", "Key", "Flags", "Flow"] + (["Not before", "Serial", "Signature", "SANs", "SHA256"] if verbose else ["SHA256"]),
+        [[_redact_in_text(c.subject), _redact_in_text(c.issuer), c.sni or "-", c.not_after, f"{c.pubkey_type} {c.pubkey_size}", _flags(c),
+          st.flow(c.src_ip, c.dst_ip)]
+         + ([c.not_before, c.serial, c.sig_algo, ", ".join(c.san) if isinstance(c.san, (list, tuple, set)) else str(c.san or "-"), c.sha256]
+            if verbose else [str(c.sha256)[:16] + "…"]) for c in summary.artifacts],
+        widths=(44, 40, 32), max_rows=12, noun="certificate",
+    ))
+    vpn = list(getattr(summary, "openvpn_certificates", None) or [])
+    rep.section("OpenVPN certificates", st.table(
+        ["Subject", "Issuer", "VPN server", "Client", "SHA256"],
+        [[_redact_in_text(str(i.get("subject", "-"))), _redact_in_text(str(i.get("issuer", "-"))), i.get("src", "-"), i.get("dst", "-"),
+          i.get("sha256", "-")] for i in vpn], max_rows=10,
+    ) + ([st.dim("  carried in the OpenVPN control channel: VPN-server certificates, not web-service certificates")] if vpn else []))
 
-        if score >= 7:
-            verdict = "YES - high-confidence certificate security risks or interception indicators are present."
-            confidence = "High"
-        elif score >= 4:
-            verdict = "LIKELY - significant certificate anomalies are present and require investigation."
-            confidence = "Medium"
-        elif score >= 2:
-            verdict = "POSSIBLE - certificate anomalies are present; corroboration recommended."
-            confidence = "Low"
-        else:
-            verdict = "NO STRONG SIGNAL - no convincing high-risk certificate abuse pattern from current heuristics."
-            confidence = "Low"
-
-        if not reasons:
-            reasons.append(
-                "No high-confidence certificate threat heuristic crossed threshold"
-            )
-        return verdict, confidence, reasons, score
-
-    verdict, confidence, verdict_reasons, verdict_score = _cert_verdict()
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Analyst Verdict"))
-    if verdict.startswith("YES"):
-        lines.append(danger(verdict))
-    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
-        lines.append(warn(verdict))
-    else:
-        lines.append(ok(verdict))
-    lines.append(_format_kv("Confidence", f"{confidence} (score={verdict_score})"))
-    lines.append(muted("Why confidence:"))
-    for reason in verdict_reasons[: _limit_value(10)]:
-        lines.append(muted(f"- {_redact_in_text(reason)}"))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Deterministic Certificate Security Checks"))
-
-    checks: list[tuple[str, list[dict[str, object]]]] = [
-        ("Chain/Trust Gaps", list(getattr(summary, "chain_gaps", []) or [])),
-        (
-            "Weak Signature Algorithms",
-            list(getattr(summary, "weak_signatures", []) or []),
-        ),
-        (
-            "EKU/KeyUsage Mismatch",
-            list(getattr(summary, "eku_mismatches", []) or [])
-            + list(getattr(summary, "key_usage_issues", []) or []),
-        ),
-        ("Name/SAN Mismatch", list(getattr(summary, "name_mismatches", []) or [])),
-        ("Validity Outliers", list(getattr(summary, "validity_outliers", []) or [])),
-        (
-            "Issuer/SAN Impersonation",
-            list(getattr(summary, "issuer_impersonation", []) or []),
-        ),
-        (
-            "Fingerprint/Serial Reuse",
-            list(getattr(summary, "fingerprint_reuse", []) or [])
-            + list(getattr(summary, "serial_reuse", []) or []),
-        ),
-        (
-            "Revocation Posture Gaps",
-            list(getattr(summary, "revocation_gaps", []) or []),
-        ),
-    ]
-
-    for label_text, evidence_items in checks:
-        lines.append(label(label_text))
-        if evidence_items:
-            lines.append(
-                warn(
-                    f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
-                )
-            )
-            for item in evidence_items[: _limit_value(6)]:
-                if isinstance(item, dict):
-                    if "subject" in item and "reason" in item:
-                        ev = f"subject={item.get('subject')} reason={item.get('reason')} src={item.get('src', '-')} dst={item.get('dst', '-')}"
-                    elif "sha256" in item:
-                        ev = f"sha256={item.get('sha256')} contexts={item.get('count')}"
-                    elif "serial" in item:
-                        ev = f"serial={item.get('serial')} contexts={item.get('count')}"
-                    else:
-                        ev = ", ".join(f"{k}={v}" for k, v in item.items())
-                else:
-                    ev = str(item)
-                lines.append(muted(f"- {_redact_in_text(ev)}"))
-        else:
-            lines.append(
-                ok(
-                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
-                )
-            )
-
-    endpoint_profiles = list(getattr(summary, "endpoint_profiles", []) or [])
-    if endpoint_profiles:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Endpoint Certificate Profiles"))
-        rows = [
-            ["Endpoint", "Certs", "Subjects", "Issuers", "Flows", "Latest NotAfter"]
-        ]
-        for item in endpoint_profiles[: _limit_value(12)]:
-            rows.append(
-                [
-                    str(item.get("endpoint", "-")),
-                    str(item.get("fingerprints", "-")),
-                    str(item.get("subjects", "-")),
-                    str(item.get("issuers", "-")),
-                    str(item.get("flows", "-")),
-                    str(item.get("latest_not_after", "-")),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    timeline = list(getattr(summary, "timeline", []) or [])
-    if timeline:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Certificate Timeline"))
-        rows = [["Event", "Subject", "Issuer", "Src", "Dst", "NotAfter"]]
-        for item in timeline[: _limit_value(15)]:
-            rows.append(
-                [
-                    str(item.get("event", "-")),
-                    _truncate_text(str(item.get("subject", "-")), 48),
-                    _truncate_text(str(item.get("issuer", "-")), 48),
-                    str(item.get("src", "-")),
-                    str(item.get("dst", "-")),
-                    str(item.get("not_after", "-")),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    if summary.subjects:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Subjects"))
-        lines.append(_counter_table(summary.subjects, "Subject", limit=_limit_value(10)))
-
-    if summary.issuers:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Issuers"))
-        lines.append(_counter_table(summary.issuers, "Issuer", limit=_limit_value(10)))
-
-    if summary.sas:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top SANs"))
-        lines.append(_counter_table(summary.sas, "SAN", limit=_limit_value(10)))
-
-    openvpn_certs = list(getattr(summary, "openvpn_certificates", []) or [])
-    if openvpn_certs:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("OpenVPN Certificate Context"))
-        lines.append(
-            muted(
-                "  Certificate(s) were carried inside the OpenVPN control channel; treat them as VPN-server certificates, not web-service certificates."
-            )
-        )
-        rows = [["Subject", "Issuer", "VPN Server", "Client", "SHA256"]]
-        for item in openvpn_certs[: _limit_value(10)]:
-            rows.append(
-                [
-                    _truncate_text(str(item.get("subject", "-")), 48),
-                    _truncate_text(str(item.get("issuer", "-")), 48),
-                    str(item.get("src", "-")),
-                    str(item.get("dst", "-")),
-                    str(item.get("sha256", "-"))[: _limit_value(32)] + "...",
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    if summary.weak_keys:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Weak Keys"))
-        rows = [["Subject", "Key Size", "Src", "Dst"]]
-        for item in summary.weak_keys[: _limit_value(10)]:
-            rows.append(
-                [
-                    str(item.get("subject", "-")),
-                    str(item.get("size", "-")),
-                    str(item.get("src", "-")),
-                    str(item.get("dst", "-")),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    if summary.expired:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Expired / Invalid Certificates"))
-        lines.append(
-            muted(
-                "  Expired or invalid validity windows can indicate misconfigurations, expired infrastructure, or opportunistic interception."
-            )
-        )
-        rows = [["Subject", "Reason", "Src", "Dst"]]
-        for item in summary.expired[: _limit_value(10)]:
-            rows.append(
-                [
-                    str(item.get("subject", "-")),
-                    str(item.get("reason", "-")),
-                    str(item.get("src", "-")),
-                    str(item.get("dst", "-")),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    if summary.self_signed:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Self-Signed Certificates"))
-        lines.append(
-            muted(
-                "  Self-signed certs may be benign in labs but can also signal spoofed services, internal C2, or TLS interception."
-            )
-        )
-        rows = [["Subject", "Src", "Dst"]]
-        for item in summary.self_signed[: _limit_value(10)]:
-            rows.append(
-                [
-                    str(item.get("subject", "-")),
-                    str(item.get("src", "-")),
-                    str(item.get("dst", "-")),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    if summary.artifacts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Certificate Artifacts"))
-        rows = [["Subject", "Issuer", "Context", "Not After", "Key", "SHA256"]]
-        for cert in summary.artifacts[: _limit_value(10)]:
-            rows.append(
-                [
-                    cert.subject,
-                    cert.issuer,
-                    getattr(cert, "transport", "TLS"),
-                    cert.not_after,
-                    f"{cert.pubkey_type} {cert.pubkey_size}",
-                    cert.sha256[: _limit_value(32)] + "...",
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    verdict, confidence, score, reasons = _assessment(summary)
+    rep.section("Assessment", st.kv([("Verdict", verdict), ("Confidence", f"{confidence} (score={score})")])
+                + st.bullets(reasons, max_items=None), detail=True)
+    rep.section("Names", st.kv([counter_line("Subjects", summary.subjects, None), counter_line("Issuers", summary.issuers, None),
+                                counter_line("SANs", summary.sas, None)]), detail=True)
+    rep.section("Endpoint profiles", st.table(
+        ["Endpoint", "Certs", "Subjects", "Issuers", "Flows", "Latest not-after"],
+        [[i.get("endpoint", "-"), i.get("fingerprints", "-"), i.get("subjects", "-"), i.get("issuers", "-"), i.get("flows", "-"),
+          i.get("latest_not_after", "-")] for i in (getattr(summary, "endpoint_profiles", None) or [])], max_rows=None,
+    ), detail=True)
+    rep.section("Timeline", st.table(
+        ["Event", "Subject", "Issuer", "Flow", "Not after"],
+        [[i.get("event", "-"), _redact_in_text(str(i.get("subject", "-"))), _redact_in_text(str(i.get("issuer", "-"))),
+          st.flow(i.get("src", "-"), i.get("dst", "-")), i.get("not_after", "-")] for i in (getattr(summary, "timeline", None) or [])],
+        max_rows=None,
+    ), detail=True)
+    return rep.render()

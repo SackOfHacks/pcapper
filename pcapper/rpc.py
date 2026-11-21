@@ -4,7 +4,7 @@ import ipaddress
 import re
 import struct
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -17,7 +17,8 @@ from .utils import (
     safe_float,
 )
 from .utils import is_public_ip as _is_public_ip
-from .utils import beacon_score
+from .utils import extract_utf16le_strings
+from .utils import beacon_score, domain_user_pairs
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -132,7 +133,35 @@ RPC_OPNUM_MAP: dict[str, dict[int, str]] = {
     "e3514235-4b06-11d1-ab04-00c04fc2dcd2": {
         0: "DRSBind",
         1: "DRSUnbind",
+        2: "IDL_DRSReplicaSync",
         3: "IDL_DRSGetNCChanges",
+        4: "IDL_DRSUpdateRefs",
+        5: "IDL_DRSReplicaAdd",
+        6: "IDL_DRSReplicaDel",
+        7: "IDL_DRSReplicaModify",
+        8: "IDL_DRSVerifyNames",
+        9: "IDL_DRSGetMemberships",
+        10: "IDL_DRSInterDomainMove",
+        11: "IDL_DRSGetNT4ChangeLog",
+        12: "IDL_DRSCrackNames",
+        13: "IDL_DRSWriteSPN",
+        14: "IDL_DRSRemoveDsServer",
+        15: "IDL_DRSRemoveDsDomain",
+        16: "IDL_DRSDomainControllerInfo",
+        17: "IDL_DRSAddEntry",
+        18: "IDL_DRSExecuteKCC",
+        19: "IDL_DRSGetReplInfo",
+        20: "IDL_DRSAddSidHistory",
+        21: "IDL_DRSGetMemberships2",
+        22: "IDL_DRSReplicaVerifyObjects",
+        23: "IDL_DRSGetObjectExistence",
+        24: "IDL_DRSQuerySitesByCost",
+        25: "IDL_DRSInitDemotion",
+        26: "IDL_DRSReplicaDemotion",
+        27: "IDL_DRSFinishDemotion",
+        28: "IDL_DRSAddCloneDC",
+        29: "IDL_DRSWriteNgcKey",
+        30: "IDL_DRSReadNgcKey",
     },
     # SAMR / MS-SAMR — account/group enumeration (T1087.002) + creation.
     "12345778-1234-abcd-ef00-0123456789ac": {
@@ -166,7 +195,6 @@ RPC_OPNUM_MAP: dict[str, dict[int, str]] = {
 }
 
 HOST_RE = re.compile(r"\b([A-Za-z0-9_.-]{2,64})\b")
-DOMAIN_USER_RE = re.compile(r"\b([A-Za-z0-9_.-]{1,64})\\([A-Za-z0-9_.-]{1,64})\b")
 IP_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 IPV6_RE = re.compile(r"\b(?:[0-9A-Fa-f]{0,4}:){2,7}[0-9A-Fa-f]{0,4}\b")
 MAC_RE = re.compile(r"\b([0-9A-Fa-f]{2}(?:[:-][0-9A-Fa-f]{2}){5})\b")
@@ -271,10 +299,14 @@ class RpcSummary:
     first_seen: Optional[float]
     last_seen: Optional[float]
     duration_seconds: Optional[float]
+    # DRSUAPI sessions (bound, or inferred from the opnum sequence): client,
+    # server, operations, whether DRSGetNCChanges was called.
+    dcsync_sessions: list[dict[str, object]] = field(default_factory=list)
 
     def to_dict(self) -> dict[str, object]:
         return {
             "path": str(self.path),
+            "dcsync_sessions": list(self.dcsync_sessions),
             "total_packets": self.total_packets,
             "rpc_packets": self.rpc_packets,
             "total_bytes": self.total_bytes,
@@ -332,6 +364,21 @@ class RpcSummary:
         }
 
 
+DRSUAPI_UUID = "e3514235-4b06-11d1-ab04-00c04fc2dcd2"
+# What secretsdump and mimikatz call on a DCSync: DRSBind, DRSUnbind,
+# DRSGetNCChanges, DRSCrackNames, DRSDomainControllerInfo.
+_DCSYNC_OPNUMS = frozenset({0, 1, 3, 12, 16})
+
+
+def _dcsync_opnum_shape(ops: list[int]) -> bool:
+    """A DRSUAPI DCSync seen without its bind: DRSBind first, DRSGetNCChanges
+    after it, nothing outside the DCSync working set, and a name lookup
+    (DRSCrackNames / DRSDomainControllerInfo) among the calls."""
+    if len(ops) < 3 or ops[0] != 0 or 3 not in ops[1:]:
+        return False
+    return set(ops) <= _DCSYNC_OPNUMS and bool({12, 16} & set(ops))
+
+
 def _rpc_pdu_type(payload: bytes | None) -> Optional[str]:
     if not payload or len(payload) < 16:
         return None
@@ -376,7 +423,7 @@ def _decode_uuid_le(data: bytes) -> Optional[str]:
 def _parse_bind_contexts(payload: bytes | None) -> list[tuple[int, str]]:
     if not payload or len(payload) < 32:
         return []
-    if payload[0] != 0x05 or payload[2] != 0x0B:
+    if payload[0] != 0x05 or payload[2] not in (0x0B, 0x0E):  # bind, alter_context
         return []
     contexts: list[tuple[int, str]] = []
     try:
@@ -414,25 +461,8 @@ def _parse_bind_contexts(payload: bytes | None) -> list[tuple[int, str]]:
 
 
 def _extract_utf16le_strings(payload: bytes, limit: int = 200) -> list[str]:
-    if not payload:
-        return []
-    out: list[str] = []
-    current = bytearray()
-    i = 0
-    while i + 1 < len(payload):
-        b1 = payload[i]
-        b2 = payload[i + 1]
-        if 32 <= b1 <= 126 and b2 == 0x00:
-            current.append(b1)
-            i += 2
-            continue
-        if len(current) >= 4:
-            out.append(current.decode("latin-1", errors="ignore")[:limit])
-        current = bytearray()
-        i += 1
-    if len(current) >= 4:
-        out.append(current.decode("latin-1", errors="ignore")[:limit])
-    return out
+    # Steps one byte after a pair that is not text: finds strings at odd offsets.
+    return extract_utf16le_strings(payload, 4, limit, aligned=False)
 
 
 def _rpc_strings(payload: bytes, limit: int = 200) -> list[str]:
@@ -612,6 +642,8 @@ def analyze_rpc(
     anomalies: list[dict[str, object]] = []
     high_risk_iface_use: dict[tuple[str, str], set[str]] = defaultdict(set)
     pending_calls: dict[tuple[str, str, str, int, int], dict[str, object]] = {}
+    drs_ops: dict[tuple[str, str, str, int], list[int]] = defaultdict(list)
+    unbound_ops: dict[tuple[str, str, str, int], list[int]] = defaultdict(list)
 
     dst_by_src: dict[str, set[str]] = defaultdict(set)
     request_times: dict[tuple[str, str], list[float]] = defaultdict(list)
@@ -718,7 +750,7 @@ def analyze_rpc(
                 if conv["last_seen"] is None or ts > conv["last_seen"]:
                     conv["last_seen"] = ts
 
-            if pdu_type == "bind":
+            if pdu_type in ("bind", "alter_context"):
                 contexts = _parse_bind_contexts(rpc_payload)
                 if contexts:
                     context_map = flow_contexts.setdefault(conv_key, {})
@@ -748,6 +780,10 @@ def analyze_rpc(
                 opnum = _rpc_read_u16(rpc_payload, 22, le) or 0
                 iface = flow_contexts.get(conv_key, {}).get(context_id)
                 iface_uuid = iface.split(" ", 1)[0] if iface else None
+                if iface_uuid == DRSUAPI_UUID:
+                    drs_ops[conv_key].append(opnum)
+                elif iface is None:
+                    unbound_ops[conv_key].append(opnum)
                 label = RPC_INTERFACES.get(iface_uuid or "", None)
                 op_map = RPC_OPNUM_MAP.get(iface_uuid or "", {})
                 op_name = op_map.get(opnum)
@@ -809,7 +845,7 @@ def analyze_rpc(
                 plaintext_strings[item] += 1
                 if HOST_RE.fullmatch(item) and len(item) <= 64:
                     hostname_counts[item] += 1
-                for match in DOMAIN_USER_RE.findall(item):
+                for match in domain_user_pairs(item):
                     domain_user_counts[f"{match[0]}\\{match[1]}"] += 1
                 for match in IP_RE.findall(item):
                     ip_strings[match] += 1
@@ -882,7 +918,62 @@ def analyze_rpc(
     except Exception as exc:
         errors.append(str(exc))
 
+    # Requests whose bind is not in the capture (it started mid-session) carry
+    # no interface; a DRSUAPI DCSync is still recognisable by its opnums,
+    # which travel in clear text even when the stubs are sealed.
+    drs_label = RPC_INTERFACES[DRSUAPI_UUID]
+    drs_names = RPC_OPNUM_MAP[DRSUAPI_UUID]
+    inferred_drs: set[tuple[str, str, str, int]] = set()
+    for conv_key, ops in unbound_ops.items():
+        if not _dcsync_opnum_shape(ops):
+            continue
+        inferred_drs.add(conv_key)
+        drs_ops[conv_key].extend(ops)
+        for op in ops:
+            generic = f"opnum {op}"
+            command_counts[generic] -= 1
+            if command_counts[generic] <= 0:
+                del command_counts[generic]
+            command_counts[f"{drs_label}::{drs_names[op]}"] += 1
+        interface_counts[f"{drs_label} (inferred from opnums; bind not captured)"] += 1
+        risk = _RPC_HIGH_RISK_INTERFACES[DRSUAPI_UUID]
+        high_risk_iface_use[(risk[0], risk[1])].add(f"{conv_key[0]} -> {conv_key[1]}")
+
+    dcsync_sessions: list[dict[str, object]] = []
+    for conv_key, ops in sorted(drs_ops.items()):
+        client, server, proto_name, port = conv_key
+        conv = conv_map.get(conv_key, {})
+        dcsync_sessions.append({
+            "client": client, "server": server, "protocol": proto_name, "server_port": port,
+            "operations": [drs_names.get(op, f"opnum {op}") for op in ops],
+            "replication": 3 in ops,
+            "inferred": conv_key in inferred_drs,
+            "first_seen": conv.get("first_seen"), "last_seen": conv.get("last_seen"),
+            "packets": int(conv.get("packets", 0) or 0), "bytes": int(conv.get("bytes", 0) or 0),
+        })
+    replicated = [d for d in dcsync_sessions if d["replication"]]
+    if replicated:
+        flows = ", ".join(f"{d['client']} -> {d['server']}:{d['server_port']}" for d in replicated[:5])
+        inferred_count = sum(1 for d in replicated if d["inferred"])
+        detections.append({
+            "severity": "high",
+            "summary": "DCSync: directory replication (DRSGetNCChanges) requested",
+            "details": (
+                f"{len(replicated)} DRSUAPI session(s) pulled replication data: {flows}"
+                + (f"; {inferred_count} identified from the DRSUAPI opnum sequence (bind not in the capture, stubs sealed)"
+                   if inferred_count else "")
+                + ". Unless the client is a domain controller this is credential theft (secretsdump / mimikatz lsadump::dcsync)."
+            ),
+            "source": "RPC",
+            "mitre": "T1003.006",
+            "src": replicated[0]["client"],
+            "dst": replicated[0]["server"],
+            "ts": replicated[0]["first_seen"],
+        })
+
     for (iface_label, attack_id), pairs in high_risk_iface_use.items():
+        if attack_id == "T1003.006" and replicated:
+            continue  # the replication finding above says more
         sample = ", ".join(sorted(pairs)[:5])
         # DCSync (DRSUAPI) is credential theft from a DC — rate it highest.
         severity = "high" if "DCSync" in iface_label else "warning"
@@ -1132,6 +1223,7 @@ def analyze_rpc(
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
+        dcsync_sessions=dcsync_sessions,
     )
 
 
@@ -1352,4 +1444,5 @@ def merge_rpc_summaries(summaries: Iterable[RpcSummary]) -> RpcSummary:
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
+        dcsync_sessions=[d for summary in summary_list for d in (getattr(summary, "dcsync_sessions", None) or [])],
     )

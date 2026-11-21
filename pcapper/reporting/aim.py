@@ -1,179 +1,60 @@
-"""Rendered output for aim analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for AIM/OSCAR instant messaging: accounts, cleartext
+passwords and secrets, recovered messages and files."""
 
 from __future__ import annotations
+
 from ..aim import AimSummary
-from ..coloring import (
-    danger,
-    header,
-    muted,
-    ok,
-    warn,
-)
-from ..utils import (
-    format_bytes_as_mb,
-    format_duration,
-    format_ts,
-)
-
-from ._common import (
-    SECTION_BAR,
-    SUBSECTION_BAR,
-    _apply_verbose_limit,
-    _counter_table,
-    _filtered_detections,
-    _finalize_output,
-    _format_client_server_table,
-    _format_kv,
-    _format_table,
-    _limit_value,
-    _render_protocol_verdict,
-    _truncate_text,
-)
+from ..utils import format_bytes_as_mb, format_duration
+from . import _style as st
+from ._kv import counter_line, findings_for
 
 
-def render_aim_summary(
-    summary: AimSummary, limit: int = 12, verbose: bool = False
-) -> str:
-    limit = _apply_verbose_limit(limit)
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"AIM ANALYSIS :: {summary.path.name}"))
-    _render_protocol_verdict(
-        lines,
-        label="AIM",
-        detections=getattr(summary, "detections", None),
-        anomalies=getattr(summary, "anomalies", None),
-    )
-    lines.append(SECTION_BAR)
-
+def render_aim_summary(summary: AimSummary, limit: int = 12, verbose: bool = False) -> str:
+    rep = st.Report("AIM", summary.path)
+    findings = findings_for(summary, ot=False)
+    if not summary.aim_packets and not st.material(findings):
+        return rep.absent("AIM/OSCAR traffic", summary.errors)
+    rows = None if (st.verbose() or verbose) else limit
+    severity, text = st.verdict(findings, high="credentials or sensitive content in cleartext IM: treat as evidence",
+                                medium="IM activity to review")
+    rep.headline(severity, text, st.join([
+        f"{st.count(summary.aim_packets)} AIM packets", st.size(summary.aim_bytes),
+        st.duration(summary.duration_seconds) if summary.duration_seconds else "",
+        st.ts_range(summary.first_seen, summary.last_seen) if summary.first_seen else "",
+    ]))
+    rep.scope(f"{st.plural(summary.unique_clients, 'client')} -> {st.plural(summary.unique_servers, 'server')}")
     if summary.errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        for err in summary.errors:
-            lines.append(danger(f"- {err}"))
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Findings", st.findings_block(findings))
 
-    lines.append(_format_kv("Packets Scanned", str(summary.total_packets)))
-    lines.append(_format_kv("AIM Packets", str(summary.aim_packets)))
-    lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
-    lines.append(_format_kv("AIM Bytes", format_bytes_as_mb(summary.aim_bytes)))
-    lines.append(_format_kv("Unique Clients", str(summary.unique_clients)))
-    lines.append(_format_kv("Unique Servers", str(summary.unique_servers)))
-    lines.append(_format_kv("Start", format_ts(summary.first_seen)))
-    lines.append(_format_kv("End", format_ts(summary.last_seen)))
-    lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
+    def _counts(title: str, counter: object, label_text: str, width: int) -> None:
+        rep.section(title, st.table([label_text, "Seen"], [[k, st.count(v)] for k, v in (counter or {}).items()]
+                                    if not hasattr(counter, "most_common") else [[k, st.count(v)] for k, v in counter.most_common()],
+                                    align="lr", widths=(width,), **({"max_rows": None} if rows is None
+                                                                   else {"max_rows": st.TOP_ROWS, "tail": st.TOP_ROWS})))
 
-    if summary.client_counts or summary.server_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Clients & Servers"))
-        lines.append(
-            _format_client_server_table(summary.client_counts, summary.server_counts)
-        )
-
-    if summary.server_ports:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Server Ports"))
-        lines.append(_counter_table(summary.server_ports, "Port", limit=limit))
-
-    if summary.username_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Usernames"))
-        rows = [["Username", "Count"]]
-        for user, count in summary.username_counts.most_common(limit):
-            rows.append([_truncate_text(user, 48), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.password_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Passwords"))
-        rows = [["Password", "Count"]]
-        for secret, count in summary.password_counts.most_common(limit):
-            rows.append([_truncate_text(secret, 64), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.secret_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Secrets"))
-        rows = [["Secret", "Count"]]
-        for secret, count in summary.secret_counts.most_common(limit):
-            rows.append([_truncate_text(secret, 64), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.message_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Recovered Messages"))
-        rows = [["Message", "Count"]]
-        for message, count in summary.message_counts.most_common(limit):
-            rows.append([_truncate_text(message, 96), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.file_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Recovered Files"))
-        rows = [["Filename", "Count"]]
-        for name, count in summary.file_counts.most_common(limit):
-            rows.append([_truncate_text(name, 80), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.conversations:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Conversations"))
-        rows = [["Client", "Server", "Port", "Packets", "Bytes", "First", "Last"]]
-        conversations = sorted(
-            summary.conversations,
-            key=lambda item: (item.packets, item.bytes),
-            reverse=True,
-        )
-        for conv in conversations[:limit]:
-            rows.append(
-                [
-                    conv.client_ip,
-                    conv.server_ip,
-                    str(conv.server_port),
-                    str(conv.packets),
-                    format_bytes_as_mb(conv.bytes),
-                    format_ts(conv.first_seen),
-                    format_ts(conv.last_seen),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    if summary.artifacts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Forensic Artifacts"))
-        rows = [["Kind", "Detail", "Packet", "Src", "Dst"]]
-        for item in summary.artifacts[: _limit_value(30)]:
-            rows.append(
-                [
-                    item.kind,
-                    _truncate_text(item.detail, 96),
-                    str(item.packet_index),
-                    item.src,
-                    item.dst,
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    detections = _filtered_detections(summary, verbose)
-    if detections:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Detections"))
-        for item in detections[: _limit_value(20)]:
-            severity = str(item.get("severity", "info")).lower()
-            prefix = (
-                danger("[HIGH]")
-                if severity in {"high", "critical"}
-                else warn("[WARN]")
-                if severity == "warning"
-                else ok("[INFO]")
-            )
-            lines.append(f"{prefix} {item.get('summary', '-')}")
-            details = str(item.get("details", "") or "").strip()
-            if details:
-                lines.append(muted(f"  {details}"))
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines, show_truncation_note=False)
+    _counts("Usernames", summary.username_counts, "Username", 48)
+    _counts("Passwords", summary.password_counts, "Password", 64)
+    _counts("Secrets", summary.secret_counts, "Secret", 64)
+    _counts("Messages", summary.message_counts, "Message", 96)
+    _counts("Files", summary.file_counts, "Filename", 80)
+    rep.section("Artifacts", st.table(
+        ["Kind", "Detail", "Packet", "Flow"],
+        [[a.kind, a.detail, a.packet_index, st.flow(a.src, a.dst)] for a in summary.artifacts],
+        widths=(None, 96), max_rows=rows,
+    ))
+    rep.section("Endpoints", st.kv([counter_line("Clients", summary.client_counts), counter_line("Servers", summary.server_counts),
+                                    counter_line("Server ports", summary.server_ports)]))
+    convs = sorted(summary.conversations, key=lambda c: (c.packets, c.bytes), reverse=True)
+    rep.section("Conversations", st.table(
+        ["Client", "Server", "Port", "Packets", "Bytes", "First", "Last"],
+        [[c.client_ip, c.server_ip, c.server_port, st.count(c.packets), format_bytes_as_mb(c.bytes), st.ts(c.first_seen),
+          st.ts(c.last_seen)] for c in convs], align="llrrrll", max_rows=None,
+    ), detail=True)
+    rep.section("Traffic", st.kv([
+        ("Packets scanned / AIM", f"{summary.total_packets} / {summary.aim_packets}"),
+        ("Bytes total / AIM", f"{format_bytes_as_mb(summary.total_bytes)} / {format_bytes_as_mb(summary.aim_bytes)}"),
+        ("Start / end", f"{st.ts(summary.first_seen)} / {st.ts(summary.last_seen)}"),
+        ("Duration", format_duration(summary.duration_seconds)),
+    ]), detail=True)
+    return rep.render()

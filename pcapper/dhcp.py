@@ -573,6 +573,7 @@ def analyze_dhcp(
     )
 
     exfil_signals: Counter[str] = Counter()
+    exfil_values: dict[str, set[str]] = defaultdict(set)
     strings_counter: Counter[str] = Counter()
     files: set[str] = set()
     seen_device_artifacts: set[str] = set()
@@ -1007,15 +1008,22 @@ def analyze_dhcp(
                     )
 
             # Exfil/abuse heuristics for option values
-            for value in (hostname, domain, vendor_class, client_id):
+            for option_name, value in (("hostname", hostname), ("domain", domain),
+                                       ("vendor_class", vendor_class), ("client_id", client_id)):
                 if not value:
                     continue
                 low_value = value.lower()
                 if any(token in low_value for token in _BENIGN_DHCP_IDENTITY_TOKENS):
                     continue
                 entropy = shannon_entropy(value)
-                if len(value) >= 80 or entropy >= 3.8:
+                # A client identifier (option 61) is binary by design -- a MAC
+                # or a DUID -- so its entropy says nothing; only an oversized
+                # one is out of place.
+                high_entropy = entropy >= 3.8 and option_name != "client_id"
+                if len(value) >= 80 or high_entropy:
                     exfil_signals[chaddr] += 1
+                    if len(exfil_values[chaddr]) < 64:
+                        exfil_values[chaddr].add(value)
                     summary.exfil_candidates[chaddr] += 1
                     summary.artifacts.append(
                         DhcpArtifact(
@@ -1231,7 +1239,10 @@ def analyze_dhcp(
             )
 
     for client_mac, signal_count in exfil_signals.items():
-        if signal_count < 3:
+        # Data smuggled in options changes from message to message; a client
+        # resending one odd value in every DISCOVER/REQUEST is not carrying any.
+        distinct = len(exfil_values.get(client_mac, ()))
+        if signal_count < 3 or distinct < 3:
             continue
         summary.attacks["DHCP Option Exfiltration"] += 1
         summary.threat_summary["DHCP Option Exfiltration"] += 1
@@ -1239,7 +1250,8 @@ def analyze_dhcp(
         _append_anomaly(
             "HIGH",
             "Potential DHCP Option Exfiltration",
-            f"Client {client_mac} produced {signal_count} suspicious high-entropy/long DHCP option values.",
+            f"Client {client_mac} sent {distinct} distinct high-entropy/long DHCP option values "
+            f"across {signal_count} options.",
             client_mac,
             "-",
             client_first_seen.get(client_mac, start_ts or 0.0),

@@ -243,6 +243,25 @@ class TestVpn:
         assert summary.vpn_packets == 1
         assert summary.first_seen == pytest.approx(T0 + 100)
 
+    def test_binary_download_segment_is_not_openvpn(self, tmp_path) -> None:
+        # A mid-stream segment of an HTTP download that happens to parse as a
+        # length-prefixed control frame (00 0d 38 ...) must not relabel the
+        # HTTP server as OpenVPN: only a direction's first payload, opening
+        # with a HARD_RESET, identifies an OpenVPN session.
+        from pcapper.services import analyze_services
+
+        client, server = "192.168.10.50", "89.38.98.150"
+        pcap = _write(tmp_path, "http_download.pcap", [
+            _at(_tcp(client, server, 49410, 80, flags="S", seq=100), T0),
+            _at(_tcp(server, client, 80, 49410, flags="SA", seq=500), T0 + 0.01),
+            _at(_tcp(client, server, 49410, 80, flags="A", seq=101), T0 + 0.02),
+            _at(_tcp(client, server, 49410, 80, b"GET /x.exe HTTP/1.1\r\nHost: a\r\n\r\n", seq=101), T0 + 0.03),
+            _at(_tcp(server, client, 80, 49410, b"HTTP/1.1 200 OK\r\nContent-Type: application/octet-stream\r\n\r\nMZ", seq=501), T0 + 0.04),
+            _at(_tcp(server, client, 80, 49410, self._ovpn_tcp(7), seq=600), T0 + 0.05),
+        ])
+        services = analyze_services(pcap, show_status=False)
+        assert [a.service_name for a in services.assets if a.port == 80] == ["HTTP"]
+
     def test_openvpn_over_tcp_443_is_not_reported_as_https(self, tmp_path) -> None:
         from pcapper.analyzer import analyze_pcap
         from pcapper.beacon import analyze_beacons

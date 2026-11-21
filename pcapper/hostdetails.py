@@ -1,7 +1,8 @@
 from __future__ import annotations
 
-from .utils import is_valid_ip as _valid_ip
+from .utils import is_valid_ip as _valid_ip, fan_out
 from .utils import is_public_ip as _is_public_ip
+from .utils import gateway_macs
 import ipaddress
 import re
 from collections import Counter, defaultdict
@@ -176,21 +177,28 @@ def _extract_mac_values(
     # reliable source — ARP/DHCP only see the subset of hosts that did ARP/DHCP,
     # so on captures without ARP (e.g. a mid-session HTTP capture) those alone
     # report no MAC even though every packet has one.
-    for mac in (getattr(ips_summary, "ip_mac_counts", {}) or {}).get(target_ip, {}):
-        if mac:
-            macs.add(str(mac).lower())
-
+    bound: set[str] = set()  # ARP / DHCP: the address owner's own MAC
     for convo in getattr(arp_summary, "conversations", []) or []:
         if convo.src_ip == target_ip and convo.src_mac:
-            macs.add(convo.src_mac.lower())
+            bound.add(convo.src_mac.lower())
         if convo.dst_ip == target_ip and convo.dst_mac:
-            macs.add(convo.dst_mac.lower())
+            bound.add(convo.dst_mac.lower())
 
     for session in getattr(dhcp_summary, "sessions", []) or []:
         if (
             session.client_ip == target_ip or session.server_ip == target_ip
         ) and session.client_mac:
-            macs.add(str(session.client_mac).lower())
+            bound.add(str(session.client_mac).lower())
+
+    # ...except that frames to or from an off-link address carry the
+    # gateway's MAC, which is not that address's unless ARP or DHCP says so.
+    ip_mac_counts = getattr(ips_summary, "ip_mac_counts", {}) or {}
+    gateways = gateway_macs(ip_mac_counts) if _is_public_ip(target_ip) else set()
+    for mac in ip_mac_counts.get(target_ip, {}):
+        mac_text = str(mac or "").lower()
+        if mac_text and (mac_text not in gateways or mac_text in bound):
+            macs.add(mac_text)
+    macs |= bound
 
     def _is_real_host_mac(mac: str) -> bool:
         # A host's own NIC address is unicast; drop the all-zero placeholder and
@@ -893,6 +901,7 @@ def merge_hostdetails_summaries(
     )
 
 
+@fan_out
 def analyze_hostdetails(
     path: Path,
     target_ip: str,

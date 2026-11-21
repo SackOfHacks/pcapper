@@ -1,60 +1,37 @@
-"""Rendered output for carve analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for stream carving: files found inside reassembled TCP
+streams, and whether each carve is complete."""
 
 from __future__ import annotations
-from ..coloring import (
-    danger,
-    header,
-)
 
-from ._common import (
-    _finalize_output,
-    _format_kv,
-    _format_table,
-    _limit_value,
-)
+from . import _style as st
 
 
-def render_carve_summary(summary) -> str:
+def render_carve_summary(summary) -> str:  # type: ignore[no-untyped-def]
     if not summary:
         return ""
-    lines = [header("STREAM CARVING")]
-    lines.append(_format_kv("Streams", str(summary.total_streams)))
-    lines.append(_format_kv("Hits", str(summary.total_hits)))
-    if summary.extracted:
-        lines.append(_format_kv("Extracted", str(len(summary.extracted))))
-    if summary.errors:
-        lines.append(_format_kv("Errors", "; ".join(summary.errors)))
-    incomplete = [hit for hit in summary.hits if getattr(hit, "gap_count", 0)]
+    rep = st.Report("Stream carving", getattr(summary, "path", "") or "streams")
+    hits = list(summary.hits or [])
+    if not hits and not summary.errors:
+        return rep.absent(f"carvable files in {st.plural(summary.total_streams, 'stream')}")
+    incomplete = [h for h in hits if getattr(h, "gap_count", 0)]
+    rep.headline(
+        "medium" if incomplete else None,
+        st.join([st.plural(summary.total_hits, "file signature"), f"{st.count(len(summary.extracted))} extracted" if summary.extracted else ""]),
+        st.plural(summary.total_streams, "stream") + " searched",
+    )
     if incomplete:
-        # A carve taken across a hole in the reassembled stream is a partial
-        # reconstruction. Say so next to the table rather than letting a
-        # confident SHA-256 travel into a report unqualified.
-        lines.append(
-            danger(
-                f"{len(incomplete)} of {len(summary.hits)} hit(s) span gaps in the"
-                " reassembled stream: those artifacts are incomplete and their"
-                " SHA-256 will not match the original file."
-            )
-        )
-    if summary.hits:
-        rows = [["Stream", "Dir", "Type", "Len", "Missing", "Src", "Dst"]]
-        for hit in summary.hits[: _limit_value(10)]:
-            gap_bytes = getattr(hit, "gap_bytes", 0)
-            gap_count = getattr(hit, "gap_count", 0)
-            rows.append(
-                [
-                    hit.stream_id,
-                    hit.direction,
-                    hit.file_type,
-                    str(hit.length),
-                    f"{gap_bytes}B/{gap_count}" if gap_count else "-",
-                    f"{hit.src}:{hit.src_port}",
-                    f"{hit.dst}:{hit.dst_port}",
-                ]
-            )
-        lines.append(_format_table(rows))
-    return _finalize_output(lines)
+        # A carve across a hole in the reassembled stream is a partial
+        # reconstruction: its SHA-256 will not match the original file.
+        rep.note("PARTIAL", f"{len(incomplete)} of {len(hits)} hit(s) span gaps in the reassembled stream: "
+                            "those artifacts are incomplete and their SHA-256 will not match the original")
+    if summary.errors:
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Hits", st.table(
+        ["Stream", "Dir", "Type", "Bytes", "Missing", "Source", "Destination"],
+        [[h.stream_id, h.direction, h.file_type, st.count(h.length),
+          st.bad(f"{getattr(h, 'gap_bytes', 0)}B/{h.gap_count}") if getattr(h, "gap_count", 0) else "-",
+          f"{h.src}:{h.src_port}", f"{h.dst}:{h.dst_port}"] for h in hits],
+        align="lllrrll", noun="hit",
+    ))
+    rep.section("Extracted", st.bullets([str(x) for x in (summary.extracted or [])], max_items=10, noun="file"))
+    return rep.render()

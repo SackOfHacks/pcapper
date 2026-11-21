@@ -97,8 +97,6 @@ from .certificates import (
     render_certificates_summary,
 )
 from .cip import (
-    _render_cip_baseline_sections,
-    _render_cip_verdict,
     render_cip_summary,
 )
 from .coap import (
@@ -150,6 +148,7 @@ from .dnp3 import (
 from .dns import (
     render_dns_summary,
 )
+from .dnsqueries import render_dnsqueries_summary
 from .domain import (
     render_domain_summary,
 )
@@ -161,8 +160,6 @@ from .encrypted_dns import (
     render_encrypted_dns_summary,
 )
 from .enip import (
-    _render_enip_baseline_sections,
-    _render_enip_verdict,
     render_enip_summary,
 )
 from .ethercat import (
@@ -269,8 +266,6 @@ from .mms import (
 )
 from .modbus import (
     _identity_text,
-    _render_modbus_baseline_sections,
-    _render_modbus_verdict,
     render_modbus_rollup,
     render_modbus_summary,
 )
@@ -315,7 +310,6 @@ from .overview import (
     _OVERVIEW_OT_SIGNAL_TOKENS,
     _overview_activity_text,
     _overview_detected_devices,
-    _overview_hunt_lead_section,
     _overview_lead_lookfor,
     _overview_list_preview,
     _overview_metrics_text,
@@ -346,7 +340,6 @@ from .profinet import (
 )
 from .protocols import (
     _INSECURE_WIRE_PROTOCOLS,
-    _protocols_mitre_techniques,
     render_protocols_summary,
 )
 from .ptp import (
@@ -450,7 +443,6 @@ from .timeline import (
     render_timeline_summary,
 )
 from .tls import (
-    _render_tls_summary_impl,
     render_tls_summary,
 )
 from .udp import (

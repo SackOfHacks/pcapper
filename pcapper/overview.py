@@ -5,7 +5,7 @@ import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable
+from typing import Callable, Optional
 
 from .analyzer import analyze_pcap
 from .bacnet import analyze_bacnet
@@ -41,7 +41,7 @@ from .ot_extra import OT_EXTRA
 from .port_heuristics import auto_decode
 from .port_overrides import is_standard as is_standard_port
 from .port_overrides import overrides as port_overrides_for
-from .utils import call_with_packet_view
+from .utils import call_with_packet_view, fan_out
 
 
 @dataclass(frozen=True)
@@ -80,6 +80,14 @@ class OverviewSummary:
     service_activity: list[dict[str, object]]
     notable_flows: list[dict[str, object]]
     hunt_leads: list[dict[str, object]]
+    # The report's top-and-bottom view of each ranking: its bottom 10 beyond
+    # the kept top 24, and how many entries it had.
+    ip_activity_tail: list[dict[str, object]] = field(default_factory=list)
+    ip_activity_total: int = 0
+    protocol_activity_tail: list[dict[str, object]] = field(default_factory=list)
+    protocol_activity_total: int = 0
+    service_activity_tail: list[dict[str, object]] = field(default_factory=list)
+    service_activity_total: int = 0
 
 
 _OT_PROTOCOL_MATCHERS: list[tuple[str, str, tuple[str, ...]]] = [
@@ -565,7 +573,7 @@ def _ip_role(bucket: dict[str, object]) -> str:
     return "mixed"
 
 
-def _ip_activity(protocols, services, limit: int = 20) -> list[dict[str, object]]:
+def _ip_activity(protocols, services, limit: Optional[int] = 20) -> list[dict[str, object]]:
     buckets: dict[str, dict[str, object]] = {}
 
     for endpoint in list(getattr(protocols, "endpoints", []) or []):
@@ -803,14 +811,19 @@ def _ip_activity(protocols, services, limit: int = 20) -> list[dict[str, object]
             str(item.get("ip", "")),
         )
     )
-    return rows[:limit]
+    return rows if limit is None else rows[:limit]
+
+
+def _ranking_tail(rows: list, kept: int, tail: int = 10) -> list:
+    """The bottom ``tail`` of a ranking that is not already in its kept top."""
+    return list(rows[max(kept, len(rows) - tail):])
 
 
 def _observed_ips(protocols, services, limit: int = 15) -> list[dict[str, object]]:
     return _ip_activity(protocols, services, limit=limit)
 
 
-def _protocol_activity(protocols, limit: int = 20) -> list[dict[str, object]]:
+def _protocol_activity(protocols, limit: Optional[int] = 20) -> list[dict[str, object]]:
     buckets: dict[str, dict[str, object]] = {}
     for conv in list(getattr(protocols, "conversations", []) or []):
         name = str(getattr(conv, "protocol", "") or "Unknown").strip() or "Unknown"
@@ -907,10 +920,10 @@ def _protocol_activity(protocols, limit: int = 20) -> list[dict[str, object]]:
             str(item.get("protocol", "")),
         )
     )
-    return rows[:limit]
+    return rows if limit is None else rows[:limit]
 
 
-def _service_activity(services, limit: int = 20) -> list[dict[str, object]]:
+def _service_activity(services, limit: Optional[int] = 20) -> list[dict[str, object]]:
     buckets: dict[str, dict[str, object]] = {}
 
     for asset in list(getattr(services, "assets", []) or []):
@@ -1022,7 +1035,7 @@ def _service_activity(services, limit: int = 20) -> list[dict[str, object]]:
             str(item.get("service", "")),
         )
     )
-    return rows[:limit]
+    return rows if limit is None else rows[:limit]
 
 
 def _notable_flows(protocols, limit: int = 20) -> list[dict[str, object]]:
@@ -1228,6 +1241,37 @@ def _ov_is_broadcast_multicast(ip: str) -> bool:
         return ipaddress.ip_address(text).is_multicast
     except Exception:
         return False
+
+
+# Module "nothing found" lines: useful in the module's own one-line result,
+# noise when repeated in the highlight blocks.
+_PLACEHOLDER_HIGHLIGHT_PREFIXES = (
+    "no threat detections",
+    "no explicit scanning",
+    "no ctf-style flag",
+    "no file transfer artifacts",
+    "no material modbus/dnp3",
+    "no safety protocol traffic",
+)
+
+
+def _distinct_highlights(*blocks: list[str]) -> tuple[list[str], ...]:
+    """Each highlight once, in the first block that has it, without the
+    "nothing found" placeholders: the same line used to appear in the hunt,
+    forensics and deep-dive views at once."""
+    seen: set[str] = set()
+    out: list[list[str]] = []
+    for block in blocks:
+        kept: list[str] = []
+        for line in block:
+            text = str(line or "").strip()
+            key = text.lower().rstrip(".")
+            if not text or key in seen or key.startswith(_PLACEHOLDER_HIGHLIGHT_PREFIXES):
+                continue
+            seen.add(key)
+            kept.append(text)
+        out.append(kept)
+    return tuple(out)
 
 
 def _build_hunt_leads(
@@ -1443,8 +1487,10 @@ def _build_hunt_leads(
         if result.module == "threats":
             high_sev = int(result.metrics.get("high_severity", 0) or 0)
             if high_sev > 0:
+                # Critical/high detections are by definition a high-priority
+                # lead (score 82 used to render them as MEDIUM).
                 add_lead(
-                    score=82,
+                    score=90,
                     entity="threat-correlation",
                     finding=f"Critical/high detections observed ({high_sev})",
                     evidence=result.highlights[0] if result.highlights else _module_metric_text(result.metrics),
@@ -1707,11 +1753,16 @@ def _build_module_result(module: str, reason: str, summary: object) -> OverviewM
                 highlights.append(f"Executable/script-like artifacts: {executable_hits}.")
         else:
             highlights.append("No file transfer artifacts were carved from observed traffic.")
-        for item in detections[:2]:
-            if isinstance(item, dict):
-                detail = str(item.get("summary") or item.get("details") or "").strip()
-                if detail:
-                    highlights.append(_truncate(detail, 120))
+        # Findings only: informational notes ("Files extracted via dpkt")
+        # describe the extractor, not the capture.
+        notable = [
+            item for item in detections
+            if isinstance(item, dict) and str(item.get("severity", "info") or "info").lower() != "info"
+        ]
+        for item in notable[:2]:
+            detail = str(item.get("summary") or item.get("details") or "").strip()
+            if detail:
+                highlights.append(_truncate(detail, 120))
 
     elif module == "ot_commands":
         command_counts = _counter_from_obj(getattr(summary, "command_counts", None))
@@ -1854,6 +1905,7 @@ def _build_module_result(module: str, reason: str, summary: object) -> OverviewM
     )
 
 
+@fan_out
 def analyze_overview(
     path: Path,
     *,
@@ -1878,7 +1930,9 @@ def analyze_overview(
         for name, count in list(getattr(protocol_summary, "top_protocols", []) or [])
     ]
     top_services = _top_services(services_summary, limit=12)
-    ip_activity = _ip_activity(protocol_summary, services_summary, limit=24)
+    ip_rows_all = _ip_activity(protocol_summary, services_summary, limit=None)
+    ip_activity = ip_rows_all[:24]
+    ip_activity_tail = _ranking_tail(ip_rows_all, 24)
     observed_ips = _observed_ips(protocol_summary, services_summary, limit=20)
     # Enrich the device/IP inventory with Browser (MS-BRWS) announced identity:
     # hostname, OS, and server roles (DC/SQL/print/master browser).
@@ -1891,7 +1945,7 @@ def analyze_overview(
     except Exception:
         _nb_intel = {}
     if _nb_intel:
-        for _row in list(ip_activity) + list(observed_ips):
+        for _row in list(ip_activity) + list(observed_ips) + list(ip_activity_tail):
             _facts = _nb_intel.get(str(_row.get("ip", "")))
             if not _facts:
                 continue
@@ -1903,8 +1957,10 @@ def analyze_overview(
                 _row["browser_roles"] = [str(r) for r in _facts["roles"]]
             if _facts.get("is_dc"):
                 _row["is_dc"] = True
-    protocol_activity = _protocol_activity(protocol_summary, limit=24)
-    service_activity = _service_activity(services_summary, limit=24)
+    protocol_rows_all = _protocol_activity(protocol_summary, limit=None)
+    protocol_activity = protocol_rows_all[:24]
+    service_rows_all = _service_activity(services_summary, limit=None)
+    service_activity = service_rows_all[:24]
     notable_flows = _notable_flows(protocol_summary, limit=30)
     capture_start, capture_end = _capture_window(protocol_summary, services_summary)
 
@@ -2113,13 +2169,16 @@ def analyze_overview(
             continue
         label = _MODULE_LABELS.get(step, step.upper())
         reason_parts: list[str] = []
-        meta = detected_meta.get(step, {})
-        if bool(meta.get("inventory", False)):
+        # Not ``meta``: that is the capture metadata the deep-dive closures
+        # above pass on, and rebinding it here handed them this dict (every
+        # deep dive of a capture read from disk failed on .file_type).
+        step_meta = detected_meta.get(step, {})
+        if bool(step_meta.get("inventory", False)):
             reason_parts.append("protocol/service labels")
-        port_hits = [int(v) for v in list(meta.get("ports", []) or [])]
+        port_hits = [int(v) for v in list(step_meta.get("ports", []) or [])]
         if port_hits:
             reason_parts.append("well-known ports " + ",".join(str(v) for v in port_hits[:4]))
-        decode_as_ports = list(meta.get("decode_as", []) or [])
+        decode_as_ports = list(step_meta.get("decode_as", []) or [])
         if decode_as_ports:
             reason_parts.append("decode-as on " + ",".join(decode_as_ports[:4]))
         reason = f"Detected {label} in protocol/service inventory."
@@ -2182,6 +2241,21 @@ def analyze_overview(
         ot_ports=ot_iot_ports,
     )
 
+    # The deep dive is the authority on a family that a port or label hint
+    # suggested: a peer's ephemeral port 3671 (or a "KNX" port label) is not
+    # KNXnet/IP when the KNX analyzer then finds no KNX packet.
+    def _confirmed(step: str) -> bool:
+        result = module_lookup.get(step)
+        packets = result.metrics.get("packets") if result is not None else None
+        return packets is None or int(packets or 0) > 0
+
+    detected_ot_steps = [step for step in detected_ot_steps if _confirmed(step)]
+    detected_ot_labels = [
+        str(detected_meta.get(step, {}).get("label") or _MODULE_LABELS.get(step, step))
+        for step in detected_ot_steps
+    ]
+    detected_iot_labels = _iot_labels_from_ot_labels(detected_ot_labels)
+
     ot_highlights: list[str] = []
     for note in decode_as_notes[:4]:
         ot_highlights.append(f"Non-standard port: {note}")
@@ -2210,19 +2284,14 @@ def analyze_overview(
     service_verdict = str(getattr(services_summary, "analyst_verdict", "") or "").strip()
     if service_verdict:
         hunt_highlights.append(f"Service posture: {service_verdict}")
-    for lead in hunt_leads[:4]:
-        entity = str(lead.get("entity", "") or "").strip()
-        finding = str(lead.get("finding", "") or "").strip()
-        if entity and finding:
-            hunt_highlights.append(f"{entity}: {finding}")
+    # The leads have their own section; listing them here again only
+    # duplicated it.
 
+    threats_result = module_lookup.get("threats")
     forensics_highlights: list[str] = []
     files_result = module_lookup.get("files")
     if files_result:
         forensics_highlights.extend(files_result.highlights[:3])
-    threats_result = module_lookup.get("threats")
-    if threats_result:
-        forensics_highlights.extend(threats_result.highlights[:2])
     if top_services:
         top_service_text = ", ".join(
             f"{name}({count})" for name, count in top_services[:5]
@@ -2233,6 +2302,10 @@ def analyze_overview(
     ctf_result = module_lookup.get("ctf")
     if ctf_result:
         ctf_highlights.extend(ctf_result.highlights[:4])
+
+    ot_highlights, hunt_highlights, forensics_highlights, ctf_highlights = _distinct_highlights(
+        ot_highlights, hunt_highlights, forensics_highlights, ctf_highlights
+    )
 
     recommendations: list[str] = []
     if detected_ot_steps:
@@ -2331,8 +2404,9 @@ def analyze_overview(
     module_error_count = sum(1 for item in module_results if item.errors)
     unique_protocols = len({name for name, _count in observed_protocols})
     unique_services = len({name for name, _count in observed_services})
+    # Every host, not the 24 the report lists: "unique IPs" was capped at 24.
     scope_counts: Counter[str] = Counter(
-        str(item.get("scope", "unknown")) for item in ip_activity if isinstance(item, dict)
+        str(item.get("scope", "unknown")) for item in ip_rows_all if isinstance(item, dict)
     )
     flow_count = len(list(getattr(protocol_summary, "conversations", []) or []))
     cross_zone_flows = _cross_zone_flow_count(protocol_summary)
@@ -2342,7 +2416,7 @@ def analyze_overview(
         else int(max(0.0, float(getattr(base_summary, "duration_seconds", 0.0) or 0.0)))
     )
     summary_details = {
-        "unique_ips": len(ip_activity),
+        "unique_ips": len(ip_rows_all),
         "unique_protocols": unique_protocols,
         "unique_services": unique_services,
         "internal_ips": int(scope_counts.get("internal", 0)),
@@ -2384,6 +2458,12 @@ def analyze_overview(
         ip_activity=ip_activity,
         protocol_activity=protocol_activity,
         service_activity=service_activity,
+        ip_activity_tail=ip_activity_tail,
+        ip_activity_total=len(ip_rows_all),
+        protocol_activity_tail=_ranking_tail(protocol_rows_all, 24),
+        protocol_activity_total=len(protocol_rows_all),
+        service_activity_tail=_ranking_tail(service_rows_all, 24),
+        service_activity_total=len(service_rows_all),
         notable_flows=notable_flows,
         hunt_leads=hunt_leads,
     )
@@ -2453,7 +2533,7 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
         for name, count in service_source:
             service_counter[str(name)] += int(count)
 
-        ip_rows = summary.ip_activity or summary.observed_ips
+        ip_rows = list(summary.ip_activity or summary.observed_ips) + list(getattr(summary, "ip_activity_tail", None) or [])
         for row in ip_rows:
             if not isinstance(row, dict):
                 continue
@@ -2726,7 +2806,7 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
 
     protocol_activity_bucket: dict[str, dict[str, object]] = {}
     for summary in summaries:
-        source_rows = summary.protocol_activity
+        source_rows = list(summary.protocol_activity) + list(getattr(summary, "protocol_activity_tail", None) or [])
         if not source_rows:
             source_rows = [
                 {"protocol": name, "packets": count}
@@ -2813,7 +2893,7 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
 
     service_activity_bucket: dict[str, dict[str, object]] = {}
     for summary in summaries:
-        source_rows = summary.service_activity
+        source_rows = list(summary.service_activity) + list(getattr(summary, "service_activity_tail", None) or [])
         if not source_rows:
             source_rows = [
                 {"service": name, "asset_count": count}
@@ -3094,6 +3174,14 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
         ip_activity=merged_ip_activity[:24],
         protocol_activity=merged_protocol_activity[:24],
         service_activity=merged_service_activity[:24],
+        ip_activity_tail=_ranking_tail(merged_ip_activity, 24),
+        ip_activity_total=max([len(merged_ip_activity)] + [int(getattr(s, "ip_activity_total", 0) or 0) for s in summaries]),
+        protocol_activity_tail=_ranking_tail(merged_protocol_activity, 24),
+        protocol_activity_total=max([len(merged_protocol_activity)]
+                                    + [int(getattr(s, "protocol_activity_total", 0) or 0) for s in summaries]),
+        service_activity_tail=_ranking_tail(merged_service_activity, 24),
+        service_activity_total=max([len(merged_service_activity)]
+                                   + [int(getattr(s, "service_activity_total", 0) or 0) for s in summaries]),
         notable_flows=merged_notable_flows[:30],
         hunt_leads=merged_hunt_leads[:14],
     )

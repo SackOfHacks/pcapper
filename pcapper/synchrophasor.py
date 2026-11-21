@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import PcapMeta, iter_packets
-from .utils import safe_float, memoize_analysis
+from .lite import UNSUPPORTED, LitePacket
+from .pcap_cache import PassStats, PcapMeta, iter_packets
+from .utils import extract_packet_endpoints, safe_float, memoize_analysis
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
@@ -84,6 +85,15 @@ def _looks_like_c37118(payload: bytes) -> Optional[int]:
     return frame_type
 
 
+def _synchrophasor_prefilter(record: LitePacket) -> bool:
+    """Only a packet with a C37.118 port on its transport can yield frames;
+    the rest count toward the capture totals alone."""
+    l4 = record.lite_l4()
+    if l4 is UNSUPPORTED:
+        return True
+    return l4 is not None and (l4[1] in SYNCHROPHASOR_PORTS or l4[2] in SYNCHROPHASOR_PORTS)
+
+
 def _iter_c37118_frames(payload: bytes) -> list[tuple[int, bytes]]:
     frames: list[tuple[int, bytes]] = []
     offset = 0
@@ -135,45 +145,76 @@ def analyze_synchrophasor(
             duration_seconds=None,
         )
 
+    # Read from disk, only packets on a C37.118 port are handed over (the
+    # totals come from the pass), as lite records parsed from their bytes.
+    stats = PassStats()
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path,
+            packets=packets,
+            meta=meta,
+            show_status=show_status,
+            lite=True,
+            prefilter=_synchrophasor_prefilter,
+            stats=stats,
+        ):
             total_packets += 1
             ts = safe_float(getattr(pkt, "time", None))
 
-            l4 = None
-            if pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                l4 = pkt[TCP]  # type: ignore[index]
-            elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                l4 = pkt[UDP]  # type: ignore[index]
-            if l4 is None:
-                continue
-            sport = int(getattr(l4, "sport", 0) or 0)
-            dport = int(getattr(l4, "dport", 0) or 0)
-            on_port = bool({sport, dport} & SYNCHROPHASOR_PORTS)
+            lite = pkt.lite_l4() if type(pkt) is LitePacket else UNSUPPORTED
+            if lite is None:
+                continue  # no TCP/UDP layer anywhere
+            if lite is not UNSUPPORTED and lite[5] >= 0:  # type: ignore[index]
+                # The packet's only transport, its payload a Raw layer: that
+                # is the first Raw layer, its load these bytes.
+                sport, dport = lite[1], lite[2]  # type: ignore[index]
+                on_port = bool({sport, dport} & SYNCHROPHASOR_PORTS)
+                payload = pkt.original[lite[5] : lite[6]]  # type: ignore[index]
+                if not payload:
+                    continue
+                frames = _iter_c37118_frames(payload) if on_port else []
+                if not frames:
+                    continue
+                src_ip, dst_ip = extract_packet_endpoints(pkt, include_arp=False)
+                src_ip = src_ip or ""
+                dst_ip = dst_ip or ""
+            else:
+                if type(pkt) is LitePacket:
+                    pkt = pkt.materialize()
+                l4 = None
+                if pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+                    l4 = pkt[TCP]  # type: ignore[index]
+                elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+                    l4 = pkt[UDP]  # type: ignore[index]
+                if l4 is None:
+                    continue
+                sport = int(getattr(l4, "sport", 0) or 0)
+                dport = int(getattr(l4, "dport", 0) or 0)
+                on_port = bool({sport, dport} & SYNCHROPHASOR_PORTS)
 
-            payload = b""
-            if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
-                try:
-                    payload = bytes(pkt[Raw].load)  # type: ignore[index]
-                except Exception:
-                    payload = b""
-            if not payload:
-                continue
+                payload = b""
+                if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
+                    try:
+                        payload = bytes(pkt[Raw].load)  # type: ignore[index]
+                    except Exception:
+                        payload = b""
+                if not payload:
+                    continue
 
-            # Require either the standard port or a strong signature to avoid
-            # matching unrelated traffic that happens to start with 0xAA.
-            frames = _iter_c37118_frames(payload) if on_port else []
-            if not frames:
-                continue
+                # Require either the standard port or a strong signature to avoid
+                # matching unrelated traffic that happens to start with 0xAA.
+                frames = _iter_c37118_frames(payload) if on_port else []
+                if not frames:
+                    continue
 
-            src_ip = ""
-            dst_ip = ""
-            if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                src_ip = str(pkt[IP].src)  # type: ignore[index]
-                dst_ip = str(pkt[IP].dst)  # type: ignore[index]
-            elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                src_ip = str(pkt[IPv6].src)  # type: ignore[index]
-                dst_ip = str(pkt[IPv6].dst)  # type: ignore[index]
+                src_ip = ""
+                dst_ip = ""
+                if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
+                    src_ip = str(pkt[IP].src)  # type: ignore[index]
+                    dst_ip = str(pkt[IP].dst)  # type: ignore[index]
+                elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
+                    src_ip = str(pkt[IPv6].src)  # type: ignore[index]
+                    dst_ip = str(pkt[IPv6].dst)  # type: ignore[index]
             if src_ip:
                 src_ips[src_ip] += 1
             if dst_ip:
@@ -198,6 +239,8 @@ def analyze_synchrophasor(
                     command_sources.setdefault(src_ip or "?", Counter())[cmd_name] += 1
     except Exception as exc:
         errors.append(str(exc))
+    if stats.active:
+        total_packets = stats.packets
 
     # A command to turn OFF data transmission stops the PMU stream a PDC/operator
     # relies on — a denial-of-view against grid monitoring/protection.

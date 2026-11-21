@@ -5,178 +5,59 @@ verbatim, only its location changed.
 """
 
 from __future__ import annotations
+
 from collections import Counter
 from pathlib import Path
 from typing import Iterable
-from ..coloring import (
-    danger,
-    header,
-    label,
-    muted,
-    ok,
-    warn,
-)
-from ..utils import (
-    format_bytes_as_mb,
-    format_ts,
-)
+
 from ..vlan import VlanStat, VlanSummary
-
+from . import _style as st
 from ._common import (
-    SECTION_BAR,
-    SUBSECTION_BAR,
     _apply_verbose_limit,
-    _filtered_detections,
-    _finalize_output,
-    _format_kv,
-    _format_table,
-    _limit_value,
-    _render_protocol_verdict,
 )
+from ._kv import findings_for
 
 
-def render_vlan_summary(
-    summary: VlanSummary, limit: int = 20, verbose: bool = False
-) -> str:
-    limit = _apply_verbose_limit(limit)
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"VLAN ANALYSIS :: {summary.path.name}"))
-    _render_protocol_verdict(
-        lines,
-        label="VLAN",
-        detections=getattr(summary, "detections", None),
-        anomalies=getattr(summary, "anomalies", None),
-    )
-    lines.append(SECTION_BAR)
-
-    lines.append(_format_kv("Tagged Packets", str(summary.total_tagged_packets)))
-    lines.append(
-        _format_kv("Tagged Bytes", format_bytes_as_mb(summary.total_tagged_bytes))
-    )
-
+def render_vlan_summary(summary: VlanSummary, limit: int = 20, verbose: bool = False) -> str:
+    """802.1Q VLANs: each VLAN's traffic, hosts and protocols (segmentation
+    as observed), with default-VLAN and double-tagging (VLAN hopping)
+    findings first; full IP/MAC lists per VLAN are -v."""
+    rep = st.Report("VLAN", summary.path)
+    findings = findings_for(summary, ot=False)
+    stats = list(summary.vlan_stats or [])
+    if not summary.total_tagged_packets and not st.material(findings):
+        return rep.absent("VLAN-tagged traffic", summary.errors)
+    severity, text = st.verdict(findings, high="VLAN hopping / segmentation issue: investigate", medium="VLAN configuration to review")
+    double = int(getattr(summary, "double_tagged_packets", 0) or 0)
+    rep.headline(severity, text, st.join([
+        f"{st.count(summary.total_tagged_packets)} tagged packets · {st.size(summary.total_tagged_bytes)}",
+        st.plural(len(stats), "VLAN"),
+        st.bad(f"{double} double-tagged") if double else "",
+    ]))
     if summary.errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        for err in summary.errors:
-            lines.append(danger(f"- {err}"))
-
-    if getattr(summary, "analysis_notes", None):
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Notes"))
-        for note in summary.analysis_notes:
-            lines.append(muted(f"- {note}"))
-
-    if summary.vlan_stats:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("VLAN Inventory"))
-        rows = [
-            [
-                "VLAN",
-                "Packets",
-                "Bytes",
-                "IPs",
-                "Top Protocols",
-                "First Seen",
-                "Last Seen",
-            ]
-        ]
-        for vlan in summary.vlan_stats[:limit]:
-            ip_count = len(vlan.src_ips.union(vlan.dst_ips))
-            proto_preview = (
-                ", ".join(
-                    name for name, _count in vlan.protocols.most_common(_limit_value(4))
-                )
-                or "-"
-            )
-            rows.append(
-                [
-                    str(vlan.vlan_id),
-                    str(vlan.packets),
-                    format_bytes_as_mb(vlan.bytes),
-                    str(ip_count),
-                    proto_preview,
-                    format_ts(vlan.first_seen),
-                    format_ts(vlan.last_seen),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("IPs Per VLAN"))
-        ip_rows = [["VLAN", "IP Count", "IPs"]]
-        for vlan in summary.vlan_stats[:limit]:
-            ip_list = sorted(vlan.src_ips.union(vlan.dst_ips))
-            preview = ip_list[: _limit_value(10)]
-            if len(ip_list) > 10:
-                preview_text = ", ".join(preview) + f" (+{len(ip_list) - 10} more)"
-            else:
-                preview_text = ", ".join(preview) if preview else "-"
-            ip_rows.append(
-                [
-                    str(vlan.vlan_id),
-                    str(len(ip_list)),
-                    preview_text,
-                ]
-            )
-        lines.append(_format_table(ip_rows))
-
-        if verbose:
-            lines.append(SUBSECTION_BAR)
-            lines.append(header("VLAN Detailed Artifacts"))
-            for vlan in summary.vlan_stats[:limit]:
-                lines.append(label(f"VLAN {vlan.vlan_id}"))
-                ip_list = sorted(vlan.src_ips.union(vlan.dst_ips))
-                mac_list = sorted(vlan.src_macs.union(vlan.dst_macs))
-                proto_list = ", ".join(
-                    f"{name}({count})"
-                    for name, count in vlan.protocols.most_common(_limit_value(10))
-                )
-                lines.append(f"  IPs: {', '.join(ip_list) if ip_list else '-'}")
-                lines.append(f"  MACs: {', '.join(mac_list) if mac_list else '-'}")
-                lines.append(f"  Protocols: {proto_list if proto_list else '-'}")
-    else:
-        lines.append(muted("No VLAN-tagged traffic detected."))
-
-    detections = _filtered_detections(summary, verbose)
-    if detections:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Detections"))
-        for item in detections:
-            severity = item.get("severity", "info")
-            summary_text = item.get("summary", "")
-            details = item.get("details", "")
-            if severity == "warning":
-                marker = warn("[WARN]")
-            elif severity == "critical":
-                marker = danger("[CRIT]")
-            else:
-                marker = ok("[INFO]")
-            lines.append(f"{marker} {summary_text}")
-            if details:
-                lines.append(muted(f"  {details}"))
-            packet_count = item.get("packet_count")
-            unique_sources = item.get("unique_sources")
-            unique_destinations = item.get("unique_destinations")
-            if packet_count is not None:
-                lines.append(muted(f"  Packets: {packet_count}"))
-            if unique_sources is not None or unique_destinations is not None:
-                src_val = str(unique_sources) if unique_sources is not None else "-"
-                dst_val = (
-                    str(unique_destinations) if unique_destinations is not None else "-"
-                )
-                lines.append(muted(f"  Unique Sources/Dests: {src_val}/{dst_val}"))
-            top_sources = item.get("top_sources")
-            if top_sources:
-                src_text = ", ".join(f"{ip}({count})" for ip, count in top_sources)
-                lines.append(muted(f"  Sources: {src_text}"))
-            top_destinations = item.get("top_destinations")
-            if top_destinations:
-                dst_text = ", ".join(f"{ip}({count})" for ip, count in top_destinations)
-                lines.append(muted(f"  Destinations: {dst_text}"))
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Findings", st.findings_block(findings))
+    rep.section("VLANs", st.table(
+        ["VLAN", "Packets", "Bytes", "Hosts", "MACs", "Protocols", "First", "Last"],
+        [[v.vlan_id, st.count(v.packets), st.size(v.bytes), st.count(len(v.src_ips | v.dst_ips)), st.count(len(v.src_macs | v.dst_macs)),
+          st.top(v.protocols, 4), st.ts(v.first_seen), st.ts(v.last_seen)] for v in stats],
+        align="rrrrrlll", max_rows=20, noun="VLAN",
+    ))
+    rep.section("Hosts per VLAN", st.table(
+        ["VLAN", "Hosts"],
+        [[v.vlan_id, ", ".join(sorted(v.src_ips | v.dst_ips)) if st.verbose() else
+          (", ".join(sorted(v.src_ips | v.dst_ips)[:8]) + (st.dim(f", +{len(v.src_ips | v.dst_ips) - 8} more")
+                                                          if len(v.src_ips | v.dst_ips) > 8 else ""))] for v in stats],
+        align="rl", max_rows=20, noun="VLAN",
+    ))
+    rep.section("Details", [line for v in stats for line in (
+        [f"  {st.strong(f'VLAN {v.vlan_id}')}"] + st.kv([
+            ("IPs", ", ".join(sorted(v.src_ips | v.dst_ips)) or "-"),
+            ("MACs", ", ".join(sorted(v.src_macs | v.dst_macs)) or "-"),
+            ("Protocols", st.top(v.protocols, None) or "-"),
+        ], indent=4))], detail=True)
+    rep.section("Notes", st.bullets(getattr(summary, "analysis_notes", None) or [], max_items=None), detail=True)
+    return rep.render()
 
 
 def render_vlan_rollup(

@@ -1,254 +1,144 @@
-"""Rendered output for ldap analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for LDAP: who bound as whom (and in cleartext with which
+password), what was searched for (base, filter, attributes), what was
+written, and what the directory returned (accounts, computers, SPNs).
+Decoded from cleartext LDAP; SASL-sealed sessions show only their binds'
+mechanisms and result codes."""
 
 from __future__ import annotations
+
+from collections import Counter
 from typing import TYPE_CHECKING
-from ..coloring import (
-    danger,
-    header,
-    muted,
-    ok,
-    warn,
-)
+
 from ..services import COMMON_PORTS
+from . import _style as st
+from ._common import _redact_in_text, _redact_secret, _render_deterministic_checks
+from ._kv import counter_line, findings_for
+from ._remote import counts
+
 if TYPE_CHECKING:
     from ..ldap import LdapAnalysis
 
-from ._common import (
-    SECTION_BAR,
-    SUBSECTION_BAR,
-    _apply_verbose_limit,
-    _counter_table,
-    _filtered_detections,
-    _finalize_output,
-    _format_kv,
-    _format_table,
-    _limit_value,
-    _redact_in_text,
-    _redact_secret,
-    _render_deterministic_checks,
-    _render_protocol_verdict,
-)
 
-
-def render_ldap_summary(
-    summary: "LdapAnalysis", limit: int = 25, verbose: bool = False
-) -> str:
-    limit = _apply_verbose_limit(limit)
-
+def render_ldap_summary(summary: "LdapAnalysis", limit: int = 25, verbose: bool = False) -> str:
     if not summary:
         return ""
-
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"LDAP ANALYSIS :: {summary.path.name}"))
-    lines.append(SECTION_BAR)
-    _render_protocol_verdict(
-        lines,
-        label="LDAP",
-        detections=getattr(summary, "detections", None),
-        anomalies=getattr(summary, "anomalies", None),
-    )
-
+    rep = st.Report("LDAP", summary.path)
+    findings = findings_for(summary, ot=False)
+    total_ldap = summary.cleartext_packets + summary.ldaps_packets
+    if not total_ldap and not summary.conversations and not st.material(findings):
+        return rep.absent("LDAP traffic", summary.errors)
+    severity, text = st.verdict(findings, high="LDAP credential exposure or directory abuse: investigate",
+                                medium="LDAP activity to review")
+    rep.headline(severity, text, st.join([
+        f"{st.count(summary.cleartext_packets)} LDAP packets",
+        f"{st.count(summary.ldaps_packets)} LDAPS" if summary.ldaps_packets else "",
+        st.duration(summary.duration) if summary.duration else "",
+    ]))
+    stats = summary.session_stats or {}
+    rep.scope(st.join([f"{st.plural(len(summary.clients), 'client')} -> {st.plural(len(summary.servers), 'server')}",
+                       st.plural(int(stats.get("total_sessions", 0) or 0), "session") if stats else ""]))
     if summary.errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        for err in summary.errors:
-            lines.append(danger(f"- {err}"))
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Findings", st.findings_block(findings))
 
-    lines.append(_format_kv("Duration", f"{summary.duration:.2f}s"))
-    lines.append(_format_kv("Total Packets", str(summary.total_packets)))
-    if summary.session_stats:
-        lines.append(
-            _format_kv(
-                "LDAP Sessions", str(summary.session_stats.get("total_sessions", 0))
-            )
-        )
-        lines.append(
-            _format_kv(
-                "Unique Clients", str(summary.session_stats.get("unique_clients", 0))
-            )
-        )
-        lines.append(
-            _format_kv(
-                "Unique Servers", str(summary.session_stats.get("unique_servers", 0))
-            )
-        )
+    binds = sorted(summary.bind_identities or [], key=lambda b: b.get("ts") or 0.0)
+    rep.section("Binds", st.table(
+        ["Time", "Flow", "Identity", "Auth"],
+        [[st.ts(b.get("ts")), st.flow(b.get("src_ip"), f"{b.get('dst_ip')}:{b.get('dst_port')}"),
+          _redact_in_text(str(b.get("identity", "-"))), b.get("auth") or "-"] for b in binds],
+        max_rows=10, noun="bind",
+    ))
+    rep.section("Credentials", st.bullets([f"{_redact_secret(str(k))}" + (st.dim(f"  ×{v}") if v > 1 else "")
+                                           for k, v in summary.secrets.most_common()], max_items=10, noun="credential"))
 
-    if summary.ldap_domains:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("LDAP-Related DNS"))
-        lines.append(_counter_table(summary.ldap_domains, "Domain", limit=limit))
+    searches = list(getattr(summary, "search_requests", None) or [])
+    if searches:
+        grouped: Counter = Counter((s.get("base", ""), s.get("scope", ""), s.get("filter", ""),
+                                    ", ".join(s.get("attributes") or [])) for s in searches)
+        rep.section("Searches", st.table(
+            ["Base", "Scope", "Filter", "Attributes", "Count"],
+            [[base or "(root DSE)", scope, flt, attrs or "(all)", st.count(n)] for (base, scope, flt, attrs), n in grouped.most_common()],
+            align="llllr", widths=(40, None, 60, 40), max_rows=st.TOP_ROWS, tail=st.TOP_ROWS, noun="search",
+        ))
+    else:
+        rep.section("Queries", counts(summary.ldap_queries, "Query", width=90, max_rows=10, noun="query"))
+    writes = list(getattr(summary, "writes", None) or [])
+    rep.section("Writes", st.table(
+        ["Time", "Client", "Operation", "DN", "Attributes"],
+        [[st.ts(w.get("ts")), w.get("client", "-"), w.get("op", "-"), w.get("dn", "-"), ", ".join(w.get("changes") or []) or "-"]
+         for w in writes],
+        widths=(None, None, None, 60, 60), max_rows=10, noun="write",
+    ))
+    rep.section("Directory data", st.kv([
+        ("Entries returned", st.count(getattr(summary, "entries_returned", 0)) if getattr(summary, "entries_returned", 0) else ""),
+        ("Users", st.top(summary.ldap_users, 12, fmt=lambda k, v: f"{_redact_in_text(str(k))} ({st.count(v)})")),
+        counter_line("Computers", summary.ldap_systems, 8),
+        counter_line("SPNs", getattr(summary, "spns", None), 6),
+        counter_line("Sensitive attributes", summary.suspicious_attributes, 8),
+    ]))
+    rep.section("Protocol", st.kv([
+        counter_line("Operations", getattr(summary, "operations", None), 8),
+        counter_line("Errors", summary.ldap_error_codes, 6),
+        counter_line("Diagnostics", getattr(summary, "diagnostics", None), 3),
+        ("Transport", f"LDAP (389/3268) {summary.cleartext_packets} · LDAPS (636/3269) {summary.ldaps_packets}"
+                      if total_ldap else ""),
+    ]))
+    rep.section("Bind bursts", st.table(["Client", "Peak binds per minute"],
+                                        [[c, st.count(n)] for c, n in summary.bind_bursts.most_common()], align="lr",
+                                        noun="client"),
+                detail=max(summary.bind_bursts.values(), default=0) < 10)
+    rep.section("Public endpoints", counts(summary.public_endpoints, "Endpoint"))
 
-    if summary.servers or summary.clients:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top LDAP Servers & Clients"))
-        rows = [["Servers", "Clients"]]
-        server_text = (
-            ", ".join(
-                f"{ip}({count})"
-                for ip, count in summary.servers.most_common(_limit_value(10))
-            )
-            or "-"
-        )
-        client_text = (
-            ", ".join(
-                f"{ip}({count})"
-                for ip, count in summary.clients.most_common(_limit_value(10))
-            )
-            or "-"
-        )
-        rows.append([server_text, client_text])
-        lines.append(_format_table(rows))
+    rep.section("Conversations", st.table(
+        ["Source", "Destination", "Port", "Proto", "Packets"],
+        [[c.src_ip, c.dst_ip, c.dst_port, c.proto, st.count(c.packets)] for c in summary.conversations],
+        align="llrlr", max_rows=None, noun="conversation",
+    ), detail=True)
+    rep.section("Search requests", st.table(
+        ["Time", "Client", "Base", "Scope", "Filter", "Attributes"],
+        [[st.ts(s.get("ts")), s.get("client", "-"), s.get("base") or "(root DSE)", s.get("scope", "-"), s.get("filter", "-"),
+          ", ".join(s.get("attributes") or []) or "(all)"] for s in searches],
+        max_rows=None, noun="search",
+    ), detail=True)
+    rep.section("Account evidence", st.table(
+        ["Flow", "Attribute", "Value"],
+        [[st.flow(e.get("src_ip"), e.get("dst_ip")), e.get("attr", "-"), _redact_in_text(str(e.get("value", "-")))]
+         for e in (summary.user_evidence or [])], max_rows=None, noun="value",
+    ), detail=True)
 
-    if summary.service_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("LDAP Service Ports"))
-        rows = [["Service", "Name", "Count"]]
-        for svc, count in summary.service_counts.most_common(limit):
-            svc_name = "-"
-            try:
-                _proto, port_str = svc.split("/", 1)
-                port = int(port_str)
-                svc_name = COMMON_PORTS.get(port, "-")
-            except Exception:
-                svc_name = "-"
-            rows.append([svc, svc_name, str(count)])
-        lines.append(_format_table(rows))
+    def _svc(svc: object) -> str:
+        try:
+            name = COMMON_PORTS.get(int(str(svc).split("/", 1)[1]))
+        except (IndexError, ValueError):
+            name = None
+        return f"{svc} ({name})" if name else str(svc)
 
-    if summary.conversations:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("LDAP Conversations"))
-        rows = [["Src", "Dst", "Port", "Proto", "Packets"]]
-        for convo in summary.conversations[:limit]:
-            rows.append(
-                [
-                    convo.src_ip,
-                    convo.dst_ip,
-                    str(convo.dst_port),
-                    convo.proto,
-                    str(convo.packets),
-                ]
-            )
-        lines.append(_format_table(rows))
+    rep.section("Context", st.kv([
+        counter_line("LDAP-related DNS", summary.ldap_domains, None),
+        ("Service ports", st.top(summary.service_counts, None, fmt=lambda k, v: f"{_svc(k)} ({v})")),
+        counter_line("Response codes", summary.response_codes, None),
+        counter_line("Requests", summary.request_counts, None),
+        counter_line("Filter types", summary.ldap_filter_types, None),
+        counter_line("Bind identities", summary.ldap_binds, None),
+        counter_line("HTTP methods", summary.http_methods, None),
+        counter_line("HTTP clients", summary.http_clients, None),
+        counter_line("URLs", summary.urls, None),
+        counter_line("User agents", summary.user_agents, None),
+        ("Files", ", ".join(summary.files or [])),
+    ]), detail=True)
+    rep.section("Artifacts", st.bullets([_redact_in_text(str(a)) for a in summary.artifacts], max_items=None), detail=True)
+    hyp = [f"[{h.get('confidence', '?')}] {h.get('hypothesis', '-')} (evidence={h.get('evidence', '')})"
+           for h in (summary.threat_hypotheses or [])]
+    rep.section("Threat hypotheses", st.bullets(hyp, max_items=None), detail=True)
+    rep.section("Benign context", st.bullets(summary.benign_context or [], max_items=None), detail=True)
+    rep.section("Traffic", st.kv([("Duration", f"{summary.duration:.2f}s"),
+                                  ("Packets", f"{summary.total_packets} total · {total_ldap} LDAP"),
+                                  ("Clients / servers", f"{stats.get('unique_clients', 0)} / {stats.get('unique_servers', 0)}")]),
+                detail=True)
 
-    if summary.ldap_queries:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("LDAP Queries"))
-        lines.append(_counter_table(summary.ldap_queries, "Query", limit=limit))
-
-    if summary.ldap_filter_types:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top LDAP Queries by Filter Type"))
-        lines.append(_counter_table(summary.ldap_filter_types, "Filter Type", limit=limit))
-
-    if summary.ldap_binds:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Binds"))
-        lines.append(_counter_table(summary.ldap_binds, "Bind Identity", limit=limit))
-
-    if summary.ldap_users:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("LDAP Users"))
-        lines.append(_counter_table(summary.ldap_users, "User", limit=limit))
-
-    if summary.ldap_systems:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("LDAP Systems"))
-        lines.append(_counter_table(summary.ldap_systems, "System", limit=limit))
-
-    if summary.response_codes:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("LDAP Response Codes"))
-        lines.append(_counter_table(summary.response_codes, "Code", limit=limit))
-
-    if summary.ldap_error_codes:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top LDAP Errors by Code"))
-        lines.append(_counter_table(summary.ldap_error_codes, "Error", limit=limit))
-
-    if summary.request_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("LDAP Requests"))
-        lines.append(_counter_table(summary.request_counts, "Request", limit=limit))
-
-    if summary.cleartext_packets or summary.ldaps_packets:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("LDAP Cleartext vs LDAPS Ratio"))
-        total = summary.cleartext_packets + summary.ldaps_packets
-        clear_pct = (summary.cleartext_packets / total * 100.0) if total else 0.0
-        ldaps_pct = (summary.ldaps_packets / total * 100.0) if total else 0.0
-        rows = [["Type", "Packets", "Percent"]]
-        rows.append(["Cleartext", str(summary.cleartext_packets), f"{clear_pct:.1f}%"])
-        rows.append(["LDAPS", str(summary.ldaps_packets), f"{ldaps_pct:.1f}%"])
-        lines.append(_format_table(rows))
-
-    if summary.secrets:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Secrets/Passwords"))
-        rows = [["Value", "Count"]]
-        for secret, count in summary.secrets.most_common(limit):
-            rows.append([_redact_secret(str(secret)), str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.public_endpoints:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Public IP LDAP Endpoints"))
-        lines.append(_counter_table(summary.public_endpoints, "Endpoint", limit=limit))
-
-    if summary.suspicious_attributes:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Suspicious Attributes Queried"))
-        lines.append(_counter_table(summary.suspicious_attributes, "Attribute", limit=limit))
-
-    if summary.bind_bursts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Burst Activity / Brute Force Indicators"))
-        rows = [["Client", "Peak Binds/Min"]]
-        for client, count in summary.bind_bursts.most_common(limit):
-            rows.append([client, str(count)])
-        lines.append(_format_table(rows))
-
-    if summary.artifacts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Artifacts"))
-        lines.append(muted(", ".join(summary.artifacts[:limit])))
-
-    if summary.anomalies:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Anomalies"))
-        for item in summary.anomalies[:limit]:
-            lines.append(warn(f"- {item}"))
-
-    detections = _filtered_detections(summary, verbose)
-    if detections:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Detections"))
-        for item in detections:
-            severity = str(item.get("severity", "info")).lower()
-            summary_text = str(item.get("summary", ""))
-            details = _redact_in_text(str(item.get("details", "")))
-            if "extension/type mismatch" in summary_text.lower():
-                severity = "high"
-            if severity == "warning":
-                marker = warn("[WARN]")
-            elif severity == "critical":
-                marker = danger("[CRIT]")
-            elif severity == "high":
-                marker = danger("[HIGH]")
-                summary_text = danger(summary_text)
-            else:
-                marker = ok("[INFO]")
-            lines.append(f"{marker} {summary_text}")
-            if details:
-                lines.append(muted(f"  {details}"))
-
-    lines.append(SECTION_BAR)
-    _render_deterministic_checks(
-        lines, summary, "Deterministic LDAP Security Checks", [
+    if st.analysis_sections():
+        legacy: list[str] = []
+        _render_deterministic_checks(legacy, summary, "Deterministic LDAP Security Checks", [
             ("cleartext_ldap_exposure", "Cleartext LDAP Exposure"),
             ("bind_auth_risk", "Bind Authentication Risk"),
             ("anonymous_or_guest_bind_activity", "Anonymous/Guest Bind Activity"),
@@ -258,6 +148,6 @@ def render_ldap_summary(
             ("secret_material_exposure", "Secret Material Exposure"),
             ("directory_write_activity", "Directory Write Activity"),
             ("public_ldap_endpoint_exposure", "Public LDAP Endpoint Exposure"),
-        ]
-    )
-    return _finalize_output(lines)
+        ])
+        rep.section("Deterministic checks", legacy[2:])
+    return rep.render()

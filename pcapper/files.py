@@ -2,6 +2,8 @@ from __future__ import annotations
 
 
 from .utils import is_public_ip as _is_public_ip
+import io
+import functools
 import base64
 import email
 import hashlib
@@ -43,13 +45,17 @@ from .cip import CIP_SERVICE_NAMES
 from .nfs import analyze_nfs
 from .openvpn import iter_openvpn_tcp_control_payloads, openvpn_tcp_control_opcodes
 from .capture_parts import capture_parts
-from .pcap_cache import PcapMeta, iter_packets
+from .lite import UNSUPPORTED, LitePacket
+from .pcap_cache import PcapMeta, complete_packet_view, iter_packets
+from .utils import open_capture_file
 from .utils import (
+    fan_out,
     detect_file_type_bytes,
     env_int,
     extract_packet_endpoints,
     memoize_analysis,
     packet_length,
+    planning,
     restrict_dir_permissions,
     safe_float,
     safe_write_bytes,
@@ -2559,6 +2565,25 @@ class FileExtractor:
         )
         self.smb_encrypted: Counter[str] = Counter()
         self.smb_signed: Counter[str] = Counter()
+        # The same retained-payload budget as the dpkt pass: streamed from
+        # disk, a large capture's TCP payload would otherwise all be held.
+        self._retained_bytes = 0
+        self._budget_reported = False
+
+    def _retain(self, payload: bytes, idx: int) -> bytes:
+        remaining = FILES_TOTAL_STREAM_BYTES - self._retained_bytes
+        if remaining >= len(payload):
+            self._retained_bytes += len(payload)
+            return payload
+        if not self._budget_reported:
+            self._budget_reported = True
+            self.errors.append(
+                f"Stream reconstruction budget of {FILES_TOTAL_STREAM_BYTES} bytes reached at "
+                f"packet {idx}; later TCP payload was not retained (PCAPPER_FILES_TOTAL_STREAM_BYTES)."
+            )
+        kept = payload[: max(0, remaining)]
+        self._retained_bytes += len(kept)
+        return kept
 
     def process_packet(self, pkt: Packet, idx: int):
         # IP/IPv6
@@ -2573,31 +2598,60 @@ class FileExtractor:
         # Statistics
         ts = safe_float(getattr(pkt, "time", 0))
 
-        if TCP and pkt.haslayer(TCP):
-            tcp = pkt[TCP]
-            proto = "TCP"
-            sport, dport = int(tcp.sport), int(tcp.dport)
-            try:
-                payload = _scapy_segment_payload(tcp)
-            except Exception:
-                payload = b""
-            if payload:
-                seq = int(tcp.seq)
-                self.tcp_streams[(src, dst, sport, dport)].append((seq, payload, idx))
+        l4 = pkt.lite_l4() if type(pkt) is LitePacket else UNSUPPORTED
+        if l4 is None:
+            pass  # no TCP/UDP layer anywhere
+        elif l4 is not UNSUPPORTED and l4[5] >= 0:  # type: ignore[index]
+            # The packet's only transport layer, its payload a Raw layer.
+            data = pkt.original  # type: ignore[attr-defined]
+            sport, dport = l4[1], l4[2]  # type: ignore[index]
+            if l4[0]:  # type: ignore[index]
+                proto = "TCP"
+                payload = data[l4[5] : l4[6]]  # type: ignore[index]
+                if payload:
+                    payload = self._retain(payload, idx)
+                if payload:
+                    self.tcp_streams[(src, dst, sport, dport)].append((l4[3], payload, idx))  # type: ignore[index]
+            else:
+                proto = "UDP"
+                if l4[6] > l4[5]:  # type: ignore[index]
+                    # bytes(pkt[Raw]): the load and the padding scapy put behind it
+                    load = data[l4[5] :]  # type: ignore[index]
+                    if _is_tftp_payload(load):
+                        self._handle_tftp(load, src, dst, sport, dport, idx)
+                        self.flow_protocol_hints[(src, dst, "UDP", sport, dport)][
+                            "TFTP"
+                        ] += 1
+        else:
+            if type(pkt) is LitePacket:
+                pkt = pkt.materialize()
+            if TCP and pkt.haslayer(TCP):
+                tcp = pkt[TCP]
+                proto = "TCP"
+                sport, dport = int(tcp.sport), int(tcp.dport)
+                try:
+                    payload = _scapy_segment_payload(tcp)
+                except Exception:
+                    payload = b""
+                if payload:
+                    payload = self._retain(payload, idx)
+                if payload:
+                    seq = int(tcp.seq)
+                    self.tcp_streams[(src, dst, sport, dport)].append((seq, payload, idx))
 
-        elif UDP and pkt.haslayer(UDP):
-            udp = pkt[UDP]
-            proto = "UDP"
-            sport, dport = int(udp.sport), int(udp.dport)
+            elif UDP and pkt.haslayer(UDP):
+                udp = pkt[UDP]
+                proto = "UDP"
+                sport, dport = int(udp.sport), int(udp.dport)
 
-            # TFTP
-            if Raw in pkt:
-                load = bytes(pkt[Raw])
-                if _is_tftp_payload(load):
-                    self._handle_tftp(load, src, dst, sport, dport, idx)
-                    self.flow_protocol_hints[(src, dst, "UDP", sport, dport)][
-                        "TFTP"
-                    ] += 1
+                # TFTP
+                if Raw in pkt:
+                    load = bytes(pkt[Raw])
+                    if _is_tftp_payload(load):
+                        self._handle_tftp(load, src, dst, sport, dport, idx)
+                        self.flow_protocol_hints[(src, dst, "UDP", sport, dport)][
+                            "TFTP"
+                        ] += 1
 
         if proto != "IP":
             key = (src, dst, proto, sport, dport)
@@ -3560,15 +3614,100 @@ def _compute_imphash(payload: bytes) -> Optional[str]:
     return None
 
 
+def _capture_datalink(path: Path) -> Optional[int]:
+    """The link type the disk branch of :func:`_export_with_dpkt` decodes
+    ``path`` with (dpkt's ``reader.datalink()``; the global header's for a
+    modified pcap), or None when parts disagree or it cannot be read. Cached
+    per version of the capture's parts."""
+    from .utils import file_version
+
+    versions = tuple(file_version(part) for part in capture_parts(path))
+    if any(v is None for v in versions):
+        return _capture_datalink_uncached(path)
+    return _capture_datalink_cached(Path(path), versions)
+
+
+@functools.lru_cache(maxsize=256)
+def _capture_datalink_cached(path: Path, _versions: tuple) -> Optional[int]:
+    return _capture_datalink_uncached(path)
+
+
+def _datalink_of(handle) -> Optional[int]:  # type: ignore[no-untyped-def]
+    """The link type a capture's header names (dpkt's reading of it)."""
+    from .utils import PCAP_MODIFIED_MAGIC_BYTES
+
+    head = handle.read(24)
+    if head[:4] in PCAP_MODIFIED_MAGIC_BYTES:
+        if len(head) < 24:
+            return None
+        order = "big" if PCAP_MODIFIED_MAGIC_BYTES[head[:4]] == ">" else "little"
+        return int.from_bytes(head[20:24], order)
+    handle.seek(0)
+    try:
+        reader = dpkt.pcapng.Reader(handle)
+    except Exception:
+        handle.seek(0)
+        reader = dpkt.pcap.Reader(handle)
+    return reader.datalink()
+
+
+def _capture_datalink_uncached(path: Path) -> Optional[int]:
+    from .utils import PCAP_MODIFIED_MAGIC_BYTES
+
+    found: Optional[int] = None
+    for part in capture_parts(path):
+        try:
+            # A compressed capture's header from its inflated start (no 128 KiB
+            # gzip read); a start too short for its pcapng header falls back.
+            from .utils import capture_prefix, is_gzip_file
+
+            if is_gzip_file(part):
+                try:
+                    datalink_found = _datalink_of(io.BytesIO(capture_prefix(part)))
+                except Exception:  # noqa: BLE001
+                    datalink_found = None
+                if datalink_found is not None:
+                    datalink = datalink_found
+                    if found is None:
+                        found = datalink
+                    elif datalink != found:
+                        return None
+                    continue
+            with open_capture_file(part, buffering=4096) as handle:
+                head = handle.read(24)
+                if head[:4] in PCAP_MODIFIED_MAGIC_BYTES:
+                    if len(head) < 24:
+                        return None
+                    order = "big" if PCAP_MODIFIED_MAGIC_BYTES[head[:4]] == ">" else "little"
+                    datalink = int.from_bytes(head[20:24], order)
+                else:
+                    handle.seek(0)
+                    try:
+                        reader = dpkt.pcapng.Reader(handle)
+                    except Exception:
+                        handle.seek(0)
+                        reader = dpkt.pcap.Reader(handle)
+                    datalink = reader.datalink()
+        except Exception:
+            return None
+        if found is None:
+            found = datalink
+        elif datalink != found:
+            return None
+    return found
+
+
+
 def _dpkt_can_read(path: Path) -> bool:
     """dpkt reads classic pcap and pcapng, but not the modified-pcap variant."""
     from .utils import PCAP_MODIFIED_MAGIC_BYTES
 
+    from .utils import capture_head
+
     for part in capture_parts(path):
         try:
-            with part.open("rb") as handle:
-                if handle.read(4) in PCAP_MODIFIED_MAGIC_BYTES:
-                    return False
+            if capture_head(part)[:4] in PCAP_MODIFIED_MAGIC_BYTES:
+                return False
         except OSError:
             return False
     return True
@@ -3657,10 +3796,65 @@ def _export_with_dpkt(
             return True
         return filter_ip in {str(src_ip), str(dst_ip)}
 
+    def _take_dpkt_ip(ip: object, idx: int) -> None:
+        """One record's IP layer as dpkt decoded it: its TCP/UDP payload
+        (sized by the IP header, so link padding never enters a stream)."""
+        if isinstance(ip, (dpkt.ip.IP, dpkt.ip6.IP6)):
+            src_ip = _dpkt_ip_to_str(ip.src)
+            dst_ip = _dpkt_ip_to_str(ip.dst)
+        else:
+            return
+        if not _in_scope(src_ip, dst_ip):
+            return
+        if isinstance(ip.data, dpkt.tcp.TCP):
+            tcp = ip.data
+            payload = bytes(tcp.data or b"")
+            payload = _retain_payload_budget(payload, idx)
+            if payload:
+                tcp_streams[
+                    (src_ip, dst_ip, int(tcp.sport), int(tcp.dport))
+                ].append((int(tcp.seq), payload, idx))
+        elif isinstance(ip.data, dpkt.udp.UDP):
+            udp = ip.data
+            payload = bytes(udp.data or b"")
+            payload = _retain_payload_budget(payload, idx)
+            if payload:
+                udp_packets.append(
+                    (
+                        src_ip,
+                        dst_ip,
+                        int(udp.sport),
+                        int(udp.dport),
+                        payload,
+                        idx,
+                    )
+                )
+
+    if packets is None and planning():
+        # A shared pass making its plan runs each analysis over an empty
+        # packet view; reading the file here instead cost a full read per
+        # call while the plan was made (15 for --threats, 21 for
+        # --compromised), on one core, before any analysis started.
+        packets = []
+    if packets is None and complete_packet_view(path) is not None:
+        # The capture is in memory whole (not a -ip / BPF / time selection):
+        # its records are the ones dpkt would read from the file, decoded the
+        # same way below, without a read of the file per nested file analysis
+        # (--overview, --timeline, --hostdetails, --ctf ...).
+        packets = complete_packet_view(path)  # type: ignore[assignment]
     if packets is None and not _dpkt_can_read(path):
         # dpkt cannot open every format pcapper reads (modified pcap); stream
-        # those through scapy instead of reporting a parse failure.
-        packets = iter_packets(path, show_status=False)  # type: ignore[assignment]
+        # those records instead of reporting a parse failure.
+        packets = iter_packets(path, show_status=False, lite=True)  # type: ignore[assignment]
+    if packets is None:
+        from . import sharedpass
+
+        if sharedpass.consuming(path):
+            # Inside a shared pass the capture is already being read for every
+            # analysis: take its records (each with its captured bytes, decoded
+            # below exactly as the dpkt branch decodes them) instead of a read
+            # of its own.
+            packets = iter_packets(path, show_status=False, lite=True)  # type: ignore[assignment]
     if packets is None:
         if dpkt is None:
             return None
@@ -3669,7 +3863,7 @@ def _export_with_dpkt(
             # A joined split capture is read part by part, in order; packet
             # indices continue across parts so they match the joined view.
             for part in capture_parts(path):
-                with part.open("rb") as handle:
+                with open_capture_file(part) as handle:
                     try:
                         reader = dpkt.pcapng.Reader(handle)
                     except Exception:
@@ -3683,49 +3877,25 @@ def _export_with_dpkt(
                     for ts, buf in reader:
                         idx += 1
                         ip = _decode_dpkt_ip_packet(buf, datalink)
-                        if ip is None:
-                            continue
-
-                        if isinstance(ip, dpkt.ip.IP):
-                            src_ip = _dpkt_ip_to_str(ip.src)
-                            dst_ip = _dpkt_ip_to_str(ip.dst)
-                        elif isinstance(ip, dpkt.ip6.IP6):
-                            src_ip = _dpkt_ip_to_str(ip.src)
-                            dst_ip = _dpkt_ip_to_str(ip.dst)
-                        else:
-                            continue
-                        if not _in_scope(src_ip, dst_ip):
-                            continue
-
-                        if isinstance(ip.data, dpkt.tcp.TCP):
-                            tcp = ip.data
-                            payload = bytes(tcp.data or b"")
-                            payload = _retain_payload_budget(payload, idx)
-                            if payload:
-                                tcp_streams[
-                                    (src_ip, dst_ip, int(tcp.sport), int(tcp.dport))
-                                ].append((int(tcp.seq), payload, idx))
-                        elif isinstance(ip.data, dpkt.udp.UDP):
-                            udp = ip.data
-                            payload = bytes(udp.data or b"")
-                            payload = _retain_payload_budget(payload, idx)
-                            if payload:
-                                udp_packets.append(
-                                    (
-                                        src_ip,
-                                        dst_ip,
-                                        int(udp.sport),
-                                        int(udp.dport),
-                                        payload,
-                                        idx,
-                                    )
-                                )
+                        if ip is not None:
+                            _take_dpkt_ip(ip, idx)
         except Exception as exc:
             return FileTransferSummary(path, 0, [], [], [], [], [], [str(exc)])
     else:
+        # Packets already read (in memory, or streamed for a format dpkt cannot
+        # open): decode each record's own bytes exactly as the disk branch
+        # above does, so both give the same streams. Only packets without
+        # their captured bytes go through the scapy layers.
+        datalink = _capture_datalink(path) if dpkt is not None else None
         idx = 0
         for pkt in packets:
             idx += 1
+            raw = getattr(pkt, "original", None)
+            if datalink is not None and isinstance(raw, (bytes, bytearray)):
+                ip = _decode_dpkt_ip_packet(bytes(raw), datalink)
+                if ip is not None:
+                    _take_dpkt_ip(ip, idx)
+                continue
             src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
@@ -4733,7 +4903,7 @@ def _export_with_scapy(
     else:
         try:
             for idx, pkt in enumerate(
-                iter_packets(path, meta=meta, show_status=show_status), start=1
+                iter_packets(path, meta=meta, show_status=show_status, lite=True), start=1
             ):
                 if _packet_in_scope(pkt):
                     extractor.process_packet(pkt, idx)
@@ -4742,14 +4912,6 @@ def _export_with_scapy(
             errors.append(f"Scapy file extraction failed: {exc}")
 
     if extractor.artifacts:
-        detections.append(
-            {
-                "severity": "info",
-                "summary": "Files extracted via Scapy fallback",
-                "details": "Fallback stream reconstruction was used to recover additional file artifacts.",
-                "source": "Files",
-            }
-        )
         if hash_name:
             search = hash_name.lower()
             for art in extractor.artifacts:
@@ -4778,6 +4940,34 @@ def _export_with_scapy(
         detections=list(extractor.detections) + detections,
         errors=list(extractor.errors) + errors,
         hashes=hashes,
+    )
+
+
+def _same_file_key(art: FileArtifact) -> tuple:
+    """One transferred file, whatever name each pass gave it: the dpkt pass
+    names an HTTP body after its URL (``404.bin``), the stream pass after its
+    content (``extracted_pe_http.exe``)."""
+    return (art.protocol, art.src_ip, art.dst_ip, art.packet_index, art.size_bytes)
+
+
+def _reconcile_scapy_pass(
+    dpkt_summary: FileTransferSummary, scapy_summary: Optional[FileTransferSummary]
+) -> None:
+    """Keep only the stream pass's artifacts the dpkt pass did not already
+    report (so a file is listed once), and credit the pass when there are any."""
+    if scapy_summary is None or not scapy_summary.artifacts:
+        return
+    known = {_same_file_key(art) for art in dpkt_summary.artifacts}
+    scapy_summary.artifacts = [art for art in scapy_summary.artifacts if _same_file_key(art) not in known]
+    if not scapy_summary.artifacts:
+        return
+    scapy_summary.detections.append(
+        {
+            "severity": "info",
+            "summary": "Files extracted via Scapy fallback",
+            "details": "Fallback stream reconstruction was used to recover additional file artifacts.",
+            "source": "Files",
+        }
     )
 
 
@@ -5103,6 +5293,7 @@ def _build_files_enrichment(
         "benign_context": [],
     }
 
+@fan_out
 @memoize_analysis
 def analyze_files(
     path: Path,
@@ -5129,6 +5320,25 @@ def analyze_files(
     # fidelity (HTTP/HTTP2 carving) while still enforcing scope via filter_ip.
     parse_packets = packets if not filter_ip else None
 
+    # The stream-reconstruction pass runs whether the packets come from memory
+    # or from disk (lite records from disk): it adds SMB/NTLM/TFTP findings the
+    # dpkt pass does not make, and running it only from memory (or from disk
+    # only when dpkt found nothing) made the two give different answers. In a
+    # shared pass it starts first, beside the dpkt pass, so the two read the
+    # capture in one round instead of one after the other.
+    def _scapy_pass() -> FileTransferSummary:
+        return _export_with_scapy(
+            path,
+            show_status=False,
+            filter_ip=filter_ip,
+            packets=packets,
+            meta=meta,
+            hash_name=hash_name,
+        )
+
+    from . import sharedpass
+
+    scapy_ahead = sharedpass.ahead(path, _scapy_pass) if packets is None else None
     dpkt_summary = _export_with_dpkt(
         path,
         extract_name=extract_name,
@@ -5141,17 +5351,14 @@ def analyze_files(
         packets=parse_packets,
     )
     if dpkt_summary is None:
+        if scapy_ahead is not None:
+            try:
+                scapy_ahead()  # never leave the sibling reading for nothing
+            except Exception:  # noqa: BLE001
+                pass
         return FileTransferSummary(path, 0, [], [], [], [], [], ["dpkt parsing failed"])
-    scapy_summary: Optional[FileTransferSummary] = None
-    if packets is not None or not dpkt_summary.artifacts:
-        scapy_summary = _export_with_scapy(
-            path,
-            show_status=False,
-            filter_ip=filter_ip,
-            packets=packets,
-            meta=meta,
-            hash_name=hash_name,
-        )
+    scapy_summary = scapy_ahead() if scapy_ahead is not None else _scapy_pass()
+    _reconcile_scapy_pass(dpkt_summary, scapy_summary)
     dpkt_summary = _merge_export_summaries(dpkt_summary, scapy_summary)
 
     def _append_nfs_context(

@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from .utils import is_valid_ip as _valid_ip
+from .utils import is_valid_ip as _valid_ip, fan_out
 from .utils import is_public_ip as _is_public_ip
 from .utils import is_private_ip as _is_private_ip
 import re
@@ -379,6 +379,7 @@ def _add_host_evidence(
             entry["first_ts"] = ts
 
 
+@fan_out
 @memoize_analysis
 def analyze_compromised(
     path: Path,

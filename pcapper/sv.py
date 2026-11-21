@@ -6,7 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import PcapMeta, iter_packets
+from .industrial_helpers import _ethertype_prefilter
+from .lite import UNSUPPORTED, LitePacket
+from .pcap_cache import PassStats, PcapMeta, iter_packets
 from .utils import safe_float
 
 try:
@@ -195,20 +197,43 @@ def analyze_sv(
     svid_macs: dict[str, set[str]] = {}
     svid_spoof_flagged: set[str] = set()
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    # Read from disk, only SV frames are handed over (the totals come from
+    # the pass) and they come as lite records, parsed from their own bytes.
+    stats = PassStats()
+    for pkt in iter_packets(
+        path,
+        packets=packets,
+        meta=meta,
+        show_status=show_status,
+        lite=True,
+        prefilter=_ethertype_prefilter(SV_ETHERTYPE),
+        stats=stats,
+    ):
         total_packets += 1
         ts = safe_float(getattr(pkt, "time", None))
 
-        if not pkt.haslayer(Ether):  # type: ignore[truthy-bool]
+        lite = pkt.lite_ether(SV_ETHERTYPE) if type(pkt) is LitePacket else UNSUPPORTED
+        if lite is None:
             continue
-        eth = pkt[Ether]  # type: ignore[index]
-        try:
-            payload = _extract_sv_payload(eth)
-        except Exception as exc:
-            malformed_frames[f"could not decode Ethernet payload ({type(exc).__name__})"] += 1
-            continue
-        if payload is None:
-            continue
+        if lite is not UNSUPPORTED:
+            # The SV EtherType's bytes are left as Raw by scapy, so its
+            # bytes(layer) is exactly the rest of the frame.
+            src_mac, dst_mac, payload = lite  # type: ignore[misc]
+        else:
+            if type(pkt) is LitePacket:
+                pkt = pkt.materialize()
+            if not pkt.haslayer(Ether):  # type: ignore[truthy-bool]
+                continue
+            eth = pkt[Ether]  # type: ignore[index]
+            try:
+                payload = _extract_sv_payload(eth)
+            except Exception as exc:
+                malformed_frames[f"could not decode Ethernet payload ({type(exc).__name__})"] += 1
+                continue
+            if payload is None:
+                continue
+            src_mac = str(getattr(eth, "src", "-"))
+            dst_mac = str(getattr(eth, "dst", "-"))
 
         sv_packets += 1
         # The report window spans this protocol's traffic, not every packet.
@@ -217,8 +242,6 @@ def analyze_sv(
                 first_seen = ts
             if last_seen is None or ts > last_seen:
                 last_seen = ts
-        src_mac = str(getattr(eth, "src", "-"))
-        dst_mac = str(getattr(eth, "dst", "-"))
         src_macs[src_mac] += 1
         dst_macs[dst_mac] += 1
         try:
@@ -301,6 +324,8 @@ def analyze_sv(
         for value in seq_values[:8]:
             data_value_samples[f"{seq_type}={value}"] += 1
 
+    if stats.active:
+        total_packets = stats.packets
     errors.extend(
         f"{count} malformed SV frame(s): {reason}."
         for reason, count in sorted(malformed_frames.items())

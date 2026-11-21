@@ -18,7 +18,7 @@ except ImportError:
     IP = TCP = UDP = Ether = IPv6 = ARP = ICMP = DNS = Raw = None
 
 from .pcap_cache import PcapMeta, iter_packets
-from .openvpn import openvpn_tcp_control_opcodes, openvpn_udp_control_opcodes
+from .openvpn import openvpn_tcp_session_start, openvpn_udp_control_opcodes
 from .utils import extract_packet_endpoints, memoize_analysis, packet_length, safe_float
 
 import ipaddress as _ipaddress
@@ -881,16 +881,19 @@ def analyze_services(
 
                 # Check payloads for banners only on handshake-confirmed TCP services.
                 if payload:
-                    if openvpn_tcp_control_opcodes(payload):
+                    sample_key = (
+                        "payload_samples_ab" if src_is_left else "payload_samples_ba"
+                    )
+                    sample_list = flow_stats.get(sample_key)
+                    # OpenVPN only from a direction's first payload: mid-stream
+                    # binary (EXE downloads, TLS data) parses as a control frame
+                    # by chance and relabelled HTTP/HTTPS servers as OpenVPN.
+                    if not sample_list and openvpn_tcp_session_start(payload):
                         s.service_name = "OpenVPN"
                         if not s.software:
                             s.software = _openvpn_software_note(server_port)
                         s.discovery_method = "openvpn_control_handshake"
                         continue
-                    sample_key = (
-                        "payload_samples_ab" if src_is_left else "payload_samples_ba"
-                    )
-                    sample_list = flow_stats.get(sample_key)
                     if isinstance(sample_list, list) and len(sample_list) < 2:
                         sample_list.append(payload[:512])
                     guessed_service, banner = _guess_service(payload, server_port)
@@ -1048,7 +1051,7 @@ def analyze_services(
                     item for item in data if isinstance(item, (bytes, bytearray))
                 )
         for sample in payload_samples:
-            if openvpn_tcp_control_opcodes(bytes(sample)):
+            if openvpn_tcp_session_start(bytes(sample)):
                 s.service_name = "OpenVPN"
                 if not s.software:
                     s.software = _openvpn_software_note(server_port)

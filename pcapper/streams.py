@@ -11,6 +11,7 @@ from .reassembly import reassemble
 from .utils import (
     env_int,
     extract_packet_endpoints,
+    memoize_analysis,
     packet_length,
     safe_float,
     tcp_flags_int,
@@ -187,6 +188,7 @@ def _reassemble(
     return result.data, [gap.as_dict() for gap in result.gaps]
 
 
+@memoize_analysis
 def analyze_streams(
     path: Path,
     show_status: bool = True,

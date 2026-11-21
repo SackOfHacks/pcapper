@@ -6,7 +6,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import PcapMeta, iter_packets
+from .lite import UNSUPPORTED, LitePacket
+from .pcap_cache import PassStats, PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
@@ -131,6 +132,19 @@ def _extract_iec_apdus(payload: bytes) -> list[bytes]:
     return apdus
 
 
+def _iec_prefilter(record: LitePacket) -> bool:
+    """Only a transport payload holding an FT1.2 frame can count; the rest
+    count toward the capture totals alone."""
+    l4 = record.lite_l4()
+    if l4 is UNSUPPORTED:
+        return True
+    if l4 is None:
+        return False
+    if l4[5] < 0:
+        return True  # a payload layer only scapy can rebuild
+    return bool(_extract_iec_apdus(record.original[l4[7] :]))
+
+
 @memoize_analysis
 def analyze_iec101_103(
     path: Path,
@@ -152,15 +166,36 @@ def analyze_iec101_103(
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    # Read from disk, only packets carrying FT1.2 frames are handed over (the
+    # totals come from the pass), as lite records parsed from their bytes.
+    stats = PassStats()
+    for pkt in iter_packets(
+        path,
+        packets=packets,
+        meta=meta,
+        show_status=show_status,
+        lite=True,
+        prefilter=_iec_prefilter,
+        stats=stats,
+    ):
         total_packets += 1
         ts = safe_float(getattr(pkt, "time", None))
 
-        payload = b""
-        if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-            payload = bytes(getattr(pkt[TCP], "payload", b""))  # type: ignore[index]
-        elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-            payload = bytes(getattr(pkt[UDP], "payload", b""))  # type: ignore[index]
+        lite = pkt.lite_l4() if type(pkt) is LitePacket else UNSUPPORTED
+        if lite is None:
+            payload = b""  # no TCP/UDP layer anywhere
+        elif lite is not UNSUPPORTED and lite[5] >= 0:  # type: ignore[index]
+            # bytes() of the only transport's payload: its Raw layer and any
+            # padding scapy split off behind it, i.e. the rest of the record.
+            payload = pkt.original[lite[7] :]  # type: ignore[index]
+        else:
+            if type(pkt) is LitePacket:
+                pkt = pkt.materialize()
+            payload = b""
+            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+                payload = bytes(getattr(pkt[TCP], "payload", b""))  # type: ignore[index]
+            elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+                payload = bytes(getattr(pkt[UDP], "payload", b""))  # type: ignore[index]
         apdus = _extract_iec_apdus(payload)
         if not apdus:
             continue
@@ -199,6 +234,8 @@ def analyze_iec101_103(
                 key = (src_ip, dst_ip, type_id)
                 command_activations[key] = command_activations.get(key, 0) + 1
 
+    if stats.active:
+        total_packets = stats.packets
     if candidate_packets:
         detections.append(
             {

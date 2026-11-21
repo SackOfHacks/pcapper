@@ -36,12 +36,16 @@ def deterministic_output(monkeypatch: pytest.MonkeyPatch) -> None:
     terminal run and a CI run, so a golden file recorded in one place would fail
     in the other. Verbose mode is module-level state that leaks between tests.
     """
+    from pcapper import progress
+
     monkeypatch.setenv("NO_COLOR", "1")
     coloring.set_color_override(False)
     reporting.set_verbose_output(False)
+    progress.set_verbose_progress(False)
     yield
     coloring.set_color_override(None)
     reporting.set_verbose_output(False)
+    progress.set_verbose_progress(False)
 
 
 @pytest.fixture(autouse=True)

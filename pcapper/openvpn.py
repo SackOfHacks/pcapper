@@ -178,6 +178,16 @@ def openvpn_tcp_control_opcodes(payload: bytes) -> list[int]:
     ]
 
 
+def openvpn_tcp_session_start(payload: bytes) -> bool:
+    """True when ``payload`` opens an OpenVPN-over-TCP session: its first
+    frame is a HARD_RESET (client or server). Any binary segment can parse as
+    a length-prefixed "control frame" by chance (e.g. ``00 10 38``), so only a
+    direction's first payload starting with a reset identifies OpenVPN."""
+    for frame in iter_openvpn_tcp_frames(payload):
+        return frame.opcode in OPENVPN_CLIENT_RESET_OPCODES | OPENVPN_SERVER_RESET_OPCODES
+    return False
+
+
 def openvpn_udp_control_opcodes(payload: bytes) -> list[int]:
     return [
         frame.opcode

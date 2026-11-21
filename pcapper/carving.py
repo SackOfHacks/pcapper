@@ -9,6 +9,7 @@ from pathlib import Path
 from .pcap_cache import PcapMeta, iter_packets
 from .reassembly import Reassembly, reassemble
 from .utils import (
+    memoize_analysis,
     detect_file_type_bytes,
     env_int,
     extract_packet_endpoints,
@@ -294,6 +295,7 @@ def _carve_blob(data: bytes, offset: int, max_bytes: int, label: str) -> tuple[b
     return data[offset : min(len(data), offset + max_bytes)], False
 
 
+@memoize_analysis
 def analyze_carving(
     path: Path,
     show_status: bool = True,

@@ -36,7 +36,8 @@ from pathlib import Path
 from typing import Optional
 
 from .industrial_helpers import IndustrialCommandEvent, _strip_padding
-from .pcap_cache import PcapMeta, iter_packets
+from .lite import UNSUPPORTED, LitePacket
+from .pcap_cache import PassStats, PcapMeta, iter_packets
 from .reassembly import relative_seq
 from .utils import extract_packet_endpoints, is_public_ip, memoize_analysis, safe_float
 
@@ -652,6 +653,15 @@ class _Call:
     response_stub: bytes = b""
 
 
+def _opc_classic_prefilter(record: LitePacket) -> bool:
+    """Only TCP segments with payload feed the DCE/RPC tracker; the rest
+    count toward the capture totals alone."""
+    l4 = record.lite_l4()
+    if l4 is UNSUPPORTED:
+        return True
+    return l4 is not None and l4[0] and (l4[5] < 0 or l4[6] > l4[5])
+
+
 def _canonical_conn(src: str, sport: int, dst: str, dport: int) -> tuple:
     a = (src, sport)
     b = (dst, dport)
@@ -964,23 +974,47 @@ def analyze_opc_classic(
         except (_NdrError, struct.error):
             return
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    # Read from disk, only TCP segments with payload are handed over (the
+    # totals come from the pass), as lite records parsed from their bytes.
+    stats = PassStats()
+    for pkt in iter_packets(
+        path,
+        packets=packets,
+        meta=meta,
+        show_status=show_status,
+        lite=True,
+        prefilter=_opc_classic_prefilter,
+        stats=stats,
+    ):
         total_packets += 1
-        if not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-            continue
-        tcp = pkt[TCP]  # type: ignore[index]
-        # Without stripping, scapy hands back the Ethernet padding of a short
-        # ACK as six zero "payload" bytes at the ACK's sequence number; fed to
-        # the reassembler they corrupt the next real PDU.
-        payload = _strip_padding(tcp.payload)
-        if not payload:
-            continue
+        lite = pkt.lite_l4() if type(pkt) is LitePacket else UNSUPPORTED
+        if lite is None or (lite is not UNSUPPORTED and (not lite[0] or lite[5] >= 0)):  # type: ignore[index]
+            # The packet's only transport layer, its payload a Raw layer.
+            if lite is None or not lite[0]:  # type: ignore[index]
+                continue
+            payload = pkt.original[lite[5] : lite[6]]  # type: ignore[index]
+            if not payload:
+                continue
+            sport, dport, seq = lite[1], lite[2], lite[3]  # type: ignore[index]
+        else:
+            if type(pkt) is LitePacket:
+                pkt = pkt.materialize()
+            if not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+                continue
+            tcp = pkt[TCP]  # type: ignore[index]
+            # Without stripping, scapy hands back the Ethernet padding of a short
+            # ACK as six zero "payload" bytes at the ACK's sequence number; fed to
+            # the reassembler they corrupt the next real PDU.
+            payload = _strip_padding(tcp.payload)
+            if not payload:
+                continue
+            sport = int(getattr(tcp, "sport", 0) or 0)
+            dport = int(getattr(tcp, "dport", 0) or 0)
+            seq = int(getattr(tcp, "seq", 0) or 0)
         ts = safe_float(getattr(pkt, "time", None))
         src_ip, dst_ip = extract_packet_endpoints(pkt)
         if not src_ip or not dst_ip:
             continue
-        sport = int(getattr(tcp, "sport", 0) or 0)
-        dport = int(getattr(tcp, "dport", 0) or 0)
         key = (src_ip, sport, dst_ip, dport)
         state = directions.get(key)
         if state is None and _looks_like_pdu_start(payload):
@@ -997,7 +1031,7 @@ def analyze_opc_classic(
         pdus: list[bytes] = []
         if state is not None:
             try:
-                pdus = _feed(state, int(getattr(tcp, "seq", 0) or 0), payload)
+                pdus = _feed(state, seq, payload)
             except Exception as exc:  # noqa: BLE001 - one bad segment must not end the pass
                 errors.append(f"DCE/RPC reassembly: {type(exc).__name__}: {exc}")
                 continue
@@ -1154,6 +1188,8 @@ def analyze_opc_classic(
                 first_seen = ts
             if last_seen is None or ts > last_seen:
                 last_seen = ts
+    if stats.active:
+        total_packets = stats.packets
 
     write_text = _ascii_from_values([event.value for event in writes])
     detections = _build_detections(

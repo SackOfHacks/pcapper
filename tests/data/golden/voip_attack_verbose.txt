@@ -1,0 +1,123 @@
+
+VOIP · voip_attack.pcap
+════════════════════════════════════════════════════════════════════════════════
+  HIGH      5 findings · high-severity VoIP activity: treat recovered credentials, keys and digits as evidence
+            38 calls · 1 registration · 76 signalling / 0 RTP packets · 750.0 ms
+            SIP (76)
+
+Findings ───────────────────────────────────────────────────────────────────────
+  HIGH      SIP extension enumeration
+            198.18.7.44 addressed 25 distinct SIP URIs — an extension or user sweep (ATT&CK T1046, T1589.002).
+  HIGH      VoIP authentication brute force / password spray
+            14 failed authentications involving 198.18.7.44 (ATT&CK T1110 Brute Force).
+  HIGH      VoIP credentials recovered (offline-crackable)
+            14 credential(s) across SIP x14 for 1 account(s): 1001. SIP Digest lines are hashcat -m 11400 candidates; IAX2 pairs are md5(challenge+secret) (ATT&CK T1040 Network Sniffing, T1110.002 Password Cracking).
+  HIGH      VoIP scanning/attack tool User-Agent observed
+            SIPVicious (svmap/svwar/svcrack) — User-Agent 'friendly-scanner' in 38 message(s). SIP enumeration and toll-fraud tooling (ATT&CK T1046 Network Service Discovery, T1595 Active Scanning).
+  MEDIUM    High SIP rejection rate
+            38 403/404 responses against 0 200 OK — the shape of an extension sweep rather than normal calling (ATT&CK T1046).
+
+Credentials ────────────────────────────────────────────────────────────────────
+  14 credentials recovered from cleartext signalling
+  TIME                         PROTOCOL  CONTEXT          USER  REALM     FLOW
+  2021-01-01T00:03:20.480000Z  SIP       REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+  2021-01-01T00:03:20.500000Z  SIP       REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+  2021-01-01T00:03:20.520000Z  SIP       REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+  2021-01-01T00:03:20.540000Z  SIP       REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+  2021-01-01T00:03:20.560000Z  SIP       REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+  2021-01-01T00:03:20.580000Z  SIP       REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+  2021-01-01T00:03:20.600000Z  SIP       REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+  2021-01-01T00:03:20.620000Z  SIP       REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+  2021-01-01T00:03:20.640000Z  SIP       REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+  2021-01-01T00:03:20.660000Z  SIP       REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+  2021-01-01T00:03:20.680000Z  SIP       REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+  2021-01-01T00:03:20.700000Z  SIP       REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+  2021-01-01T00:03:20.720000Z  SIP       REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+  2021-01-01T00:03:20.740000Z  SIP       REGISTER Digest  1001  asterisk  198.18.7.44 -> 192.168.10.5
+  Crack-ready SIP (SIP lines: hashcat -m 11400)
+    $sip$*192.168.10.5*198.18.7.44*1001*asterisk*REGISTER*sip*pbx.example.com**6f1e2d3c4b5a****MD5*00000000000000000000000000000000
+    $sip$*192.168.10.5*198.18.7.44*1001*asterisk*REGISTER*sip*pbx.example.com**6f1e2d3c4b5a****MD5*00000000000000000000000000000001
+    $sip$*192.168.10.5*198.18.7.44*1001*asterisk*REGISTER*sip*pbx.example.com**6f1e2d3c4b5a****MD5*00000000000000000000000000000002
+    $sip$*192.168.10.5*198.18.7.44*1001*asterisk*REGISTER*sip*pbx.example.com**6f1e2d3c4b5a****MD5*00000000000000000000000000000003
+    $sip$*192.168.10.5*198.18.7.44*1001*asterisk*REGISTER*sip*pbx.example.com**6f1e2d3c4b5a****MD5*00000000000000000000000000000004
+    $sip$*192.168.10.5*198.18.7.44*1001*asterisk*REGISTER*sip*pbx.example.com**6f1e2d3c4b5a****MD5*00000000000000000000000000000005
+    $sip$*192.168.10.5*198.18.7.44*1001*asterisk*REGISTER*sip*pbx.example.com**6f1e2d3c4b5a****MD5*00000000000000000000000000000006
+    $sip$*192.168.10.5*198.18.7.44*1001*asterisk*REGISTER*sip*pbx.example.com**6f1e2d3c4b5a****MD5*00000000000000000000000000000007
+    $sip$*192.168.10.5*198.18.7.44*1001*asterisk*REGISTER*sip*pbx.example.com**6f1e2d3c4b5a****MD5*00000000000000000000000000000008
+    $sip$*192.168.10.5*198.18.7.44*1001*asterisk*REGISTER*sip*pbx.example.com**6f1e2d3c4b5a****MD5*00000000000000000000000000000009
+    $sip$*192.168.10.5*198.18.7.44*1001*asterisk*REGISTER*sip*pbx.example.com**6f1e2d3c4b5a****MD5*0000000000000000000000000000000a
+    $sip$*192.168.10.5*198.18.7.44*1001*asterisk*REGISTER*sip*pbx.example.com**6f1e2d3c4b5a****MD5*0000000000000000000000000000000b
+    $sip$*192.168.10.5*198.18.7.44*1001*asterisk*REGISTER*sip*pbx.example.com**6f1e2d3c4b5a****MD5*0000000000000000000000000000000c
+    $sip$*192.168.10.5*198.18.7.44*1001*asterisk*REGISTER*sip*pbx.example.com**6f1e2d3c4b5a****MD5*0000000000000000000000000000000d
+
+Calls ──────────────────────────────────────────────────────────────────────────
+  TIME                         PROTOCOL  FROM  TO    DISPOSITION            DURATION  AUTH
+  2021-01-01T00:03:20Z         SIP       100   1000  options                    0.0s  no
+  2021-01-01T00:03:20.020000Z  SIP       100   1001  options                    0.0s  no
+  2021-01-01T00:03:20.040000Z  SIP       100   1002  options                    0.0s  no
+  2021-01-01T00:03:20.060000Z  SIP       100   1003  options                    0.0s  no
+  2021-01-01T00:03:20.080000Z  SIP       100   1004  options                    0.0s  no
+  2021-01-01T00:03:20.100000Z  SIP       100   1005  options                    0.0s  no
+  2021-01-01T00:03:20.120000Z  SIP       100   1006  options                    0.0s  no
+  2021-01-01T00:03:20.140000Z  SIP       100   1007  options                    0.0s  no
+  2021-01-01T00:03:20.160000Z  SIP       100   1008  options                    0.0s  no
+  2021-01-01T00:03:20.180000Z  SIP       100   1009  options                    0.0s  no
+  2021-01-01T00:03:20.200000Z  SIP       100   1010  options                    0.0s  no
+  2021-01-01T00:03:20.220000Z  SIP       100   1011  options                    0.0s  no
+  2021-01-01T00:03:20.240000Z  SIP       100   1012  options                    0.0s  no
+  2021-01-01T00:03:20.260000Z  SIP       100   1013  options                    0.0s  no
+  2021-01-01T00:03:20.280000Z  SIP       100   1014  options                    0.0s  no
+  2021-01-01T00:03:20.300000Z  SIP       100   1015  options                    0.0s  no
+  2021-01-01T00:03:20.320000Z  SIP       100   1016  options                    0.0s  no
+  2021-01-01T00:03:20.340000Z  SIP       100   1017  options                    0.0s  no
+  2021-01-01T00:03:20.360000Z  SIP       100   1018  options                    0.0s  no
+  2021-01-01T00:03:20.380000Z  SIP       100   1019  options                    0.0s  no
+  2021-01-01T00:03:20.400000Z  SIP       100   1020  options                    0.0s  no
+  2021-01-01T00:03:20.420000Z  SIP       100   1021  options                    0.0s  no
+  2021-01-01T00:03:20.440000Z  SIP       100   1022  options                    0.0s  no
+  2021-01-01T00:03:20.460000Z  SIP       100   1023  options                    0.0s  no
+  2021-01-01T00:03:20.480000Z  SIP       1001  1001  register failed (403)      0.0s  yes
+  2021-01-01T00:03:20.500000Z  SIP       1001  1001  register failed (403)      0.0s  yes
+  2021-01-01T00:03:20.520000Z  SIP       1001  1001  register failed (403)      0.0s  yes
+  2021-01-01T00:03:20.540000Z  SIP       1001  1001  register failed (403)      0.0s  yes
+  2021-01-01T00:03:20.560000Z  SIP       1001  1001  register failed (403)      0.0s  yes
+  2021-01-01T00:03:20.580000Z  SIP       1001  1001  register failed (403)      0.0s  yes
+  2021-01-01T00:03:20.600000Z  SIP       1001  1001  register failed (403)      0.0s  yes
+  2021-01-01T00:03:20.620000Z  SIP       1001  1001  register failed (403)      0.0s  yes
+  2021-01-01T00:03:20.640000Z  SIP       1001  1001  register failed (403)      0.0s  yes
+  2021-01-01T00:03:20.660000Z  SIP       1001  1001  register failed (403)      0.0s  yes
+  2021-01-01T00:03:20.680000Z  SIP       1001  1001  register failed (403)      0.0s  yes
+  2021-01-01T00:03:20.700000Z  SIP       1001  1001  register failed (403)      0.0s  yes
+  2021-01-01T00:03:20.720000Z  SIP       1001  1001  register failed (403)      0.0s  yes
+  2021-01-01T00:03:20.740000Z  SIP       1001  1001  register failed (403)      0.0s  yes
+
+Registrations ──────────────────────────────────────────────────────────────────
+  PROTOCOL  ACCOUNT                   ATTEMPTS  OK  CHALLENGED  FAILED  SOURCES
+  SIP       sip:1001@pbx.example.com        14   0           0      14  198.18.7.44
+
+Devices and software ───────────────────────────────────────────────────────────
+  User-Agents:  friendly-scanner (38)
+  Servers:      Asterisk PBX 18.10.0 (38)
+
+Traffic ────────────────────────────────────────────────────────────────────────
+  Total packets:       76
+  Signalling packets:  76
+  RTP packets:         0
+  Duration:            750.0 ms
+  Protocols:           SIP (76)
+  SIP transport:       TLS-port (2), UDP (74)
+  Signalling ports:    5060 (75), 5061 (1)
+
+Parties ────────────────────────────────────────────────────────────────────────
+  Called:   1001 (15), 1000 (1), 1002 (1), 1003 (1), 1004 (1), 1005 (1), 1006 (1), 1007 (1), 1008 (1), 1009 (1), 1010 (1), 1011 (1), 1012 (1), 1013 (1), 1014 (1), 1015 (1), 1016 (1), 1017 (1), 1018 (1), 1019 (1), 1020 (1), 1021 (1), 1022 (1), 1023 (1)
+  Callers:  100 (24), 1001 (14)
+
+Threat hypotheses ──────────────────────────────────────────────────────────────
+  • VoIP account takeover
+      why: 14 recoverable credential(s) and 14 authentication failure(s).
+      next: Crack the recovered material offline (hashcat -m 11400 for SIP Digest) to confirm weak secrets, then check the PBX CDR for calls placed by those accounts.
+
+False-positive context ─────────────────────────────────────────────────────────
+  • No cleartext SRTP keying material in SDP
+  • No international/premium-rate destinations dialled
+  • No phone configuration files fetched in the clear

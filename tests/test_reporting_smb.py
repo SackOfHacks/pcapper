@@ -65,41 +65,57 @@ MIXED_ACCOUNTS = {"svc_sql", "Domain Admins", "Backup Operators"}
 
 
 class TestTokensContainingSpaces:
+    """The default Accounts line filters carved junk; names with spaces are
+    ordinary Windows names and must survive it."""
+
     def test_spaced_accounts_survive_alongside_an_unspaced_one(self) -> None:
-        client = SmbClient(ip="192.168.10.50", usernames=set(MIXED_ACCOUNTS))
-        out = render_smb_summary(_summary([client]))
+        summary = _summary([])
+        summary.observed_users.update(MIXED_ACCOUNTS)
+        out = render_smb_summary(summary)
         for account in sorted(MIXED_ACCOUNTS):
-            assert account in out, f"{account!r} was filtered out of the preview"
+            assert account in out, f"{account!r} was filtered out of the default view"
 
     def test_domain_names_with_spaces_survive_the_preview(self) -> None:
-        client = SmbClient(ip="192.168.10.50", domains={"CONTOSO", "Contoso Corp"})
-        out = render_smb_summary(_summary([client]))
+        summary = _summary([])
+        summary.observed_domains.update({"CONTOSO", "Contoso Corp"})
+        out = render_smb_summary(summary)
         assert "Contoso Corp" in out
         assert "CONTOSO" in out
 
     def test_spaced_tokens_are_not_counted_as_filtered(self) -> None:
         """The 'filtered' suffix is how a dropped token announced itself."""
-        client = SmbClient(ip="192.168.10.50", usernames=set(MIXED_ACCOUNTS))
-        assert "filtered" not in render_smb_summary(_summary([client]))
+        summary = _summary([])
+        summary.observed_users.update(MIXED_ACCOUNTS)
+        assert "filtered" not in render_smb_summary(summary)
 
     def test_all_spaced_tokens_also_survive(self) -> None:
-        """The masked case: worth pinning too, so a future change to the
-        fallback cannot quietly reintroduce the drop."""
-        client = SmbClient(ip="192.168.10.50", usernames=set(SPACED_ACCOUNTS))
-        out = render_smb_summary(_summary([client]))
+        summary = _summary([])
+        summary.observed_users.update(SPACED_ACCOUNTS)
+        out = render_smb_summary(summary)
         for account in sorted(SPACED_ACCOUNTS):
             assert account in out
 
     def test_genuinely_junk_tokens_are_still_filtered(self) -> None:
-        """The filter still has to do its job — the fix restores the space, it
-        does not disable the predicate."""
-        client = SmbClient(
-            ip="192.168.10.50",
-            usernames={"svc_sql", "\x01\x02binary\x03", "a" * 200, "***"},
-        )
-        out = render_smb_summary(_summary([client]))
+        """The filter still has to do its job: carved binary and overlong
+        tokens stay out of the default view."""
+        summary = _summary([])
+        summary.observed_users.update({"svc_sql", "\x01\x02binary\x03", "a" * 200, "***"})
+        out = render_smb_summary(summary)
         assert "svc_sql" in out
         assert "\x01" not in out
+        assert "a" * 200 not in out
+
+    def test_client_inventory_keeps_every_name_with_v(self) -> None:
+        from pcapper.reporting import set_verbose_output
+
+        client = SmbClient(ip="192.168.10.50", usernames=set(MIXED_ACCOUNTS), domains={"Contoso Corp"})
+        set_verbose_output(True)
+        try:
+            out = render_smb_summary(_summary([client]))
+        finally:
+            set_verbose_output(False)
+        for name in sorted(MIXED_ACCOUNTS) + ["Contoso Corp"]:
+            assert name in out
 
 
 class TestHelpersAreDefinedOnce:
@@ -123,12 +139,21 @@ class TestHelpersAreDefinedOnce:
 class TestRendersWithoutClients:
     def test_empty_inventory_does_not_raise(self) -> None:
         out = render_smb_summary(_summary([]))
-        assert "No SMB clients identified." in out
+        assert "SMB · fixture.pcap" in out
 
     @pytest.mark.parametrize("verbose", [False, True])
     def test_both_verbosity_modes_render(self, verbose: bool) -> None:
+        from pcapper.reporting import set_verbose_output
+
         client = SmbClient(ip="192.168.10.50", usernames=set(MIXED_ACCOUNTS))
-        out = render_smb_summary(_summary([client]), verbose=verbose)
-        assert "192.168.10.50" in out
-        for account in sorted(MIXED_ACCOUNTS):
-            assert account in out
+        set_verbose_output(verbose)
+        try:
+            out = render_smb_summary(_summary([client]), verbose=verbose)
+        finally:
+            set_verbose_output(False)
+        if verbose:
+            assert "192.168.10.50" in out
+            for account in sorted(MIXED_ACCOUNTS):
+                assert account in out
+        else:
+            assert "-v adds" in out and "clients" in out

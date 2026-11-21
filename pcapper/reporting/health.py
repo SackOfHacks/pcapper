@@ -1,441 +1,143 @@
-"""Rendered output for health analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for --health: findings, TCP vitals (handshakes,
+resets, windows, retransmissions, TTL), hosts at risk, degradation chains,
+OT cycle safety, SNMP exposure and certificate hygiene; throughput, QoS,
+talkers, flow-duration buckets, outlier windows and OT cycle timing are
+-v detail."""
 
 from __future__ import annotations
+
 from collections import Counter
-from ..coloring import (
-    danger,
-    header,
-    label,
-    muted,
-    ok,
-    warn,
-)
+
 from ..health import HealthSummary
 from ..utils import (
-    format_bytes_as_mb,
     format_duration,
     format_speed_bps,
     format_ts,
 )
-
-from ._common import (
-    SECTION_BAR,
-    SUBSECTION_BAR,
-    _finalize_output,
-    _format_kv,
-    _format_table,
-    _limit_value,
-    _redact_in_text,
-    _truncate_text,
-)
+from . import _style as st
+from ._common import _redact_in_text, _redact_secret, _render_deterministic_checks
+from ._kv import counter_line
 
 
 def render_health_summary(summary: HealthSummary) -> str:
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"TRAFFIC HEALTH :: {summary.path.name}"))
-    lines.append(SECTION_BAR)
-
-    lines.append(_format_kv("Packets", str(summary.total_packets)))
-    lines.append(_format_kv("TCP Packets", str(summary.tcp_packets)))
-    lines.append(_format_kv("UDP Packets", str(summary.udp_packets)))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Throughput"))
-    lines.append(_format_kv("Total Bytes", format_bytes_as_mb(summary.total_bytes)))
-    lines.append(_format_kv("Start", format_ts(summary.first_seen)))
-    lines.append(_format_kv("End", format_ts(summary.last_seen)))
-    lines.append(_format_kv("Duration", format_duration(summary.duration_seconds)))
-    if summary.duration_seconds:
-        pps = summary.total_packets / summary.duration_seconds
-        bps = (summary.total_bytes / summary.duration_seconds) * 8
-        lines.append(_format_kv("Packets/sec", f"{pps:.2f}"))
-        lines.append(_format_kv("Bits/sec", format_speed_bps(int(bps))))
-
+    """Traffic health: findings first, then the TCP vitals (handshakes,
+    resets, zero windows, retransmissions), TTL problems and per-host risk;
+    throughput, QoS, SNMP, certificate counts, flow-duration buckets and OT
+    cycle timing follow (timing and outlier windows are -v)."""
+    rep = st.Report("Health", summary.path)
+    findings = [st.finding(f) for f in (summary.findings or [])]
+    if not summary.total_packets and not st.material(findings):
+        return rep.absent("traffic", summary.errors)
+    severity, text = st.verdict(findings, high="network health problems that affect evidence or operations",
+                                medium="health issues to review", clean="no health problems")
+    dur = summary.duration_seconds
+    # A rollup's first..last spans unrelated captures: no duration or rate.
+    single = not st.is_rollup(summary)
+    rep.headline(severity, text, st.join([
+        f"{st.count(summary.total_packets)} packets ({summary.tcp_packets} TCP, {summary.udp_packets} UDP)",
+        st.size(summary.total_bytes), st.duration(dur) if dur and single else "",
+        f"{format_speed_bps(int(summary.total_bytes * 8 / dur))}" if dur and single else "",
+    ]))
     if summary.errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        for err in summary.errors:
-            lines.append(danger(f"- {err}"))
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Findings", st.findings_block(findings))
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Analyst Verdict"))
-    verdict = (
-        summary.analyst_verdict
-        or "NO STRONG SIGNAL - no convincing high-confidence health risk pattern from current heuristics"
-    )
-    confidence = (summary.analyst_confidence or "low").strip().lower()
-    if verdict.startswith("YES"):
-        lines.append(danger(verdict))
-    elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
-        lines.append(warn(verdict))
-    else:
-        lines.append(ok(verdict))
-    lines.append(_format_kv("Confidence", confidence.capitalize()))
-    if summary.analyst_reasons:
-        lines.append(muted("Why confidence:"))
-        for reason in summary.analyst_reasons[: _limit_value(8)]:
-            lines.append(muted(f"- {_redact_in_text(str(reason))}"))
+    syn_only = max(0, summary.tcp_syn - summary.tcp_syn_ack)
+    rst_ratio = summary.tcp_rst / summary.tcp_syn if summary.tcp_syn else 0.0
+    rep.section("TCP", st.kv([
+        ("Handshakes", f"SYN {summary.tcp_syn} · SYN-ACK {summary.tcp_syn_ack} · unanswered {syn_only}"),
+        ("Resets", f"{summary.tcp_rst} ({rst_ratio:{'.2%' if st.verbose() else '.0%'}} of SYN)"
+                   + (f" · from {st.top(summary.tcp_rst_sources, 4)}" if summary.tcp_rst_sources else "")),
+        ("Windows", f"zero {summary.tcp_zero_window} · small {summary.tcp_small_window}"
+                    + (f" · zero from {st.top(summary.tcp_zero_window_sources, 4)}" if summary.tcp_zero_window_sources else "")),
+        ("Retransmissions", f"{summary.retransmissions} ({summary.retransmission_rate:.2%})"),
+        ("TTL / hop limit", f"expired {summary.ttl_expired} · low (<=5) {summary.ttl_low}"),
+        ("UDP amplification", f"{len(summary.udp_amp_candidates)}: " + ", ".join(summary.udp_amp_candidates[:5]) if summary.udp_amp_candidates else ""),
+    ]))
+    hosts = list(getattr(summary, "host_risk_profiles", None) or [])
+    rep.section("Hosts at risk", st.table(
+        ["Host", "Score", "Severity", "Confidence", "SYN", "RST", "Zero win", "Targets", "Reasons"],
+        [[i.get("host", "-"), i.get("score", "-"), str(i.get("severity", "-")).upper(), str(i.get("confidence", "-")).upper(),
+          i.get("syn", "-"), i.get("rst", "-"), i.get("zero_window", "-"), i.get("targets", "-"),
+          " | ".join(str(r) for r in (i.get("reasons") or []))] for i in hosts],
+        align="lrllrrrrl", widths=(None, None, None, None, None, None, None, None, 72), max_rows=10, noun="host",
+    ))
+    rep.section("Degradation", st.table(
+        ["Sequence", "Confidence", "Details"],
+        [[i.get("sequence", "-"), str(i.get("confidence", "-")).upper(), i.get("details", "-")] for i in (getattr(summary, "sequence_findings", None) or [])],
+        widths=(None, None, 90), max_rows=10,
+    ))
+    rep.section("OT safety", st.table(
+        ["Family", "Session", "Avg (s)", "Std (s)", "CV", "Samples", "Severity"],
+        [[i.get("family", "-"), i.get("session", "-"), f"{float(i.get('avg', 0.0)):.3f}", f"{float(i.get('std', 0.0)):.3f}",
+          f"{float(i.get('cv', 0.0)):.2f}", i.get("count", "-"), str(i.get("severity", "-")).upper()]
+         for i in (getattr(summary, "ot_risk_profiles", None) or [])], align="llrrrrl", max_rows=10,
+    ))
+    rep.section("SNMP", st.kv([
+        ("Packets", str(summary.snmp_packets) if summary.snmp_packets else ""),
+        counter_line("Versions", summary.snmp_versions, 5),
+        ("Communities", st.top(summary.snmp_communities, 5, fmt=lambda k, v: f"{_redact_secret(str(k))} ({v})")),
+    ]) + st.table(["Risk", "Details"], [[i.get("risk", "-"), i.get("details", "-")] for i in (getattr(summary, "snmp_risks", None) or [])],
+                  widths=(None, 96), max_rows=10))
+    rep.section("Certificates", st.kv([("Expired / invalid", str(summary.expired_certs) if summary.expired_certs else ""),
+                                       ("Self-signed", str(summary.self_signed_certs) if summary.self_signed_certs else "")]))
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Deterministic Health Security Checks"))
-    checks = summary.deterministic_checks or {}
-    check_labels = [
-        ("syn_scan_or_exhaustion", "SYN Scan or Service Exhaustion"),
-        ("tcp_reset_storm", "TCP Reset Storm"),
-        ("persistent_zero_window", "Persistent Zero-Window"),
-        ("udp_reflection_amplification", "UDP Reflection/Amplification"),
-        ("qos_marking_anomaly", "QoS Marking Anomaly"),
-        ("snmp_exposure_risk", "SNMP Exposure Risk"),
-        ("ot_cycle_instability", "OT Cycle-Time Instability"),
-        ("certificate_hygiene_risk", "Certificate Hygiene Risk"),
-        ("sequence_degradation_chain", "Sequence Degradation Chain"),
-        ("zone_policy_drift", "Peer Trust Zoning Drift"),
-        ("evidence_provenance", "Evidence Provenance"),
-    ]
-    for key, label_text in check_labels:
-        evidence_items = [
-            str(v) for v in list(checks.get(key, []) or []) if str(v).strip()
-        ]
-        lines.append(label(label_text))
-        if evidence_items:
-            lines.append(
-                warn(
-                    f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
-                )
-            )
-            for item in evidence_items[: _limit_value(6)]:
-                lines.append(muted(f"- {_redact_in_text(item)}"))
-        else:
-            lines.append(
-                ok(
-                    f"No, there is no strong evidence for {label_text.lower()} in this capture."
-                )
-            )
-
-    sequence_rows = list(getattr(summary, "sequence_findings", []) or [])
-    if sequence_rows:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Sequence-Based Degradation Checks"))
-        rows = [["Sequence", "Confidence", "Details"]]
-        for item in sequence_rows[: _limit_value(10)]:
-            rows.append(
-                [
-                    str(item.get("sequence", "-")),
-                    str(item.get("confidence", "-")).upper(),
-                    _truncate_text(str(item.get("details", "-")), 90),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    host_rows = list(getattr(summary, "host_risk_profiles", []) or [])
-    if host_rows:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Per-Host Risk Profiles"))
-        rows = [
-            [
-                "Host",
-                "Score",
-                "Severity",
-                "Confidence",
-                "SYN",
-                "RST",
-                "ZeroWin",
-                "Targets",
-                "Reasons",
-            ]
-        ]
-        for item in host_rows[: _limit_value(12)]:
-            reasons = item.get("reasons", [])
-            reason_text = (
-                " | ".join(str(v) for v in reasons[:3])
-                if isinstance(reasons, list)
-                else str(reasons)
-            )
-            rows.append(
-                [
-                    str(item.get("host", "-")),
-                    str(item.get("score", "-")),
-                    str(item.get("severity", "-")).upper(),
-                    str(item.get("confidence", "-")).upper(),
-                    str(item.get("syn", "-")),
-                    str(item.get("rst", "-")),
-                    str(item.get("zero_window", "-")),
-                    str(item.get("targets", "-")),
-                    _truncate_text(reason_text or "-", 72),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    outlier_rows = list(getattr(summary, "outlier_windows", []) or [])
-    if outlier_rows:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Temporal Outlier Windows"))
-        rows = [
-            [
-                "Metric",
-                "Window Start",
-                "Window End",
-                "Value",
-                "Baseline",
-                "Threshold",
-                "Sample",
-            ]
-        ]
-        for item in outlier_rows[: _limit_value(12)]:
-            rows.append(
-                [
-                    str(item.get("metric", "-")),
-                    format_ts(item.get("window_start")),
-                    format_ts(item.get("window_end")),
-                    str(item.get("value", "-")),
-                    str(item.get("baseline", "-")),
-                    str(item.get("threshold", "-")),
-                    _truncate_text(str(item.get("sample", "-")), 72),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    snmp_rows = list(getattr(summary, "snmp_risks", []) or [])
-    if snmp_rows:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("SNMP Security Analytics"))
-        rows = [["Risk", "Details"]]
-        for item in snmp_rows[: _limit_value(10)]:
-            rows.append(
-                [
-                    str(item.get("risk", "-")),
-                    _truncate_text(str(item.get("details", "-")), 96),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    ot_rows = list(getattr(summary, "ot_risk_profiles", []) or [])
-    if ot_rows:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("OT Health Safety Checks"))
-        rows = [["Family", "Session", "Avg(s)", "Std(s)", "CV", "Samples", "Severity"]]
-        for item in ot_rows[: _limit_value(10)]:
-            rows.append(
-                [
-                    str(item.get("family", "-")),
-                    _truncate_text(str(item.get("session", "-")), 44),
-                    f"{float(item.get('avg', 0.0)):.3f}",
-                    f"{float(item.get('std', 0.0)):.3f}",
-                    f"{float(item.get('cv', 0.0)):.2f}",
-                    str(item.get("count", "-")),
-                    str(item.get("severity", "-")).upper(),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    if summary.zone_anomalies:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Peer Trust Zoning Checks"))
-        for item in summary.zone_anomalies[: _limit_value(10)]:
-            lines.append(muted(f"- {_redact_in_text(str(item))}"))
-
-    anchors = list(getattr(summary, "evidence_anchors", []) or [])
-    if anchors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Evidence Anchors"))
-        rows = [["Packet", "Signal", "Details"]]
-        for item in anchors[: _limit_value(12)]:
-            rows.append(
-                [
-                    str(item.get("packet", "-")),
-                    str(item.get("signal", "-")),
-                    _truncate_text(str(item.get("details", "-")), 88),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    benign = list(getattr(summary, "benign_context", []) or [])
-    if benign:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("False-Positive Context"))
-        for item in benign[: _limit_value(8)]:
-            lines.append(muted(f"- {_redact_in_text(str(item))}"))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Retransmissions"))
-    lines.append(_format_kv("TCP Retransmissions", str(summary.retransmissions)))
-    lines.append(
-        _format_kv("Retransmission Rate", f"{summary.retransmission_rate:.2%}")
-    )
-
-    if summary.endpoint_bytes:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Talkers"))
-        rows = [["Endpoint", "Packets", "Bytes"]]
-        endpoint_packets = (
-            summary.endpoint_packets
-            if isinstance(summary.endpoint_packets, Counter)
-            else Counter()
-        )
-        endpoint_bytes = (
-            summary.endpoint_bytes
-            if isinstance(summary.endpoint_bytes, Counter)
-            else Counter()
-        )
-        for ip, byte_count in endpoint_bytes.most_common(_limit_value(10)):
-            rows.append(
-                [
-                    ip,
-                    str(endpoint_packets.get(ip, 0)),
-                    format_bytes_as_mb(byte_count),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    if summary.flow_duration_buckets:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Flow Duration Distribution"))
-        bucket_order = ["<=1s", "1-10s", "10-60s", "1-5m", "5-30m", ">30m"]
-        for key, label_text in (("all", "All"), ("tcp", "TCP"), ("udp", "UDP")):
-            buckets = summary.flow_duration_buckets.get(key, Counter())
-            if not buckets:
-                continue
-            counts = [int(buckets.get(bucket, 0)) for bucket in bucket_order]
-            lines.append(_format_kv(f"{label_text} Buckets", ", ".join(bucket_order)))
-            lines.append(
-                _format_kv(
-                    f"{label_text} Counts", ", ".join(str(val) for val in counts)
-                )
-            )
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("TTL / Hop Limit"))
-    lines.append(_format_kv("Expired TTL/Hop Limit", str(summary.ttl_expired)))
-    lines.append(_format_kv("Low TTL/Hop Limit (<=5)", str(summary.ttl_low)))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("TCP/UDP Health Indicators"))
-    syn_only = summary.tcp_syn - summary.tcp_syn_ack
-    rst_ratio = (summary.tcp_rst / summary.tcp_syn) if summary.tcp_syn else 0.0
-    lines.append(_format_kv("TCP SYN", str(summary.tcp_syn)))
-    lines.append(_format_kv("TCP SYN-ACK", str(summary.tcp_syn_ack)))
-    lines.append(_format_kv("TCP RST", str(summary.tcp_rst)))
-    lines.append(_format_kv("SYN without SYN-ACK", str(max(0, syn_only))))
-    lines.append(_format_kv("RST/SYN Ratio", f"{rst_ratio:.2%}"))
-    lines.append(_format_kv("Zero-Window", str(summary.tcp_zero_window)))
-    lines.append(_format_kv("Small-Window", str(summary.tcp_small_window)))
-    if summary.tcp_zero_window_sources:
-        top_zero = ", ".join(
-            f"{ip}({count})"
-            for ip, count in summary.tcp_zero_window_sources.most_common(
-                _limit_value(5)
-            )
-        )
-        lines.append(_format_kv("Zero-Window Sources", top_zero))
-    if summary.tcp_rst_sources:
-        top_rst = ", ".join(
-            f"{ip}({count})"
-            for ip, count in summary.tcp_rst_sources.most_common(_limit_value(5))
-        )
-        lines.append(_format_kv("RST Sources", top_rst))
-    if summary.udp_amp_candidates:
-        lines.append(
-            _format_kv("UDP Amplification", str(len(summary.udp_amp_candidates)))
-        )
-        lines.append(
-            _format_kv(
-                "Top Candidates",
-                ", ".join(summary.udp_amp_candidates[: _limit_value(5)]),
-            )
-        )
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Quality of Service (DSCP/ECN)"))
-    top_dscp = (
-        ", ".join(
-            f"{dscp}({count})"
-            for dscp, count in summary.dscp_counts.most_common(_limit_value(5))
-        )
-        or "-"
-    )
-    top_ecn = (
-        ", ".join(
-            f"{ecn}({count})"
-            for ecn, count in summary.ecn_counts.most_common(_limit_value(5))
-        )
-        or "-"
-    )
-    lines.append(_format_kv("Top DSCP", top_dscp))
-    lines.append(_format_kv("Top ECN", top_ecn))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("SNMP"))
-    lines.append(_format_kv("SNMP Packets", str(summary.snmp_packets)))
-    versions = (
-        ", ".join(
-            f"{ver}({count})"
-            for ver, count in summary.snmp_versions.most_common(_limit_value(5))
-        )
-        or "-"
-    )
-    communities = (
-        ", ".join(
-            f"{comm}({count})"
-            for comm, count in summary.snmp_communities.most_common(_limit_value(5))
-        )
-        or "-"
-    )
-    lines.append(_format_kv("Versions", versions))
-    lines.append(_format_kv("Communities", communities))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Certificates"))
-    lines.append(_format_kv("Expired/Invalid", str(summary.expired_certs)))
-    lines.append(_format_kv("Self-Signed", str(summary.self_signed_certs)))
-
-    if summary.ot_timing:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("OT Cycle/Jitter"))
-        for key, label_text in (
-            ("profinet_rt", "Profinet RT"),
-            ("enip_io", "ENIP IO"),
-            ("s7_rosctr", "S7 COTP/ROSCTR"),
-        ):
-            entries = summary.ot_timing.get(key, [])
-            if not entries:
-                continue
-            lines.append(muted(label_text))
-            rows = [["Session", "Avg(s)", "Std(s)", "CV", "Min", "Max", "Samples"]]
-            for item in entries:
-                rows.append(
-                    [
-                        str(item.get("session", "-")),
-                        f"{float(item.get('avg', 0.0)):.3f}",
-                        f"{float(item.get('std', 0.0)):.3f}",
-                        f"{float(item.get('cv', 0.0)):.2f}",
-                        f"{float(item.get('min', 0.0)):.3f}",
-                        f"{float(item.get('max', 0.0)):.3f}",
-                        str(item.get("count", 0)),
-                    ]
-                )
-            lines.append(_format_table(rows))
-
-    if summary.findings:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Findings"))
-        for item in summary.findings:
-            severity = str(item.get("severity", "info"))
-            summary_text = str(item.get("summary", ""))
-            details = str(item.get("details", ""))
-            if severity == "critical":
-                marker = danger("[CRIT]")
-            elif severity == "warning":
-                marker = warn("[WARN]")
-            else:
-                marker = ok("[INFO]")
-            lines.append(f"{marker} {summary_text}")
-            if details:
-                lines.append(muted(f"  {details}"))
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    rep.section("Assessment", st.kv([
+        ("Verdict", summary.analyst_verdict or "NO STRONG SIGNAL from the current heuristics"),
+        ("Confidence", (summary.analyst_confidence or "low").strip().lower()),
+    ]) + st.bullets([_redact_in_text(str(r)) for r in (summary.analyst_reasons or [])], max_items=None), detail=True)
+    rep.section("Throughput", st.kv([
+        ("Window", f"{format_ts(summary.first_seen)} / {format_ts(summary.last_seen)}"),
+        ("Duration", format_duration(dur)),
+        ("Packets/s · bits/s", f"{summary.total_packets / dur:.2f} · {format_speed_bps(int(summary.total_bytes * 8 / dur))}"
+         if dur and single else ""),
+        counter_line("DSCP", summary.dscp_counts, None),
+        counter_line("ECN", summary.ecn_counts, None),
+        counter_line("SYN sources", getattr(summary, "tcp_syn_sources", None), None),
+    ]), detail=True)
+    endpoint_packets = summary.endpoint_packets if isinstance(summary.endpoint_packets, Counter) else Counter()
+    endpoint_bytes = summary.endpoint_bytes if isinstance(summary.endpoint_bytes, Counter) else Counter()
+    rep.section("Top talkers", st.table(
+        ["Endpoint", "Packets", "Bytes"], [[ip, st.count(endpoint_packets.get(ip, 0)), st.size(b)] for ip, b in endpoint_bytes.most_common()],
+        align="lrr", max_rows=None,
+    ), detail=True)
+    order = ["<=1s", "1-10s", "10-60s", "1-5m", "5-30m", ">30m"]
+    rep.section("Flow durations", st.kv([
+        (label_text, f"{st.sparkline_of([int(b.get(k, 0)) for k in order])}  " + ", ".join(f"{k} {int(b.get(k, 0))}" for k in order))
+        for key, label_text in (("all", "All"), ("tcp", "TCP"), ("udp", "UDP"))
+        for b in [summary.flow_duration_buckets.get(key, Counter())] if b
+    ]), detail=True)
+    rep.section("Outlier windows", st.table(
+        ["Metric", "Start", "End", "Value", "Baseline", "Threshold", "Sample"],
+        [[i.get("metric", "-"), st.ts(i.get("window_start")), st.ts(i.get("window_end")), i.get("value", "-"), i.get("baseline", "-"),
+          i.get("threshold", "-"), i.get("sample", "-")] for i in (getattr(summary, "outlier_windows", None) or [])], max_rows=None,
+    ), detail=True)
+    timing: list[str] = []
+    for key, label_text in (("profinet_rt", "Profinet RT"), ("enip_io", "ENIP IO"), ("s7_rosctr", "S7 COTP/ROSCTR")):
+        entries = (summary.ot_timing or {}).get(key, [])
+        if entries:
+            timing.append(f"  {st.strong(label_text)}")
+            timing += st.table(["Session", "Avg (s)", "Std (s)", "CV", "Min", "Max", "Samples"],
+                               [[e.get("session", "-"), f"{float(e.get('avg', 0.0)):.3f}", f"{float(e.get('std', 0.0)):.3f}",
+                                 f"{float(e.get('cv', 0.0)):.2f}", f"{float(e.get('min', 0.0)):.3f}", f"{float(e.get('max', 0.0)):.3f}",
+                                 e.get("count", 0)] for e in entries], align="lrrrrrr", max_rows=None)
+    rep.section("OT cycle timing", timing, detail=True)
+    rep.section("Zoning", st.bullets([_redact_in_text(str(z)) for z in (summary.zone_anomalies or [])], max_items=None), detail=True)
+    rep.section("Evidence anchors", st.table(
+        ["Packet", "Signal", "Details"], [[i.get("packet", "-"), i.get("signal", "-"), i.get("details", "-")]
+                                          for i in (getattr(summary, "evidence_anchors", None) or [])], max_rows=None,
+    ), detail=True)
+    rep.section("False-positive context", st.bullets([_redact_in_text(str(b)) for b in (getattr(summary, "benign_context", None) or [])],
+                                                     max_items=None), detail=True)
+    if st.analysis_sections():
+        legacy: list[str] = []
+        _render_deterministic_checks(legacy, summary, "Deterministic Health Security Checks", [
+            ("syn_scan_or_exhaustion", "SYN Scan or Service Exhaustion"), ("tcp_reset_storm", "TCP Reset Storm"),
+            ("persistent_zero_window", "Persistent Zero-Window"), ("udp_reflection_amplification", "UDP Reflection/Amplification"),
+            ("qos_marking_anomaly", "QoS Marking Anomaly"), ("snmp_exposure_risk", "SNMP Exposure Risk"),
+            ("ot_cycle_instability", "OT Cycle-Time Instability"), ("certificate_hygiene_risk", "Certificate Hygiene Risk"),
+            ("sequence_degradation_chain", "Sequence Degradation Chain"), ("zone_policy_drift", "Peer Trust Zoning Drift"),
+            ("evidence_provenance", "Evidence Provenance"),
+        ])
+        rep.section("Deterministic checks", legacy[2:])
+    return rep.render()

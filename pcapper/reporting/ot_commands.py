@@ -1,144 +1,92 @@
-"""Rendered output for ot_commands analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for --ot-commands: every OT command observed across the
+decoded protocols, with the state-changing ones (writes, control, restarts,
+program transfers) first: who sent them, to which targets, how often."""
 
 from __future__ import annotations
-from collections import Counter
-from ..coloring import (
-    danger,
-    header,
-    muted,
-    ok,
-    warn,
-)
-from ..ot_commands import OtCommandSummary
-from ..utils import (
-    format_ts,
-)
 
-from ._common import (
-    SUBSECTION_BAR,
-    _filtered_detections,
-    _finalize_output,
-    _format_counter,
-    _format_kv,
-    _format_table,
-    _limit_value,
-    _ot_command_risk,
-)
+from collections import Counter
+
+from ..ot_commands import OtCommandSummary
+from . import _style as st
+from ._common import _ot_command_risk
+from ._kv import counter_line, findings_for
 
 
 def render_ot_commands_summary(
     summary: OtCommandSummary, session_limit: int = 10, verbose: bool = False
 ) -> str:
-    lines = [header("OT COMMANDS")]
+    rep = st.Report("OT commands", summary.path)
+    findings = findings_for(summary)
+    all_cmds: Counter = getattr(summary, "all_command_counts", None) or Counter()
+    control: Counter = getattr(summary, "command_counts", None) or Counter()
+    streams = list(getattr(summary, "unnormalized_streams", []) or [])
+    if not all_cmds and not control and not findings and not streams:
+        return rep.absent("decodable OT protocol commands", summary.errors)
+
+    if control:
+        clean = f"{st.plural(sum(control.values()), 'state-changing command')} without findings"
+    elif streams:
+        clean = "no control commands; publish/subscribe signalling present (see note)"
+    else:
+        clean = "read-only/monitoring: no writes, control, restarts or program transfers"
+    severity, text = st.verdict(
+        findings,
+        high="state-changing OT commands: confirm each source is an authorized master or EWS",
+        medium="OT command activity to review",
+        clean=clean,
+    )
+    rep.headline(severity, text, st.join([
+        st.plural(len(all_cmds), "command type"),
+        st.plural(len(control), "state-changing type"),
+        f"{float(summary.control_rate_per_min or 0.0):.2f} control/min" if summary.control_rate_per_min is not None else "",
+        f"burst {summary.control_burst_max} in 60s" if getattr(summary, "control_burst_max", 0) else "",
+    ]))
     if getattr(summary, "fast_mode", False):
-        lines.append(_format_kv("Mode", "FAST (port heuristic)"))
+        rep.note("FAST", "port-heuristic mode: commands are inferred from ports, not decoded")
         for note in getattr(summary, "fast_notes", []) or []:
-            lines.append(muted(f"- {note}"))
+            rep.scope(str(note))
+    if streams and not control:
+        flags = " ".join(f"--{s.lower().replace('c37.118', 'synchrophasor')}" for s in streams)
+        rep.note("NOTE", f"{', '.join(streams)} is publish/subscribe signalling, not commands: evaluate it with {flags}")
 
-    all_cmds = getattr(summary, "all_command_counts", Counter()) or Counter()
-    control_cmds = getattr(summary, "command_counts", Counter()) or Counter()
-
-    # All observed OT commands (reads + writes) across every decoded protocol —
-    # risk-classified so control/write commands stand out. Shown by default; this
-    # is the section that makes --ot-commands useful on read-only captures.
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("All Observed OT Commands (by protocol)"))
-    if all_cmds:
-        rows = [["Protocol", "Command", "Count", "Class"]]
-        n_control = 0
-        for key, count in all_cmds.most_common(_limit_value(25)):
-            proto, _, cmd = str(key).partition(":")
-            risk = _ot_command_risk(cmd)
-            disp = (
-                danger(cmd) if risk == "CONTROL"
-                else warn(cmd) if risk == "REVIEW"
-                else cmd
-            )
-            if risk == "CONTROL":
-                n_control += 1
-            rows.append([proto, disp, str(count), risk])
-        lines.append(_format_table(rows))
-        distinct = len(all_cmds)
-        if distinct > 25:
-            lines.append(muted(f"  ... and {distinct - 25} more distinct command types"))
-        if n_control:
-            lines.append(muted(
-                f"  {n_control} distinct control/state-changing command type(s) in view "
-                "— see Control/Write Commands below."
-            ))
-    else:
-        lines.append(muted("No decodable OT protocol commands observed in this capture."))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Control/Write Commands (state-changing)"))
-    if control_cmds:
-        lines.append(_format_kv("Commands", _format_counter(control_cmds, 8)))
-        lines.append(_format_kv("Top Sources", _format_counter(summary.sources, 5)))
-        lines.append(
-            _format_kv("Top Destinations", _format_counter(summary.destinations, 5))
-        )
-    else:
-        streams = list(getattr(summary, "unnormalized_streams", []) or [])
-        if streams:
-            flags = " ".join(f"--{s.lower().replace('c37.118', 'synchrophasor')}" for s in streams)
-            lines.append(warn(
-                "None observed in the command protocols; "
-                + ", ".join(streams)
-                + " traffic is present but is publish/subscribe signalling, not "
-                f"commands - evaluate it with {flags} (trips, state changes, injection)."
-            ))
-        else:
-            lines.append(ok(
-                "None observed — traffic is read-only / monitoring "
-                "(no writes, control, restart, or program transfers)."
-            ))
-    if getattr(summary, "control_rate_per_min", None) is not None:
-        rate = float(summary.control_rate_per_min or 0.0)
-        lines.append(_format_kv("Control Rate", f"{rate:.2f}/min"))
-        lines.append(
-            _format_kv(
-                "Control Burst (60s)", str(getattr(summary, "control_burst_max", 0))
-            )
-        )
-    if getattr(summary, "command_sessions", None):
-        lines.append(header("Top Command Sessions"))
-        rows = [["Session", "Count", "First Seen", "Last Seen"]]
-        session_times = getattr(summary, "command_session_times", {}) or {}
-        for session, count in summary.command_sessions.most_common(
-            _limit_value(session_limit)
-        ):
-            first, last = session_times.get(session, (None, None))
-            rows.append([session, str(count), format_ts(first), format_ts(last)])
-        lines.append(_format_table(rows))
-    if getattr(summary, "control_targets", None):
-        targets = summary.control_targets or {}
-        if targets:
-            lines.append(header("Top Control Targets"))
-            for proto in sorted(targets.keys(), key=str.casefold):
-                rows = [["Target", "Count"]]
-                for target, count in targets[proto].most_common(_limit_value(6)):
-                    rows.append([target, str(count)])
-                if len(rows) > 1:
-                    lines.append(muted(proto))
-                    lines.append(_format_table(rows))
     if summary.errors:
-        lines.append(_format_kv("Errors", "; ".join(summary.errors)))
-    # Show all detections by default — --ot-commands does not require -v.
-    detections = _filtered_detections(summary, True)
-    if detections:
-        lines.append(header("Detections"))
-        for item in detections[: _limit_value(6)]:
-            sev = str(item.get("severity", "info")).upper()
-            summary_text = str(item.get("summary", ""))
-            details = str(item.get("details", ""))
-            sev_color = danger if sev in {"CRITICAL", "HIGH"} else warn
-            if sev in {"INFO", "LOW"}:
-                sev_color = muted
-            lines.append(sev_color(f"[{sev}] {summary_text}"))
-            if details:
-                lines.append(muted(f"  {details}"))
-    return _finalize_output(lines)
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Findings", st.findings_block(findings))
+
+    if control:
+        rep.section("State-changing commands", st.kv([
+            ("Commands", st.top(control, 8)),
+            counter_line("Sources", summary.sources),
+            counter_line("Destinations", summary.destinations),
+        ]))
+    targets = getattr(summary, "control_targets", None) or {}
+    target_rows = [[proto, target, st.count(n)] for proto in sorted(targets, key=str.casefold)
+                   for target, n in targets[proto].most_common(None if st.verbose() else 6)]
+    rep.section("Control targets", st.table(["Protocol", "Target", "Count"], target_rows, align="llr", max_rows=None))
+
+    times = getattr(summary, "command_session_times", {}) or {}
+    rep.section("Command sessions", st.table(
+        ["Session", "Commands", "First", "Last"],
+        [[s, st.count(n), st.ts(times.get(s, (None, None))[0]), st.ts(times.get(s, (None, None))[1])]
+         for s, n in (summary.command_sessions or Counter()).most_common()],
+        align="lrll", max_rows=session_limit, noun="session",
+    ))
+
+    rank = {"CONTROL": 0, "REVIEW": 1}
+    rows = []
+    for key, n in sorted(all_cmds.items(), key=lambda kv: (rank.get(_ot_command_risk(str(kv[0]).partition(":")[2]), 2), -kv[1], str(kv[0]))):
+        proto, _, cmd = str(key).partition(":")
+        risk = _ot_command_risk(cmd)
+        shown = st.bad(cmd) if risk == "CONTROL" else st.caution(cmd) if risk == "REVIEW" else cmd
+        rows.append([proto, shown, st.count(n), risk.lower()])
+    rep.section("All commands", st.ranked(["Protocol", "Command", "Count", "Class"], rows, align="llrl",
+                                          noun="command type"))
+
+    markers = []
+    for label_text, name in (("Write markers", "write_markers"), ("Protocol markers", "protocol_markers")):
+        value = getattr(summary, name, None)
+        if value:
+            markers.append((label_text, st.top(value, None) if hasattr(value, "items") else ", ".join(map(str, value))))
+    rep.section("Markers", st.kv(markers), detail=True)
+    return rep.render()
+

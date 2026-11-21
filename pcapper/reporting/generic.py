@@ -1,32 +1,14 @@
-"""Rendered output for generic analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for the generic -summarize rollup (analyzers without
+their own merge): findings aggregated across captures with how many
+captures each appeared in, endpoint and counter tallies, and service
+endpoints; totals, size buckets and artifacts are -v detail."""
 
 from __future__ import annotations
+
 from collections import Counter, defaultdict
 from typing import Iterable
-from ..coloring import (
-    header,
-    highlight,
-    label,
-    muted,
-)
-from ..utils import (
-    format_bytes_as_mb,
-    format_duration,
-)
 
-from ._common import (
-    SECTION_BAR,
-    SUBSECTION_BAR,
-    _counter_table,
-    _finalize_output,
-    _format_kv,
-    _format_table,
-    _limit_value,
-)
+from . import _style as st
 
 
 def render_generic_rollup(title: str, summaries: Iterable[object]) -> str:
@@ -41,7 +23,7 @@ def render_generic_rollup(title: str, summaries: Iterable[object]) -> str:
     packet_buckets: dict[str, dict[str, float]] = {}
     payload_buckets: dict[str, dict[str, float]] = {}
     artifact_counts: Counter[str] = Counter()
-    anomaly_counts: Counter[str] = Counter()
+    finding_seen: dict[tuple[str, str], tuple[str, set[int]]] = {}
 
     preferred_numeric = {
         "total_packets": "Total Packets",
@@ -71,7 +53,7 @@ def render_generic_rollup(title: str, summaries: Iterable[object]) -> str:
         "servers": "Unique Servers",
     }
 
-    for summary in summary_list:
+    for index, summary in enumerate(summary_list):
         for name, value in vars(summary).items():
             if isinstance(value, Counter):
                 counters.setdefault(name, Counter()).update(value)
@@ -122,123 +104,51 @@ def render_generic_rollup(title: str, summaries: Iterable[object]) -> str:
                 detail = str(getattr(artifact, "detail", ""))
                 artifact_counts[f"{kind}: {detail}"] += 1
 
-        anomalies = getattr(summary, "anomalies", None)
-        if isinstance(anomalies, list):
-            for anomaly in anomalies:
-                title = str(getattr(anomaly, "title", "Event"))
-                anomaly_counts[title] += 1
+        for item in list(getattr(summary, "detections", None) or []) + list(getattr(summary, "anomalies", None) or []):
+            f = st.finding(item)
+            entry = finding_seen.setdefault((f.title, f.severity), (f.detail, set()))
+            entry[1].add(index)
 
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"{title} :: ALL PCAPS ({len(summary_list)})"))
-    lines.append(SECTION_BAR)
-    lines.append(_format_kv("PCAPs Analyzed", str(len(summary_list))))
-
+    n = len(summary_list)
+    rep = st.Report(f"{title.replace(' ANALYSIS', '').strip()} rollup", f"all captures ({n})")
+    findings = []
+    for (_title, _sev), (detail, seen) in sorted(finding_seen.items(), key=lambda kv: (-st.sev_rank(kv[0][1]), kv[0][0])):
+        findings.append(st.finding({"severity": _sev, "title": _title,
+                                    "details": st.join([f"in {len(seen)} of {st.plural(n, 'capture')}", detail])}))
+    severity, text = st.verdict(findings, high="high-severity findings across captures", medium="findings to review across captures")
+    totals_kv: dict[str, str] = {}
     for key, label_text in preferred_numeric.items():
-        if key in totals:
+        if key in totals and label_text not in totals_kv:
             value = totals[key]
-            if key.endswith("bytes"):
-                lines.append(_format_kv(label_text, format_bytes_as_mb(int(value))))
-            elif "duration" in key:
-                lines.append(_format_kv(label_text, format_duration(value)))
-            else:
-                lines.append(_format_kv(label_text, str(int(value))))
+            totals_kv[label_text] = (st.size(int(value)) if key.endswith("bytes") else
+                                     st.duration(value) if "duration" in key else st.count(int(value)))
+    rep.headline(severity, text, st.join([st.plural(n, "capture")]
+                                         + [f"{v} {k.lower().removeprefix('total ')}" for k, v in list(totals_kv.items())[:3]]))
+    rep.section("Findings", st.findings_block(findings))
+    client_counter = counters.get("client_ips") or counters.get("clients") or counters.get("src_ips")
+    server_counter = counters.get("server_ips") or counters.get("servers") or counters.get("dst_ips")
+    rep.section("Endpoints", st.kv([("Clients", st.top(client_counter, 8)), ("Servers", st.top(server_counter, 8))]
+                                   + [(label_text, st.count(len(unions[key]))) for key, label_text in preferred_sets.items() if key in unions]))
+    shown = {id(client_counter), id(server_counter)}
+    ordered = sorted(((k, c) for k, c in counters.items() if id(c) not in shown), key=lambda item: sum(item[1].values()), reverse=True)
+    rep.section("Counters", st.kv([(name.replace("_", " ").capitalize(), st.top(c, 6)) for name, c in
+                                   (ordered if st.verbose() else ordered[:4])]))
+    rep.section("Services", st.table(
+        ["Service", "Top endpoints"],
+        [[svc, st.top(service_endpoints.get(svc, Counter()), 3)] for svc, _ in
+         Counter({svc: sum(c.values()) for svc, c in service_endpoints.items()}).most_common()],
+        max_rows=st.TOP_ROWS, tail=st.TOP_ROWS, noun="service",
+    ))
+    rep.section("Totals", st.kv(list(totals_kv.items())), detail=True)
 
-    for key, label_text in preferred_sets.items():
-        if key in unions:
-            lines.append(_format_kv(label_text, str(len(unions[key]))))
+    def _buckets(store: dict[str, dict[str, float]]) -> list[str]:
+        total = sum(e["count"] for e in store.values())
+        return st.table(["Bucket", "Count", "Share", "Min", "Avg", "Max"],
+                        [[b, int(e["count"]), f"{e['count'] / total:.1%}", int(e["min"]), f"{e['sum'] / e['count']:.1f}" if e["count"] else "0.0",
+                          int(e["max"])] for b, e in store.items()], align="lrrrrr", max_rows=None) if total else []
 
-    client_counter = (
-        counters.get("client_ips") or counters.get("clients") or counters.get("src_ips")
-    )
-    server_counter = (
-        counters.get("server_ips") or counters.get("servers") or counters.get("dst_ips")
-    )
-    if client_counter or server_counter:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Endpoint Statistics"))
-        col_width = 45
-        lines.append(highlight(f"{'Clients':<{col_width}} | {'Servers'}"))
-        lines.append(muted("-" * 90))
-        clients = client_counter.most_common(_limit_value(10)) if client_counter else []
-        servers = server_counter.most_common(_limit_value(10)) if server_counter else []
-        max_rows = max(len(clients), len(servers))
-        for i in range(max_rows):
-            c_str = ""
-            s_str = ""
-            if i < len(clients):
-                ip, cnt = clients[i]
-                c_str = f"{ip} ({cnt})"
-            if i < len(servers):
-                ip, cnt = servers[i]
-                s_str = f"{ip} ({cnt})"
-            lines.append(f"{c_str:<{col_width}} | {s_str}")
-
-    if counters:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Top Aggregated Counters"))
-        ordered_counters = sorted(
-            counters.items(), key=lambda item: sum(item[1].values()), reverse=True
-        )
-        for name, counter in ordered_counters[: _limit_value(4)]:
-            lines.append(label(name.replace("_", " ").title()))
-            lines.append(_counter_table(counter, "Item", limit=_limit_value(10)))
-
-    if service_endpoints:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Service Endpoints"))
-        rows = [["Service", "Top Endpoints"]]
-        for service, counter in Counter(
-            {svc: sum(cnt.values()) for svc, cnt in service_endpoints.items()}
-        ).most_common(_limit_value(10)):
-            endpoints = service_endpoints.get(service, Counter())
-            top_eps = ", ".join(
-                f"{ep} ({cnt})" for ep, cnt in endpoints.most_common(_limit_value(3))
-            )
-            rows.append([service, top_eps or "-"])
-        lines.append(_format_table(rows))
-
-    if packet_buckets or payload_buckets:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Packet/Payload Size Analysis"))
-
-        def _render_bucket_table(
-            bucket_store: dict[str, dict[str, float]], label_text: str
-        ) -> None:
-            if not bucket_store:
-                return
-            total = sum(entry["count"] for entry in bucket_store.values())
-            if not total:
-                return
-            rows = [["Bucket", "Count", "Pct", "Min", "Avg", "Max"]]
-            for bucket_label, entry in bucket_store.items():
-                avg = (entry["sum"] / entry["count"]) if entry["count"] else 0.0
-                pct = (entry["count"] / total) * 100
-                rows.append(
-                    [
-                        bucket_label,
-                        str(int(entry["count"])),
-                        f"{pct:.1f}%",
-                        str(int(entry["min"])) if entry["min"] else "0",
-                        f"{avg:.1f}",
-                        str(int(entry["max"])) if entry["max"] else "0",
-                    ]
-                )
-            lines.append(label(label_text))
-            lines.append(_format_table(rows))
-
-        _render_bucket_table(packet_buckets, "Packet Buckets")
-        _render_bucket_table(payload_buckets, "Payload Buckets")
-
-    if artifact_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Artifacts & Observations"))
-        lines.append(_counter_table(artifact_counts, "Artifact", limit=_limit_value(12)))
-
-    if anomaly_counts:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Anomalies & Threat Indicators"))
-        lines.append(_counter_table(anomaly_counts, "Title", limit=_limit_value(12)))
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    rep.section("Packet sizes", _buckets(packet_buckets), detail=True)
+    rep.section("Payload sizes", _buckets(payload_buckets), detail=True)
+    rep.section("Artifacts", st.table(["Artifact", "Count"], [[a, c] for a, c in artifact_counts.most_common()], align="lr", max_rows=None),
+                detail=True)
+    return rep.render()

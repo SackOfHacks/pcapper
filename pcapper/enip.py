@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from .utils import is_public_ip as _is_public_ip, packet_length, memoize_analysis
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
+
+from .ot_ports import foreign_service_reply
+from .utils import is_public_ip as _is_public_ip
+from .utils import memoize_analysis, packet_length
 
 try:
     from scapy.layers.inet import IP, TCP, UDP
@@ -30,6 +33,7 @@ from .cip import (
     WRITE_BASELINE_MIN,
     WRITE_SERVICE_CODES,
     _decode_cip_data_type,
+    _enip_prefilter,
     _extract_symbol,
     _match_sensitive_tag,
     _parse_cip_message,
@@ -48,7 +52,7 @@ from .industrial_helpers import (
     _extract_transport,
     merge_size_buckets,
 )
-from .pcap_cache import PcapMeta, iter_packets
+from .pcap_cache import PassStats, PcapMeta, iter_packets
 from .utils import safe_float, safe_read_text
 
 ENIP_TCP_PORT = 44818
@@ -541,6 +545,23 @@ def _parse_forward_open(data: bytes) -> Optional[dict[str, object]]:
     }
 
 
+
+def _enip_signature(payload: bytes) -> bool:
+    """A full 24-byte encapsulation header accounting for exactly the trailing
+    data, with a defined status: ENIP on a non-standard port. Checking only
+    the 2-byte command would misread arbitrary binary/HTTP content whose first
+    two bytes equal a command code (small LE values like 04 00 / 65 00)."""
+    if not payload or len(payload) < 24:
+        return False
+    cmd_guess = int.from_bytes(payload[0:2], "little")
+    declared_len = int.from_bytes(payload[2:4], "little")
+    enc_status = int.from_bytes(payload[8:12], "little")
+    return (
+        cmd_guess in ENIP_COMMANDS
+        and 24 + declared_len == len(payload)
+        and enc_status in _ENIP_ENCAP_STATUSES
+    )
+
 @memoize_analysis
 def analyze_enip(
     path: Path,
@@ -648,8 +669,19 @@ def analyze_enip(
             ] += 1
         return is_write
 
+    # Read from disk, only ENIP candidates are handed over (the totals and the
+    # time span come from the pass), as lite records parsed from their bytes.
+    stats = PassStats()
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path,
+            packets=packets,
+            meta=meta,
+            show_status=show_status,
+            lite=True,
+            prefilter=_enip_prefilter(frozenset(enip_ports), _enip_signature),
+            stats=stats,
+        ):
             analysis.total_packets += 1
             pkt_len = packet_length(pkt)
             analysis.total_bytes += pkt_len
@@ -676,26 +708,12 @@ def analyze_enip(
             # whose ephemeral source port happens to equal 44818 (e.g. a DNS
             # query to 8.8.8.8). Real ENIP on a nonstandard port is still
             # caught by the command-signature path below.
-            matches_port = dport in enip_ports or (
+            matches_port = (dport in enip_ports and not foreign_service_reply(sport, enip_ports)) or (
                 sport in enip_ports and dport >= 32768
             )
-            # Signature match for ENIP on a non-standard port must validate
-            # the full 24-byte encapsulation header, not just the 2-byte
-            # command — otherwise arbitrary binary/HTTP content whose first
-            # two bytes happen to equal a command code (small LE values like
-            # 04 00 / 65 00) is misread as ENIP. A real header's length field
-            # accounts for exactly the trailing data and the status is one of
-            # the defined encapsulation statuses.
-            matches_signature = False
-            if payload and len(payload) >= 24:
-                cmd_guess = int.from_bytes(payload[0:2], "little")
-                declared_len = int.from_bytes(payload[2:4], "little")
-                enc_status = int.from_bytes(payload[8:12], "little")
-                matches_signature = (
-                    cmd_guess in ENIP_COMMANDS
-                    and 24 + declared_len == len(payload)
-                    and enc_status in _ENIP_ENCAP_STATUSES
-                )
+            # Signature match for ENIP on a non-standard port validates the
+            # full 24-byte encapsulation header (see _enip_signature).
+            matches_signature = _enip_signature(payload)
 
             if not matches_port and not matches_signature:
                 continue
@@ -1474,6 +1492,12 @@ def analyze_enip(
 
     except Exception as exc:
         analysis.errors.append(f"{type(exc).__name__}: {exc}")
+    if stats.active:
+        analysis.total_packets = stats.packets
+        analysis.total_bytes = stats.bytes
+        if stats.packets:
+            start_time = safe_float(getattr(stats.first, "time", 0))
+            last_time = safe_float(getattr(stats.last, "time", 0))
 
     if start_time is not None and last_time is not None:
         analysis.duration = last_time - start_time

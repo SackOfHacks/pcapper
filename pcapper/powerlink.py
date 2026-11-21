@@ -16,8 +16,9 @@ from pathlib import Path
 from .industrial_helpers import (
     IndustrialAnalysis,
     IndustrialAnomaly,
-    analyze_ethertype_protocol,
-    analyze_port_protocol,
+    analyze_protocols_together,
+    ethertype_protocol_spec,
+    port_protocol_spec,
 )
 from .utils import memoize_analysis
 
@@ -90,6 +91,16 @@ class _EplState:
             self.sdo_writes[f"{src} -> node {dst_node}"] += 1
         return []
 
+    def absorb(self, later: "_EplState") -> None:
+        """Fold in a state fed with the frames after this one's: the same
+        counts, and the same first-seen order, as one state fed with both."""
+        self.mn_sources |= later.mn_sources
+        self.nmt.update(later.nmt)
+        for detail, pairs in later.nmt_src.items():
+            self.nmt_src[detail].update(pairs)
+        self.sdo_writes.update(later.sdo_writes)
+        self.nodes |= later.nodes
+
     def findings(self) -> list[IndustrialAnomaly]:
         found: list[IndustrialAnomaly] = []
         if len(self.mn_sources) > 1:
@@ -134,38 +145,46 @@ def _merge(target: IndustrialAnalysis, other: IndustrialAnalysis) -> None:
 
 @memoize_analysis
 def analyze_powerlink(path: Path, show_status: bool = True) -> IndustrialAnalysis:
+    # EPL v2 on its EtherType, routed EPL on UDP 3819 and EPL v1, in one read.
+    # Each feeds its own state; the UDP one is folded in after the L2 one,
+    # as when the UDP frames were read in a second pass.
     state = _EplState()
-    analysis = analyze_ethertype_protocol(
-        path=path,
-        protocol_name="POWERLINK",
-        ethertype=EPL_ETHERTYPE,
-        command_parser=_commands,
-        artifact_parser=lambda _payload: [],
-        anomaly_detector=state.feed,
-        enable_enrichment=True,
+    routed_state = _EplState()
+    analysis, routed, v1 = analyze_protocols_together(
+        path,
+        [
+            ethertype_protocol_spec(
+                path,
+                "POWERLINK",
+                EPL_ETHERTYPE,
+                command_parser=_commands,
+                artifact_parser=lambda _payload: [],
+                anomaly_detector=state.feed,
+                enable_enrichment=True,
+            ),
+            port_protocol_spec(
+                path,
+                "POWERLINK (UDP)",
+                port_key="powerlink",
+                tcp_ports=set(),
+                udp_ports={EPL_UDP_PORT},
+                command_parser=_commands,
+                artifact_parser=lambda _payload: [],
+                anomaly_detector=routed_state.feed,
+                enable_enrichment=True,
+            ),
+            ethertype_protocol_spec(
+                path,
+                "POWERLINK v1",
+                EPL_V1_ETHERTYPE,
+                command_parser=lambda _payload: ["EPL v1 frame"],
+                artifact_parser=lambda _payload: [],
+            ),
+        ],
         show_status=show_status,
     )
-    routed = analyze_port_protocol(
-        port_key="powerlink",
-        path=path,
-        protocol_name="POWERLINK (UDP)",
-        tcp_ports=set(),
-        udp_ports={EPL_UDP_PORT},
-        command_parser=_commands,
-        artifact_parser=lambda _payload: [],
-        anomaly_detector=state.feed,
-        enable_enrichment=True,
-        show_status=False,
-    )
     _merge(analysis, routed)
-    v1 = analyze_ethertype_protocol(
-        path=path,
-        protocol_name="POWERLINK v1",
-        ethertype=EPL_V1_ETHERTYPE,
-        command_parser=lambda _payload: ["EPL v1 frame"],
-        artifact_parser=lambda _payload: [],
-        show_status=False,
-    )
     _merge(analysis, v1)
+    state.absorb(routed_state)
     analysis.anomalies.extend(state.findings())
     return analysis

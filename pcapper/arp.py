@@ -312,8 +312,12 @@ def analyze_arp(
             if convo.last_seen is None or ts > convo.last_seen:
                 convo.last_seen = ts
 
-        ip_to_macs[src_ip].add(src_mac)
-        mac_to_ips[src_mac].add(src_ip)
+        # An ARP probe (RFC 5227) is sent from 0.0.0.0 before the sender owns
+        # an address: it claims nothing, so two devices probing are not an
+        # IP/MAC conflict.
+        if src_ip != "0.0.0.0":
+            ip_to_macs[src_ip].add(src_mac)
+            mac_to_ips[src_mac].add(src_ip)
         if op == 2:
             replies_by_ip_mac[src_ip][src_mac] += 1
             reply_dst_targets_by_mac[src_mac].add(dst_ip)

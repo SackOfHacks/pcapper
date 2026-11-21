@@ -6,7 +6,8 @@ from pathlib import Path
 from typing import Optional
 
 from .device_detection import device_fingerprints_from_text
-from .pcap_cache import PcapMeta, iter_packets
+from .lite import UNSUPPORTED, LitePacket
+from .pcap_cache import PassStats, PcapMeta, iter_packets
 from .utils import memoize_analysis, safe_float
 
 try:
@@ -153,6 +154,18 @@ def _parse_dcp(payload: bytes) -> tuple[list[str], list[str], list[str]]:
     return services, names, ips
 
 
+_LLDP_DCP_TYPES = frozenset((LLDP_ETHERTYPE, PROFINET_ETHERTYPE))
+
+
+def _lldp_dcp_prefilter(record: LitePacket) -> bool:
+    """Only frames whose first Ethernet header names LLDP or PROFINET can
+    count; the rest count toward the capture totals alone."""
+    first = record.lite_first_ether()
+    if first is UNSUPPORTED:
+        return True
+    return first is not None and first[0] in _LLDP_DCP_TYPES
+
+
 @memoize_analysis
 def analyze_lldp_dcp(
     path: Path,
@@ -198,18 +211,42 @@ def analyze_lldp_dcp(
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    # Read from disk, only LLDP/PROFINET frames are handed over (the totals
+    # come from the pass), as lite records parsed from their bytes.
+    stats = PassStats()
+    for pkt in iter_packets(
+        path,
+        packets=packets,
+        meta=meta,
+        show_status=show_status,
+        lite=True,
+        prefilter=_lldp_dcp_prefilter,
+        stats=stats,
+    ):
         total_packets += 1
         ts = safe_float(getattr(pkt, "time", None))
 
-        if not pkt.haslayer(Ether):  # type: ignore[truthy-bool]
-            continue
-        eth = pkt[Ether]  # type: ignore[index]
-        eth_type = int(getattr(eth, "type", 0) or 0)
-        try:
-            payload = bytes(eth.payload)
-        except Exception:
-            payload = b""
+        first = pkt.lite_first_ether() if type(pkt) is LitePacket else UNSUPPORTED
+        if first is None:
+            continue  # no Ethernet layer anywhere
+        if first is not UNSUPPORTED and (first[0] not in _LLDP_DCP_TYPES or first[3] >= 0):  # type: ignore[index]
+            eth_type, eth_src, eth_dst, offset = first  # type: ignore[misc]
+            if eth_type not in _LLDP_DCP_TYPES:
+                continue
+            # Left as Raw by scapy: bytes(eth.payload) is the rest of the frame.
+            payload = pkt.original[offset:]
+        else:
+            if type(pkt) is LitePacket:
+                pkt = pkt.materialize()
+            if not pkt.haslayer(Ether):  # type: ignore[truthy-bool]
+                continue
+            eth = pkt[Ether]  # type: ignore[index]
+            eth_type = int(getattr(eth, "type", 0) or 0)
+            try:
+                payload = bytes(eth.payload)
+            except Exception:
+                payload = b""
+            eth_src, eth_dst = eth.src, eth.dst
 
         if eth_type == LLDP_ETHERTYPE:
             lldp_packets += 1
@@ -235,7 +272,7 @@ def analyze_lldp_dcp(
                     seen_device_artifacts.add(key)
                     artifacts.append(
                         LldpDcpArtifact(
-                            kind="device", detail=detail, src=eth.src, dst=eth.dst
+                            kind="device", detail=detail, src=eth_src, dst=eth_dst
                         )
                     )
 
@@ -266,13 +303,14 @@ def analyze_lldp_dcp(
                             LldpDcpArtifact(
                                 kind="device",
                                 detail=detail,
-                                src=eth.src,
-                                dst=eth.dst,
+                                src=eth_src,
+                                dst=eth_dst,
                             )
                         )
                 for ip in ips:
                     dcp_ips[ip] += 1
-
+    if stats.active:
+        total_packets = stats.packets
 
     if lldp_packets:
         detections.append(

@@ -66,7 +66,7 @@ from .profinet import _parse_commands as _parse_profinet_commands
 from .s7 import S7_PORT, analyze_s7
 from .s7 import _parse_commands as _parse_s7_commands
 from .srtp import analyze_srtp
-from .utils import call_with_packet_view, safe_float
+from .utils import call_with_packet_view, safe_float, fan_out
 from .yokogawa import analyze_yokogawa
 from .opc_classic import analyze_opc_classic
 from .ot_extra import OT_EXTRA
@@ -778,6 +778,7 @@ def _analyze_ot_commands_fast(
     )
 
 
+@fan_out
 def analyze_ot_commands(
     path: Path,
     show_status: bool = True,
@@ -827,11 +828,15 @@ def analyze_ot_commands(
 
     modbus = _analyze(analyze_modbus, show_status=show_status)
     modbus_extra = _protocol_extra("Modbus")
+    # Requests only: a Modbus write is echoed in its response.
+    modbus_requests = getattr(modbus, "request_func_counts", None) or modbus.func_counts
     _count_from_counter(
-        modbus.func_counts, "Modbus", command_counts, modbus_extra, base_markers
+        modbus_requests, "Modbus", command_counts, modbus_extra, base_markers
     )
     errors.extend(modbus.errors or [])
     for msg in getattr(modbus, "messages", []) or []:
+        if getattr(msg, "direction", None) == "response":
+            continue  # the device echoing the write, not a command
         if _is_write_command(
             str(getattr(msg, "func_name", "")), modbus_extra, base_markers
         ):
@@ -1283,7 +1288,7 @@ def analyze_ot_commands(
     # analyzers already run above, so the view is useful on read-only captures.
     all_command_counts: Counter[str] = Counter()
     _all_sources: list[tuple[str, Counter]] = [
-        ("Modbus", getattr(modbus, "func_counts", Counter())),
+        ("Modbus", getattr(modbus, "request_func_counts", None) or getattr(modbus, "func_counts", Counter())),
         ("DNP3", getattr(dnp3, "func_counts", Counter())),
         ("CIP", getattr(cip, "cip_services", Counter())),
         ("ENIP", getattr(cip, "enip_commands", Counter())),

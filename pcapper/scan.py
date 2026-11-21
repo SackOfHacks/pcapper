@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-
 import re
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
@@ -8,14 +7,18 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import PcapMeta, iter_packets
-from .services import COMMON_PORTS, _OT_SERVICE_PORTS
+from .services import _OT_SERVICE_PORTS, COMMON_PORTS
 from .utils import (
     extract_packet_endpoints,
     is_private_ip,
     is_public_ip,
-    is_unicast_host_ip as _is_unicast_target,
     memoize_analysis,
     safe_float,
+)
+from .utils import (
+    is_unicast_host_ip as _is_unicast_target,
+)
+from .utils import (
     tcp_flags_int as _tcp_flags_int,
 )
 
@@ -456,8 +459,16 @@ def _guess_scanner_tool(
         5900,
     }
     top = set(top_ports[:10])
+    # Masscan/ZMap sweep many hosts on a few ports; ~1000 ports on one host
+    # is nmap's default top-1000 list, and 60k+ ports is a full range.
+    if scan_type == "horizontal" and unique_targets >= 1000 and unique_ports <= 3:
+        return "Heuristic: internet-scale sweep (Masscan/ZMap-like)"
     if scan_type == "vertical" and syn_packets > 300 and unique_ports >= 500:
-        return "Heuristic: high-speed scanner (Masscan/ZMap-like)"
+        if unique_ports >= 60000:
+            return "Heuristic: full port-range scan (nmap -p- / masscan -p0-65535)"
+        if 900 <= unique_ports <= 1100:
+            return "Nmap (heuristic: default top-1000 port scan)"
+        return "Heuristic: wide vertical port scan"
     if scan_type == "horizontal" and probe_packets >= 50 and unique_targets >= 32:
         return "Nmap (heuristic: -sn host discovery sweep)"
     if (
@@ -711,8 +722,18 @@ def analyze_scan(
                     if flavor == "syn":
                         src_syn[src_ip] += 1
         elif udp_layer is not None:
-            # UDP scan: a host firing UDP datagrams at many ports/targets.
-            if dport is not None and _is_unicast_target(dst_ip):
+            # UDP scan: a host firing UDP datagrams at many ports/targets. A
+            # datagram from a service port to an ephemeral port is that
+            # service's reply (a DNS server answering a resolver's random
+            # source ports), not a probe -- it made every DNS server a scanner.
+            udp_reply = (
+                sport is not None
+                and dport is not None
+                and dport >= 1024
+                and dport not in COMMON_PORTS
+                and (sport < 1024 or sport in COMMON_PORTS)
+            )
+            if dport is not None and _is_unicast_target(dst_ip) and not udp_reply:
                 _record_probe(
                     src_ip,
                     dst_ip,

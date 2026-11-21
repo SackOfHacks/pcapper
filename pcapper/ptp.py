@@ -6,8 +6,9 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-from .pcap_cache import PcapMeta, iter_packets
-from .utils import memoize_analysis, safe_float
+from .lite import UNSUPPORTED, LitePacket
+from .pcap_cache import PassStats, PcapMeta, iter_packets
+from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, UDP  # type: ignore
@@ -110,6 +111,20 @@ def _extract_ptp_payload(eth: object) -> bytes | None:
     return bytes(layer)
 
 
+_PTP_PORTS = frozenset((PTP_EVENT_PORT, PTP_GENERAL_PORT))
+
+
+def _ptp_prefilter(record: LitePacket) -> bool:
+    """Only L2 PTP frames and UDP 319/320 datagrams can count; the rest count
+    toward the capture totals alone."""
+    if record.lite_ether(PTP_ETHERTYPE) is not None:
+        return True
+    l4 = record.lite_l4()
+    if l4 is UNSUPPORTED:
+        return True
+    return l4 is not None and not l4[0] and (l4[1] in _PTP_PORTS or l4[2] in _PTP_PORTS)
+
+
 @memoize_analysis
 def analyze_ptp(
     path: Path,
@@ -136,62 +151,114 @@ def analyze_ptp(
     first_seen: Optional[float] = None
     last_seen: Optional[float] = None
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    # Read from disk, only PTP candidates are handed over (the totals come
+    # from the pass), as lite records parsed from their bytes.
+    stats = PassStats()
+    for pkt in iter_packets(
+        path,
+        packets=packets,
+        meta=meta,
+        show_status=show_status,
+        lite=True,
+        prefilter=_ptp_prefilter,
+        stats=stats,
+    ):
         total_packets += 1
         ts = safe_float(getattr(pkt, "time", None))
 
-        is_ptp = False
-        payload = b""
-        if Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
-            eth = pkt[Ether]  # type: ignore[index]
-            try:
-                l2_payload = _extract_ptp_payload(eth)
-            except Exception as exc:
-                malformed_messages[
-                    f"could not decode Ethernet payload ({type(exc).__name__})"
-                ] += 1
-                l2_payload = None
-            if l2_payload is not None:
-                payload = l2_payload
-                is_ptp = True
-                src_mac = str(getattr(eth, "src", "-"))
-                dst_mac = str(getattr(eth, "dst", "-"))
-                src_macs[src_mac] += 1
-                dst_macs[dst_mac] += 1
+        lite_done = False
+        if type(pkt) is LitePacket:
+            l2 = pkt.lite_ether(PTP_ETHERTYPE)
+            l4 = pkt.lite_l4()
+            udp_ptp = (
+                l4 is not None
+                and l4 is not UNSUPPORTED
+                and not l4[0]  # type: ignore[index]
+                and (l4[1] in _PTP_PORTS or l4[2] in _PTP_PORTS)  # type: ignore[index]
+            )
+            if l2 is not UNSUPPORTED and l4 is not UNSUPPORTED and not (udp_ptp and l4[5] < 0):  # type: ignore[index]
+                lite_done = True
+                is_ptp = False
+                payload = b""
+                ip_src = ip_dst = None
+                source_label = "?"
+                if l2 is not None:
+                    # An outer Ethernet header (linktype 1): its source is the
+                    # packet's first ``src`` field. PTP's EtherType bytes are
+                    # left as Raw by scapy: bytes(layer) is the rest of the frame.
+                    src_mac, dst_mac, payload = l2  # type: ignore[misc]
+                    is_ptp = True
+                    source_label = src_mac
+                    src_macs[src_mac] += 1
+                    dst_macs[dst_mac] += 1
+                    try:
+                        first_octet = int(dst_mac.split(":")[0], 16)
+                        if (first_octet & 1) == 0:
+                            unicast_dsts.add(dst_mac)
+                    except Exception:
+                        pass
+                if udp_ptp:
+                    # bytes() of the only transport's Raw payload and the
+                    # padding scapy split off behind it: the rest of the record.
+                    is_ptp = True
+                    payload = pkt.original[l4[7] :]  # type: ignore[index]
+                    ip_src, ip_dst = extract_packet_endpoints(pkt, include_arp=False)
+                    source_label = ip_src  # type: ignore[assignment]
+            else:
+                pkt = pkt.materialize()
+        if not lite_done:
+            is_ptp = False
+            payload = b""
+            if Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
+                eth = pkt[Ether]  # type: ignore[index]
                 try:
-                    first_octet = int(dst_mac.split(":")[0], 16)
-                    if (first_octet & 1) == 0:
-                        unicast_dsts.add(dst_mac)
-                except Exception:
-                    pass
-
-        ip_src: str | None = None
-        ip_dst: str | None = None
-        source_label = str(getattr(pkt, "src", "?"))
-        if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-            udp = pkt[UDP]  # type: ignore[index]
-            sport = int(getattr(udp, "sport", 0) or 0)
-            dport = int(getattr(udp, "dport", 0) or 0)
-            if sport in {PTP_EVENT_PORT, PTP_GENERAL_PORT} or dport in {
-                PTP_EVENT_PORT,
-                PTP_GENERAL_PORT,
-            }:
-                is_ptp = True
-                try:
-                    payload = bytes(getattr(udp, "payload", b""))
+                    l2_payload = _extract_ptp_payload(eth)
                 except Exception as exc:
                     malformed_messages[
-                        f"could not decode UDP payload ({type(exc).__name__})"
+                        f"could not decode Ethernet payload ({type(exc).__name__})"
                     ] += 1
-                    payload = b""
-                if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
-                    ip_src = str(pkt[IP].src)  # type: ignore[index]
-                    ip_dst = str(pkt[IP].dst)  # type: ignore[index]
-                    source_label = ip_src
-                elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
-                    ip_src = str(pkt[IPv6].src)  # type: ignore[index]
-                    ip_dst = str(pkt[IPv6].dst)  # type: ignore[index]
-                    source_label = ip_src
+                    l2_payload = None
+                if l2_payload is not None:
+                    payload = l2_payload
+                    is_ptp = True
+                    src_mac = str(getattr(eth, "src", "-"))
+                    dst_mac = str(getattr(eth, "dst", "-"))
+                    src_macs[src_mac] += 1
+                    dst_macs[dst_mac] += 1
+                    try:
+                        first_octet = int(dst_mac.split(":")[0], 16)
+                        if (first_octet & 1) == 0:
+                            unicast_dsts.add(dst_mac)
+                    except Exception:
+                        pass
+
+            ip_src: str | None = None
+            ip_dst: str | None = None
+            source_label = str(getattr(pkt, "src", "?"))
+            if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+                udp = pkt[UDP]  # type: ignore[index]
+                sport = int(getattr(udp, "sport", 0) or 0)
+                dport = int(getattr(udp, "dport", 0) or 0)
+                if sport in {PTP_EVENT_PORT, PTP_GENERAL_PORT} or dport in {
+                    PTP_EVENT_PORT,
+                    PTP_GENERAL_PORT,
+                }:
+                    is_ptp = True
+                    try:
+                        payload = bytes(getattr(udp, "payload", b""))
+                    except Exception as exc:
+                        malformed_messages[
+                            f"could not decode UDP payload ({type(exc).__name__})"
+                        ] += 1
+                        payload = b""
+                    if IP is not None and pkt.haslayer(IP):  # type: ignore[truthy-bool]
+                        ip_src = str(pkt[IP].src)  # type: ignore[index]
+                        ip_dst = str(pkt[IP].dst)  # type: ignore[index]
+                        source_label = ip_src
+                    elif IPv6 is not None and pkt.haslayer(IPv6):  # type: ignore[truthy-bool]
+                        ip_src = str(pkt[IPv6].src)  # type: ignore[index]
+                        ip_dst = str(pkt[IPv6].dst)  # type: ignore[index]
+                        source_label = ip_src
 
         if not is_ptp:
             continue
@@ -241,6 +308,8 @@ def analyze_ptp(
         seq_state[seq_key] = seq_id
         src_msg_types.setdefault(source_label, set()).add(msg_type)
 
+    if stats.active:
+        total_packets = stats.packets
     errors.extend(
         f"{count} malformed PTP message(s): {reason}."
         for reason, count in sorted(malformed_messages.items())

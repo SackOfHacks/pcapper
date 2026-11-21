@@ -12,7 +12,7 @@ from .utils import extract_packet_endpoints, is_public_ip, memoize_analysis, saf
 try:
     from scapy.layers.inet import ICMP, IP, TCP, UDP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
-    from scapy.layers.l2 import LLC, Ether  # type: ignore
+    from scapy.layers.l2 import LLC, Dot3, Ether  # type: ignore
     from scapy.packet import Raw  # type: ignore
 except Exception:  # pragma: no cover
     IP = None  # type: ignore
@@ -21,6 +21,7 @@ except Exception:  # pragma: no cover
     ICMP = None  # type: ignore
     IPv6 = None  # type: ignore
     Ether = None  # type: ignore
+    Dot3 = None  # type: ignore
     LLC = None  # type: ignore
     Raw = None  # type: ignore
 
@@ -106,24 +107,39 @@ OSPF_LSA_TYPES = {
     11: "Opaque-AS",
 }
 
+# ISO 10589 PDU types (the low 5 bits of the type byte).
 ISIS_PDU_TYPES = {
-    15: "L1 LSP",
-    16: "L2 LSP",
-    17: "L1 CSNP",
-    18: "L2 CSNP",
-    19: "L1 PSNP",
-    20: "L2 PSNP",
-    24: "L1 IIH",
-    25: "L2 IIH",
-    26: "P2P IIH",
+    15: "L1 LAN Hello",
+    16: "L2 LAN Hello",
+    17: "P2P Hello",
+    18: "L1 LSP",
+    20: "L2 LSP",
+    24: "L1 CSNP",
+    25: "L2 CSNP",
+    26: "L1 PSNP",
+    27: "L2 PSNP",
 }
+ISIS_HELLO_TYPES = {15, 16, 17}
+ISIS_LSP_TYPES = {18, 20}
+ISIS_CSNP_TYPES = {24, 25}
+ISIS_PSNP_TYPES = {26, 27}
+# Authentication TLV (10) type byte: RFC 1195 cleartext, RFC 5304 HMAC-MD5,
+# RFC 5310 generic cryptographic authentication.
+ISIS_AUTH_TYPES = {1: "cleartext password", 54: "HMAC-MD5", 3: "generic cryptographic"}
 
 ISIS_TLV_NAMES = {
     1: "Area Addresses",
+    2: "IS Reachability",
+    3: "ES Neighbors",
     6: "IS Neighbors (LAN)",
-    8: "LSP Entries",
-    9: "Authentication (old)",
+    8: "Padding",
+    9: "LSP Entries",
     10: "Authentication",
+    129: "Protocols Supported",
+    134: "TE Router ID",
+    211: "Restart Signaling",
+    229: "Multi-Topology",
+    240: "P2P Adjacency State",
     22: "Extended IS Reachability",
     128: "IP Internal Reachability",
     130: "IP External Reachability",
@@ -629,7 +645,8 @@ def _parse_isis_tlvs(payload: bytes) -> dict[str, object]:
     ipv4_addrs: list[str] = []
     ipv6_addrs: list[str] = []
     neighbors: list[str] = []
-    auth_values: list[str] = []
+    auth_values: list[str] = []  # cleartext passwords only
+    auth_types: list[str] = []
     reachability: list[tuple[str, int]] = []
     router_caps: list[str] = []
 
@@ -659,16 +676,11 @@ def _parse_isis_tlvs(payload: bytes) -> dict[str, object]:
             while pos + 6 <= len(value):
                 neighbors.append(_isis_system_id(value[pos : pos + 6]))
                 pos += 6
-        elif tlv_type == 10 or tlv_type == 9:  # Authentication
-            if value:
-                try:
-                    text = value.decode("latin-1", errors="ignore").strip("\x00")
-                except Exception:
-                    text = ""
-                if text and all(32 <= ord(ch) <= 126 for ch in text):
-                    auth_values.append(text)
-                else:
-                    auth_values.append(value.hex())
+        elif tlv_type == 10 and value:  # Authentication: type byte, then the credential
+            auth_type = value[0]
+            auth_types.append(ISIS_AUTH_TYPES.get(auth_type, f"type {auth_type}"))
+            if auth_type == 1:  # cleartext: the password itself is on the wire
+                auth_values.append(value[1:].decode("latin-1", errors="replace"))
         elif tlv_type == 132:  # IPv4 Interface Address
             pos = 0
             while pos + 4 <= len(value):
@@ -733,42 +745,46 @@ def _parse_isis_tlvs(payload: bytes) -> dict[str, object]:
         "ipv6_addrs": ipv6_addrs,
         "neighbors": neighbors,
         "auth_values": auth_values,
+        "auth_types": auth_types,
         "reachability": reachability,
         "router_caps": router_caps,
     }
 
 
 def _parse_isis_pdu(payload: bytes) -> dict[str, object]:
+    """One IS-IS PDU (ISO 10589): the 8-byte common header, the fixed fields
+    of its type, then the TLVs after the header length."""
     if len(payload) < 8 or payload[0] != 0x83:
         return {}
     header_len = payload[1]
-    pdu_type = payload[4]
-    max_area = payload[7]
+    pdu_type = payload[4] & 0x1F
     details: dict[str, object] = {
         "pdu_type": pdu_type,
         "header_len": header_len,
-        "max_area": max_area,
+        "max_area": payload[7],
     }
-    tlv_offset = header_len if header_len and header_len <= len(payload) else 8
-
-    if pdu_type in {24, 25, 26} and len(payload) >= 20:
-        details["circuit_type"] = payload[8]
+    if pdu_type in ISIS_HELLO_TYPES and len(payload) >= 20:
+        details["circuit_type"] = payload[8] & 0x03
         details["source_id"] = _isis_system_id(payload[9:15])
         details["hold_time"] = int.from_bytes(payload[15:17], "big")
-        details["local_circuit_id"] = payload[19]
-    elif pdu_type in {15, 16} and len(payload) >= 27:
-        details["lsp_lifetime"] = int.from_bytes(payload[8:10], "big")
-        details["lsp_id"] = _isis_lsp_id(payload[10:18])
-        details["lsp_seq"] = int.from_bytes(payload[18:22], "big")
-        details["lsp_checksum"] = int.from_bytes(payload[22:24], "big")
-        details["lsp_flags"] = payload[24]
-    elif pdu_type in {17, 18} and len(payload) >= 32:
+        if pdu_type == 17:
+            details["local_circuit_id"] = payload[19]
+        elif len(payload) >= 27:
+            details["priority"] = payload[19] & 0x7F
+            details["lan_id"] = _isis_system_id(payload[20:26]) + f".{payload[26]:02x}"
+    elif pdu_type in ISIS_LSP_TYPES and len(payload) >= 27:
+        details["lsp_lifetime"] = int.from_bytes(payload[10:12], "big")
+        details["lsp_id"] = _isis_lsp_id(payload[12:20])
+        details["lsp_seq"] = int.from_bytes(payload[20:24], "big")
+        details["lsp_checksum"] = int.from_bytes(payload[24:26], "big")
+        details["lsp_flags"] = payload[26]
+    elif pdu_type in ISIS_CSNP_TYPES and len(payload) >= 33:
         details["source_id"] = _isis_system_id(payload[10:16])
-        details["start_lsp_id"] = _isis_lsp_id(payload[16:24])
-        details["end_lsp_id"] = _isis_lsp_id(payload[24:32])
-    elif pdu_type in {19, 20} and len(payload) >= 16:
+        details["start_lsp_id"] = _isis_lsp_id(payload[17:25])
+        details["end_lsp_id"] = _isis_lsp_id(payload[25:33])
+    elif pdu_type in ISIS_PSNP_TYPES and len(payload) >= 17:
         details["source_id"] = _isis_system_id(payload[10:16])
-
+    tlv_offset = header_len if 8 <= header_len <= len(payload) else 8
     if tlv_offset < len(payload):
         details["tlvs"] = _parse_isis_tlvs(payload[tlv_offset:])
     return details
@@ -1112,14 +1128,18 @@ def analyze_routing(
                     proto_val = int(getattr(ip6_layer, "nh", 0) or 0)
             src_label = src_ip
             dst_label = dst_ip
-            if (
-                (not src_label or not dst_label)
-                and Ether is not None
-                and pkt.haslayer(Ether)
-            ):  # type: ignore[truthy-bool]
-                eth = pkt[Ether]  # type: ignore[index]
-                src_label = str(getattr(eth, "src", ""))
-                dst_label = str(getattr(eth, "dst", ""))
+            if not src_label or not dst_label:
+                # MACs for non-IP frames: Ethernet II, or IEEE 802.3 with an LLC
+                # header (scapy's Dot3), which is how IS-IS travels -- reading
+                # Ether only skipped every IS-IS frame here.
+                l2 = None
+                if Ether is not None and pkt.haslayer(Ether):  # type: ignore[truthy-bool]
+                    l2 = pkt[Ether]  # type: ignore[index]
+                elif Dot3 is not None and pkt.haslayer(Dot3):  # type: ignore[truthy-bool]
+                    l2 = pkt[Dot3]  # type: ignore[index]
+                if l2 is not None:
+                    src_label = str(getattr(l2, "src", ""))
+                    dst_label = str(getattr(l2, "dst", ""))
 
             if not src_label or not dst_label:
                 continue
@@ -1418,28 +1438,19 @@ def analyze_routing(
                                     "isis_router_cap_id", str(rid), src_label, dst_label
                                 )
                             )
-                        auth_vals = tlvs.get("auth_values", [])
-                        if auth_vals:
-                            auth_counts["ISIS Auth"] += 1
-                            for auth_val in auth_vals:
-                                artifacts.append(
-                                    RoutingArtifact(
-                                        "isis_auth",
-                                        f"ISIS auth: {auth_val}",
-                                        src_label,
-                                        dst_label,
-                                    )
-                                )
-                                if isinstance(auth_val, str) and all(
-                                    32 <= ord(ch) <= 126 for ch in auth_val
-                                ):
-                                    detections.append(
-                                        {
-                                            "severity": "warning",
-                                            "summary": "ISIS plaintext authentication",
-                                            "details": f"{src_label} -> {dst_label} value '{auth_val}'",
-                                        }
-                                    )
+                        for auth_kind in tlvs.get("auth_types", []):
+                            auth_counts[f"ISIS Auth ({auth_kind})"] += 1
+                            artifacts.append(
+                                RoutingArtifact("isis_auth", f"ISIS auth: {auth_kind}", src_label, dst_label)
+                            )
+                        for password in tlvs.get("auth_values", []):  # cleartext passwords
+                            detections.append(
+                                {
+                                    "severity": "warning",
+                                    "summary": "ISIS plaintext authentication",
+                                    "details": f"{src_label} -> {dst_label} cleartext password '{password}'",
+                                }
+                            )
                     _update_session("IS-IS", src_label, dst_label, 0, 0, ts, pdu_name)
                 elif proto_name == "PIM":
                     info = _parse_pim(payload)
@@ -1635,28 +1646,19 @@ def analyze_routing(
                                     "isis_router_cap_id", str(rid), src_label, dst_label
                                 )
                             )
-                        auth_vals = tlvs.get("auth_values", [])
-                        if auth_vals:
-                            auth_counts["ISIS Auth"] += 1
-                            for auth_val in auth_vals:
-                                artifacts.append(
-                                    RoutingArtifact(
-                                        "isis_auth",
-                                        f"ISIS auth: {auth_val}",
-                                        src_label,
-                                        dst_label,
-                                    )
-                                )
-                                if isinstance(auth_val, str) and all(
-                                    32 <= ord(ch) <= 126 for ch in auth_val
-                                ):
-                                    detections.append(
-                                        {
-                                            "severity": "warning",
-                                            "summary": "ISIS plaintext authentication",
-                                            "details": f"{src_label} -> {dst_label} value '{auth_val}'",
-                                        }
-                                    )
+                        for auth_kind in tlvs.get("auth_types", []):
+                            auth_counts[f"ISIS Auth ({auth_kind})"] += 1
+                            artifacts.append(
+                                RoutingArtifact("isis_auth", f"ISIS auth: {auth_kind}", src_label, dst_label)
+                            )
+                        for password in tlvs.get("auth_values", []):  # cleartext passwords
+                            detections.append(
+                                {
+                                    "severity": "warning",
+                                    "summary": "ISIS plaintext authentication",
+                                    "details": f"{src_label} -> {dst_label} cleartext password '{password}'",
+                                }
+                            )
                     _update_session("IS-IS", src_label, dst_label, 0, 0, ts, pdu_name)
 
             # Port-based routing protocols (BGP/RIP/HSRP/GLBP)
@@ -1969,7 +1971,7 @@ def analyze_routing(
                 "details": f"{isis_lsp_seq_high_count} IS-IS LSPs with high sequence values observed.",
             }
         )
-    if protocol_counts.get("IS-IS") and not auth_counts.get("ISIS Auth"):
+    if protocol_counts.get("IS-IS") and not any(k.startswith("ISIS Auth") for k in auth_counts):
         detections.append(
             {
                 "severity": "warning",

@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-from .utils import is_public_ip as _is_public_ip, packet_length
 import bisect
 from collections import Counter, OrderedDict, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterable
+from typing import Callable, Generator, Iterable
+
+from .ot_ports import foreign_service_reply
+from .utils import is_public_ip as _is_public_ip
+from .utils import packet_length
 
 try:
     from scapy.layers.inet import IP, TCP, UDP
@@ -14,7 +17,8 @@ try:
 except ImportError:  # pragma: no cover - scapy optional at runtime
     TCP = UDP = IP = Raw = Ether = Padding = None
 
-from .pcap_cache import PcapMeta, iter_packets
+from .lite import UNSUPPORTED, LitePacket
+from .pcap_cache import PassStats, PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, safe_float
 
 DEFAULT_KEYWORDS = {
@@ -372,9 +376,10 @@ class TPKTTCPReassembler:
         payload = bytes(getattr(match, "payload", b"") or b"")
         if TCP is None:
             return payload
-        tcp = packet.getlayer(TCP)  # type: ignore[attr-defined]
-        if tcp is None:
+        seq_flags = _tcp_seq_flags(packet)
+        if seq_flags is None:
             return payload
+        sequence, flags = seq_flags
 
         key = (
             str(getattr(match, "src", "?")),
@@ -383,7 +388,6 @@ class TPKTTCPReassembler:
             int(getattr(match, "dport", 0)),
         )
         previous = self._streams.pop(key, None)
-        flags = int(getattr(tcp, "flags", 0))
         if flags & 0x02 and previous is not None:
             self._report_incomplete()
             previous = None
@@ -395,7 +399,6 @@ class TPKTTCPReassembler:
                 self._streams[key] = previous
             return b""
 
-        sequence = int(getattr(tcp, "seq", 0))
         original_length = len(payload)
         if previous is not None:
             expected, buffered = previous
@@ -502,81 +505,116 @@ def _strip_padding(layer: object) -> bytes:
     return raw
 
 
-def _extract_transport(pkt: object) -> tuple[bool, str, str, int, int, bytes]:
-    """``(has_transport, src, dst, sport, dport, payload)`` for a TCP/UDP packet.
-
-    Kept for the analyzers with their own packet loop (cip, enip,
-    ot_commands). One layer walk per transport, padding stripped.
-    """
-    getlayer = getattr(pkt, "getlayer", None)
-    transport = None
-    if callable(getlayer):
-        transport = getlayer(TCP) if TCP is not None else None
-        if transport is None:
-            transport = getlayer(UDP) if UDP is not None else None
-    if transport is None:
-        return False, "?", "?", 0, 0, b""
-    sport = int(getattr(transport, "sport", 0) or 0)
-    dport = int(getattr(transport, "dport", 0) or 0)
-    payload = _strip_padding(transport.payload)
-    src, dst = extract_packet_endpoints(pkt)
-    if not src or not dst:
-        first = pkt[0]  # type: ignore[index]
-        src = getattr(first, "src", None) or "?"
-        dst = getattr(first, "dst", None) or "?"
-    return True, src, dst, sport, dport, payload
+def _packet_store(pkt: object) -> dict | None:
+    """Where per-packet derived values live: a lite packet's cache, or the
+    scapy packet's instance dict (packets are never modified once read)."""
+    if type(pkt) is LitePacket:
+        return pkt.cache()
+    return getattr(pkt, "__dict__", None)
 
 
-_TRANSPORT_CACHES: "OrderedDict[int, tuple[list, dict]]" = OrderedDict()
+_MISSING = object()
 
 
-def _transport_cache_for(packets: list | None) -> dict | None:
-    """Per-packet transport records shared by every port analyzer's pass.
-
-    Only for an in-memory packet list (the CLI's shared view): the list keeps
-    its packets alive, so ``id(pkt)`` cannot be reused while the cache lives.
-    At most two lists are kept. Each record is filled lazily: transport layer
-    and ports at once, payload and endpoints on first use. Re-serialising the
-    scapy payload for every packet in each of ~40 analyzer passes was the
-    largest single cost of --threats/--overview/--ot-commands.
-    """
-    if not isinstance(packets, list):
-        return None
-    key = id(packets)
-    hit = _TRANSPORT_CACHES.get(key)
-    if hit is not None and hit[0] is packets:
-        _TRANSPORT_CACHES.move_to_end(key)
-        return hit[1]
-    cache: dict = {}
-    _TRANSPORT_CACHES[key] = (packets, cache)
-    while len(_TRANSPORT_CACHES) > 2:
-        _TRANSPORT_CACHES.popitem(last=False)
-    return cache
-
-
-def _transport_record(pkt: object, cache: dict | None) -> list | None:
-    if cache is not None:
-        record = cache.get(id(pkt), False)
-        if record is not False:
-            return record
+def _scapy_transport_record(pkt: object) -> list | None:
     getlayer = pkt.getlayer  # type: ignore[attr-defined]
     transport = getlayer(TCP) if TCP is not None else None
     is_tcp = transport is not None
     if transport is None:
         transport = getlayer(UDP) if UDP is not None else None
-    record = None
-    if transport is not None:
-        record = [
-            is_tcp,
-            int(getattr(transport, "sport", 0) or 0),
-            int(getattr(transport, "dport", 0) or 0),
-            transport,
-            None,  # payload, filled on first use
-            None,  # endpoints, filled on first use
-        ]
-    if cache is not None:
-        cache[id(pkt)] = record
+    if transport is None:
+        return None
+    return [
+        is_tcp,
+        int(getattr(transport, "sport", 0) or 0),
+        int(getattr(transport, "dport", 0) or 0),
+        transport,
+        None,  # payload, filled on first use
+        None,  # endpoints, filled on first use
+    ]
+
+
+def _transport_record(pkt: object, cache: dict | None = None) -> list | None:
+    """``[is_tcp, sport, dport, layer, payload, endpoints]`` of the first TCP
+    (else UDP) layer, kept on the packet so the ~40 port analyzers of a
+    --threats/--overview run classify each packet once. ``layer`` is the scapy
+    transport layer, or None for a lite packet (its payload is exact, or None
+    until :func:`_record_payload` asks scapy). ``cache`` is accepted for old
+    callers and ignored.
+    """
+    store = _packet_store(pkt)
+    if store is not None:
+        record = store.get("_pcapper_tr", _MISSING)
+        if record is not _MISSING:
+            return record
+    if type(pkt) is LitePacket:
+        lite = pkt.lite_ports()
+        if lite is UNSUPPORTED:
+            record = _scapy_transport_record(pkt.materialize())
+        elif lite is None:
+            record = None
+        else:
+            record = [lite[0], lite[1], lite[2], None, None, None]
+    else:
+        record = _scapy_transport_record(pkt)
+    if store is not None:
+        store["_pcapper_tr"] = record
     return record
+
+
+def _record_payload(pkt: object, record: list) -> bytes:
+    payload = record[4]
+    if payload is None:
+        layer = record[3]
+        if layer is None:  # lite packet: its own bytes, unless scapy dissects further
+            payload = pkt.lite_payload()  # type: ignore[attr-defined]
+            if payload is None:
+                layer = pkt.materialize().getlayer(TCP if record[0] else UDP)  # type: ignore[attr-defined]
+        if payload is None:
+            payload = _strip_padding(layer.payload) if layer is not None else b""
+        record[4] = payload
+    return payload
+
+
+def _record_endpoints(pkt: object, record: list) -> tuple[str, str]:
+    endpoints = record[5]
+    if endpoints is None:
+        src, dst = extract_packet_endpoints(pkt)
+        if not src or not dst:
+            first = (pkt.materialize() if type(pkt) is LitePacket else pkt)[0]  # type: ignore[index, attr-defined]
+            src = getattr(first, "src", None) or "?"
+            dst = getattr(first, "dst", None) or "?"
+        endpoints = record[5] = (src, dst)
+    return endpoints
+
+
+def _tcp_seq_flags(pkt: object) -> tuple[int, int] | None:
+    """(sequence number, flags) of the first TCP layer, or None."""
+    if type(pkt) is LitePacket:
+        lite = pkt.lite_ports()
+        if lite is not UNSUPPORTED:
+            if lite is None or not lite[0]:
+                return None
+            return lite[3], lite[4]
+        pkt = pkt.materialize()
+    tcp = pkt.getlayer(TCP) if TCP is not None else None  # type: ignore[attr-defined]
+    if tcp is None:
+        return None
+    return int(getattr(tcp, "seq", 0)), int(getattr(tcp, "flags", 0))
+
+
+def _extract_transport(pkt: object) -> tuple[bool, str, str, int, int, bytes]:
+    """``(has_transport, src, dst, sport, dport, payload)`` for a TCP/UDP packet.
+
+    Kept for the analyzers with their own packet loop (cip, enip,
+    ot_commands). Shares the per-packet transport record, padding stripped.
+    """
+    record = _transport_record(pkt)
+    if record is None:
+        return False, "?", "?", 0, 0, b""
+    payload = _record_payload(pkt, record)
+    src, dst = _record_endpoints(pkt, record)
+    return True, src, dst, record[1], record[2], payload
 
 
 def _match_ports(
@@ -585,9 +623,10 @@ def _match_ports(
     udp_ports: set[int],
     signature_matcher: SignatureMatcher | None,
     cache: dict | None = None,
+    require_signature: bool = False,
 ) -> _Matched | None:
     """Port/signature classification for TCP- and UDP-carried protocols."""
-    record = _transport_record(pkt, cache)
+    record = _transport_record(pkt)
     if record is None:
         return None
     is_tcp, sport, dport = record[0], record[1], record[2]
@@ -598,26 +637,19 @@ def _match_ports(
     # destination (server -> client response). A bare "sport or dport in
     # ports" test misclassifies any flow whose ephemeral source port happens
     # to equal an OT port number. Signature matches are always honored.
-    matches_port = dport in server_ports or (
+    matches_port = (dport in server_ports and not foreign_service_reply(sport, server_ports)) or (
         sport in server_ports and dport >= _PORT_SERVER_EPHEMERAL_MIN
     )
     if not matches_port and signature_matcher is None:
         return None  # no payload work for the ~all packets that cannot match
-    if record[4] is None:
-        record[4] = _strip_padding(record[3].payload)
-    payload = record[4]
+    payload = _record_payload(pkt, record)
     matches_sig = bool(signature_matcher and payload and signature_matcher(payload))
     if not matches_port and not matches_sig:
         return None
+    if require_signature and not matches_sig:
+        return None  # a sub-protocol of a shared port (UMAS on Modbus/502)
 
-    if record[5] is None:
-        src, dst = extract_packet_endpoints(pkt)
-        if not src or not dst:
-            first = pkt[0]  # type: ignore[index]
-            src = getattr(first, "src", None) or "?"
-            dst = getattr(first, "dst", None) or "?"
-        record[5] = (src, dst)
-    src, dst = record[5]
+    src, dst = _record_endpoints(pkt, record)
     return _Matched(
         src=src,
         dst=dst,
@@ -630,9 +662,54 @@ def _match_ports(
     )
 
 
+def _port_prefilter(
+    tcp_ports: set[int], udp_ports: set[int], signature_matcher: SignatureMatcher | None
+) -> Callable[[object], bool]:
+    """Records :func:`_match_ports` could claim, decided from the lite headers
+    (anything the headers cannot settle is kept for the full check)."""
+
+    def keep(record: object) -> bool:
+        lite = record.lite_ports()  # type: ignore[attr-defined]
+        if lite is UNSUPPORTED:
+            return True
+        if lite is None:
+            return False
+        sport, dport = lite[1], lite[2]
+        server_ports = tcp_ports if lite[0] else udp_ports
+        if (dport in server_ports and not foreign_service_reply(sport, server_ports)) or (
+            sport in server_ports and dport >= _PORT_SERVER_EPHEMERAL_MIN
+        ):
+            return True
+        if signature_matcher is None:
+            return False
+        # A signature can only match a non-empty payload (or one only scapy
+        # can produce: payload_start -1).
+        return lite[5] < 0 or lite[6] > lite[5]
+
+    return keep
+
+
+def _ethertype_prefilter(ethertype: int) -> Callable[[object], bool]:
+    def keep(record: object) -> bool:
+        return record.lite_ether(ethertype) is not None  # type: ignore[attr-defined]
+
+    return keep
+
+
 def _match_ethertype(pkt: object, ethertype: int) -> _Matched | None:
     """EtherType classification for L2 protocols (GOOSE, SV, PROFINET RT, …).
     Endpoints are MAC addresses; every frame counts as a request."""
+    if type(pkt) is LitePacket:
+        lite = pkt.lite_ether(ethertype)
+        if lite is None:
+            return None
+        if lite is not UNSUPPORTED:
+            src, dst, payload = lite
+            return _Matched(
+                src=src, dst=dst, sport=0, dport=0, payload=payload,
+                is_request=True, is_response=False, session_key=f"{src} -> {dst}",
+            )
+        pkt = pkt.materialize()
     ether = pkt.getlayer(Ether) if Ether is not None else None  # type: ignore[attr-defined]
     if ether is None:
         return None
@@ -659,7 +736,16 @@ _VLAN_ETHERTYPES = {0x8100, 0x88A8, 0x9100}
 _MAX_TPKT_TCP_STREAMS = 256
 
 
-def _industrial_pass(
+class _PassEnd:
+    """Sent to a pass's steps after the last packet, with the pass totals."""
+
+    __slots__ = ("stats",)
+
+    def __init__(self, stats: PassStats) -> None:
+        self.stats = stats
+
+
+def _industrial_steps(
     path: Path,
     protocol_name: str,
     *,
@@ -668,24 +754,12 @@ def _industrial_pass(
     artifact_parser: ArtifactParser | None,
     anomaly_detector: AnomalyDetector | None,
     enable_enrichment: bool,
-    show_status: bool,
     scanning_check: bool,
-    packets: list[object] | None = None,
-    meta: PcapMeta | None = None,
     payload_reassembler: PayloadReassembler | None = None,
-) -> IndustrialAnalysis:
-    """The single packet pass behind every port- and EtherType-based OT analyzer.
-
-    ``classify`` decides whether a packet belongs to the protocol and returns
-    its endpoints/payload/role; everything after that — counters, command and
-    artifact extraction, per-packet anomaly detection with de-duplication,
-    size buckets, cadence (beaconing) and exfiltration checks — is shared.
-    Was two ~250-line copies that had already drifted apart.
-
-    A packet that raises inside a protocol parser is counted and skipped;
-    the pass no longer aborts at the first malformed packet and reports the
-    number skipped, so a partial result is visible as partial.
-    """
+) -> Generator[None, object, IndustrialAnalysis]:
+    """One protocol's share of an industrial pass: a generator that is sent
+    every packet the pass hands it, then a :class:`_PassEnd`, and returns the
+    protocol's analysis (see :func:`_industrial_passes`)."""
     analysis = IndustrialAnalysis(path=path)
     # Collapse identical per-packet detector findings (same title/src/dst/detail)
     # to one — OT detectors that emit an anomaly per packet otherwise flood the
@@ -707,9 +781,11 @@ def _industrial_pass(
     skipped = 0
     first_error: str | None = None
 
-    for pkt in iter_packets(
-        path, packets=packets, meta=meta, show_status=show_status
-    ):
+    while True:
+        pkt = yield
+        if type(pkt) is _PassEnd:
+            stats = pkt.stats
+            break
         analysis.total_packets += 1
         pkt_len = packet_length(pkt)
         analysis.total_bytes += pkt_len
@@ -813,6 +889,12 @@ def _industrial_pass(
             if first_error is None:
                 first_error = f"{type(exc).__name__}: {exc}"
 
+    if stats.active:
+        analysis.total_packets = stats.packets
+        analysis.total_bytes = stats.bytes
+        if stats.first is not None:
+            start_time = safe_float(getattr(stats.first, "time", 0))
+            last_time = safe_float(getattr(stats.last, "time", 0))
     if skipped:
         analysis.errors.append(
             f"{skipped} packet(s) skipped by the {protocol_name} parser "
@@ -898,6 +980,87 @@ def _industrial_pass(
     return analysis
 
 
+
+
+def _industrial_passes(
+    path: Path,
+    specs: list[dict],
+    *,
+    show_status: bool,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> list[IndustrialAnalysis]:
+    """The packet pass behind every port- and EtherType-based OT analyzer,
+    for one or several protocols over one read of the capture.
+
+    ``classify`` decides whether a packet belongs to the protocol and returns
+    its endpoints/payload/role; everything after that — counters, command and
+    artifact extraction, per-packet anomaly detection with de-duplication,
+    size buckets, cadence (beaconing) and exfiltration checks — is shared.
+    Was two ~250-line copies that had already drifted apart.
+
+    A packet that raises inside a protocol parser is counted and skipped;
+    the pass no longer aborts at the first malformed packet and reports the
+    number skipped, so a partial result is visible as partial.
+
+    Read from disk, the pass gets lightweight records (no scapy dissection
+    unless a parser needs it) and ``prefilter`` drops the ones ``classify``
+    could never claim before any work is done; the capture totals and time
+    span then come from :class:`PassStats`, which saw every record.
+
+    Each spec (the keyword arguments of :func:`_industrial_steps` plus its
+    ``prefilter``) gets exactly the packets a pass of its own would get, in
+    capture order: read from disk, the records its prefilter keeps; from
+    memory, every packet. Its analysis is therefore the one a pass of its
+    own returns, totals included.
+    """
+    steps = []
+    filters = []
+    for spec in specs:
+        spec = dict(spec)
+        filters.append(spec.pop("prefilter", None))
+        gen = _industrial_steps(path, **spec)
+        next(gen)
+        steps.append(gen)
+    if len(filters) == 1:
+        combined = filters[0]
+    elif all(f is not None for f in filters):
+        def combined(record: object, _filters: tuple = tuple(filters)) -> bool:
+            for keep in _filters:
+                if keep(record):
+                    return True
+            return False
+    else:
+        combined = None
+    stats = PassStats()
+    single = len(steps) == 1
+    for pkt in iter_packets(
+        path,
+        packets=packets,
+        meta=meta,
+        show_status=show_status,
+        lite=True,
+        prefilter=combined,
+        stats=stats,
+    ):
+        if single or not stats.active or type(pkt) is not LitePacket:
+            for gen in steps:
+                gen.send(pkt)
+        else:  # records the union kept: each pass takes the ones it keeps
+            for gen, keep in zip(steps, filters):
+                if keep is None or keep(pkt):
+                    gen.send(pkt)
+    results: list[IndustrialAnalysis] = []
+    for gen in steps:
+        try:
+            gen.send(_PassEnd(stats))
+        except StopIteration as stop:
+            results.append(stop.value)
+        else:  # pragma: no cover - the steps always return after _PassEnd
+            raise RuntimeError("industrial pass did not finish")
+    return results
+
+
 def analyze_port_protocol(
     path: Path,
     protocol_name: str,
@@ -913,6 +1076,7 @@ def analyze_port_protocol(
     meta: PcapMeta | None = None,
     payload_reassembler: PayloadReassembler | None = None,
     port_key: str | None = None,
+    signature_required: bool = False,
 ) -> IndustrialAnalysis:
     """Analyse a TCP/UDP-carried OT protocol. Returns a fresh object every
     call (not memoized) so callers may post-process it in place.
@@ -921,29 +1085,60 @@ def analyze_port_protocol(
     registered with ``--decode-as`` (or by payload-structure auto-detection)
     are matched as server ports exactly like the protocol's registered ones.
     """
-    if TCP is None and UDP is None:
-        return IndustrialAnalysis(path=path, errors=["Scapy unavailable (TCP/UDP missing)"])
-    from .port_overrides import extra_ports
-
-    from .pcap_cache import get_forced_packet_view
-
-    cache = _transport_cache_for(packets if packets is not None else get_forced_packet_view(path))
-    tcp_set = set(tcp_ports or ()) | extra_ports(port_key, "tcp", path)
-    udp_set = set(udp_ports or ()) | extra_ports(port_key, "udp", path)
-    return _industrial_pass(
+    spec = port_protocol_spec(
         path,
         protocol_name,
-        classify=lambda pkt: _match_ports(pkt, tcp_set, udp_set, signature_matcher, cache),
+        tcp_ports=tcp_ports,
+        udp_ports=udp_ports,
+        signature_matcher=signature_matcher,
         command_parser=command_parser,
         artifact_parser=artifact_parser,
         anomaly_detector=anomaly_detector,
         enable_enrichment=enable_enrichment,
-        show_status=show_status,
-        scanning_check=True,
-        packets=packets,
-        meta=meta,
         payload_reassembler=payload_reassembler,
+        port_key=port_key,
+        signature_required=signature_required,
     )
+    return analyze_protocols_together(path, [spec], show_status=show_status, packets=packets, meta=meta)[0]
+
+
+def port_protocol_spec(
+    path: Path,
+    protocol_name: str,
+    *,
+    tcp_ports: set[int] | None = None,
+    udp_ports: set[int] | None = None,
+    signature_matcher: SignatureMatcher | None = None,
+    command_parser: CommandParser | None = None,
+    artifact_parser: ArtifactParser | None = None,
+    anomaly_detector: AnomalyDetector | None = None,
+    enable_enrichment: bool = False,
+    payload_reassembler: PayloadReassembler | None = None,
+    port_key: str | None = None,
+    signature_required: bool = False,
+) -> dict:
+    """What :func:`analyze_port_protocol` analyses, for
+    :func:`analyze_protocols_together`. ``signature_required`` claims a packet
+    on a registered port only when its payload also matches the signature
+    (a protocol sharing another's port, as UMAS shares Modbus/TCP 502)."""
+    if TCP is None and UDP is None:
+        return {"unavailable": "Scapy unavailable (TCP/UDP missing)"}
+    from .port_overrides import extra_ports
+
+    tcp_set = set(tcp_ports or ()) | extra_ports(port_key, "tcp", path)
+    udp_set = set(udp_ports or ()) | extra_ports(port_key, "udp", path)
+    return {
+        "protocol_name": protocol_name,
+        "classify": lambda pkt: _match_ports(pkt, tcp_set, udp_set, signature_matcher,
+                                             require_signature=signature_required),
+        "prefilter": _port_prefilter(tcp_set, udp_set, signature_matcher),
+        "command_parser": command_parser,
+        "artifact_parser": artifact_parser,
+        "anomaly_detector": anomaly_detector,
+        "enable_enrichment": enable_enrichment,
+        "scanning_check": True,
+        "payload_reassembler": payload_reassembler,
+    }
 
 
 def analyze_ethertype_protocol(
@@ -960,18 +1155,67 @@ def analyze_ethertype_protocol(
 ) -> IndustrialAnalysis:
     """Analyse an EtherType-carried (L2) OT protocol. Returns a fresh object
     every call (not memoized) so callers may post-process it in place."""
-    if Ether is None:
-        return IndustrialAnalysis(path=path, errors=["Scapy unavailable (Ether missing)"])
-    return _industrial_pass(
+    spec = ethertype_protocol_spec(
         path,
         protocol_name,
-        classify=lambda pkt: _match_ethertype(pkt, ethertype),
+        ethertype,
         command_parser=command_parser,
         artifact_parser=artifact_parser,
         anomaly_detector=anomaly_detector,
         enable_enrichment=enable_enrichment,
-        show_status=show_status,
-        scanning_check=False,
-        packets=packets,
-        meta=meta,
     )
+    return analyze_protocols_together(path, [spec], show_status=show_status, packets=packets, meta=meta)[0]
+
+
+def ethertype_protocol_spec(
+    path: Path,
+    protocol_name: str,
+    ethertype: int,
+    *,
+    command_parser: CommandParser | None = None,
+    artifact_parser: ArtifactParser | None = None,
+    anomaly_detector: AnomalyDetector | None = None,
+    enable_enrichment: bool = False,
+) -> dict:
+    """What :func:`analyze_ethertype_protocol` analyses, for
+    :func:`analyze_protocols_together`."""
+    if Ether is None:
+        return {"unavailable": "Scapy unavailable (Ether missing)"}
+    return {
+        "protocol_name": protocol_name,
+        "classify": lambda pkt: _match_ethertype(pkt, ethertype),
+        "prefilter": _ethertype_prefilter(ethertype),
+        "command_parser": command_parser,
+        "artifact_parser": artifact_parser,
+        "anomaly_detector": anomaly_detector,
+        "enable_enrichment": enable_enrichment,
+        "scanning_check": False,
+    }
+
+
+def analyze_protocols_together(
+    path: Path,
+    specs: list[dict],
+    *,
+    show_status: bool = True,
+    packets: list[object] | None = None,
+    meta: PcapMeta | None = None,
+) -> list[IndustrialAnalysis]:
+    """The analyses ``specs`` (from :func:`port_protocol_spec` and
+    :func:`ethertype_protocol_spec`) describe, from one read of the capture:
+    each is the analysis its own analyze_port_protocol/analyze_ethertype_protocol
+    call returns (fresh objects, not memoized)."""
+    results: list[IndustrialAnalysis | None] = [None] * len(specs)
+    runnable = []
+    for index, spec in enumerate(specs):
+        if "unavailable" in spec:
+            results[index] = IndustrialAnalysis(path=path, errors=[spec["unavailable"]])
+        else:
+            runnable.append(index)
+    if runnable:
+        done = _industrial_passes(
+            path, [specs[i] for i in runnable], show_status=show_status, packets=packets, meta=meta
+        )
+        for index, analysis in zip(runnable, done):
+            results[index] = analysis
+    return results  # type: ignore[return-value]

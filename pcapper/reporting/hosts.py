@@ -5,368 +5,100 @@ verbatim, only its location changed.
 """
 
 from __future__ import annotations
-from ..coloring import (
-    danger,
-    header,
-    label,
-    muted,
-    ok,
-    warn,
-)
+
 from ..hosts import HostSummary
-from ..utils import (
-    format_bytes_as_mb,
-)
-
+from . import _style as st
 from ._common import (
-    SECTION_BAR,
-    SUBSECTION_BAR,
-    _apply_verbose_limit,
-    _finalize_output,
-    _format_kv,
-    _format_table,
-    _limit_value,
     _redact_in_text,
-    _truncate_text,
+    _render_deterministic_checks,
 )
 
 
-def render_hosts_summary(
-    summary: HostSummary, limit: int = 30, verbose: bool = False
-) -> str:
-    limit = _apply_verbose_limit(limit)
-    lines: list[str] = []
-    lines.append(SECTION_BAR)
-    lines.append(header(f"HOST INVENTORY :: {summary.path.name}"))
-    lines.append(SECTION_BAR)
-
+def render_hosts_summary(summary: HostSummary, limit: int = 30, verbose: bool = False) -> str:
+    """The host inventory: every IP with its MACs, names, OS guess, traffic
+    and the ports it served; priority hosts, lateral-movement and drift
+    profiles follow when the analyzer produced them. OS evidence and
+    method notes are -v."""
+    rep = st.Report("Hosts", summary.path)
+    hosts = list(summary.hosts)
+    total = summary.total_hosts or len(hosts)
+    if not hosts:
+        return rep.absent("hosts", summary.errors)
+    with_mac = sum(1 for h in hosts if h.mac_addresses)
+    with_name = sum(1 for h in hosts if h.hostnames)
+    with_os = sum(1 for h in hosts if h.operating_system and h.operating_system.lower() != "unknown")
+    rep.headline(False, f"{st.plural(total, 'host')}", st.join([
+        f"{with_mac} with MAC", f"{with_name} named", f"{with_os} with OS guess",
+        st.size(sum(h.bytes_sent + h.bytes_recv for h in hosts)),
+    ]))
     if summary.errors:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Errors"))
-        for err in summary.errors if verbose else summary.errors[: _limit_value(20)]:
-            lines.append(danger(f"- {err}"))
-        if not verbose and len(summary.errors) > 20:
-            lines.append(muted(f"... {len(summary.errors) - 20} more errors"))
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    verbose_view = st.verbose()
 
-    total_hosts = summary.total_hosts or len(summary.hosts)
-    with_macs = sum(1 for host in summary.hosts if host.mac_addresses)
-    with_hostnames = sum(1 for host in summary.hosts if host.hostnames)
-    with_os = sum(
-        1
-        for host in summary.hosts
-        if host.operating_system and host.operating_system.lower() != "unknown"
-    )
-    total_bytes = sum(host.bytes_sent + host.bytes_recv for host in summary.hosts)
+    def _open_ports_text(h: object) -> str:
+        items = []
+        for p in getattr(h, "open_ports", None) or []:
+            label = f"{int(getattr(p, 'port', 0) or 0)}/{str(getattr(p, 'protocol', '') or '-').lower()} {getattr(p, 'service', '') or '-'}"
+            if verbose_view and getattr(p, "software", ""):
+                label += f" ({p.software})"
+            items.append(label)
+        if not items:
+            return "-"
+        return ", ".join(items) if verbose_view else ", ".join(items[:4]) + (st.dim(f", +{len(items) - 4}") if len(items) > 4 else "")
 
-    lines.append(_format_kv("Total Hosts", str(total_hosts)))
-    lines.append(_format_kv("Hosts w/ MAC", str(with_macs)))
-    lines.append(_format_kv("Hosts w/ Hostname", str(with_hostnames)))
-    lines.append(_format_kv("Hosts w/ OS Guess", str(with_os)))
-    lines.append(_format_kv("Total Host Traffic", format_bytes_as_mb(total_bytes)))
+    rep.section("Inventory", st.table(
+        ["IP", "MAC", "Hostname", "OS", "Sent", "Received", "Serves"],
+        [[h.ip, ", ".join(h.mac_addresses) or "-", _redact_in_text(", ".join(h.hostnames)) or "-", h.operating_system or "unknown",
+          f"{st.size(h.bytes_sent)} ({st.count(h.packets_sent)})", f"{st.size(h.bytes_recv)} ({st.count(h.packets_recv)})", _open_ports_text(h)]
+         for h in hosts],
+        widths=(None, 40, 40, 28, None, None, 60), align="llllrrl", max_rows=limit, noun="host",
+    ))
 
-    # Host-risk assessment (verdict / deterministic checks / risk matrix) is
-    # sourced from a disabled enrichment builder, so it was emitting a fixed
-    # "NO STRONG SIGNAL" verdict, nine "no evidence" check lines, and an empty
-    # risk matrix on every capture. Render only when actually populated.
-    checks = getattr(summary, "deterministic_checks", {}) or {}
-    check_labels = [
-        ("service_exposure_risk", "Service Exposure Risk"),
-        ("identity_drift_or_collision", "Identity Drift or Collision"),
-        ("boundary_cross_zone_exposure", "Boundary Cross-Zone Exposure"),
-        ("ot_it_boundary_crossing", "OT/IT Boundary Crossing"),
-        ("evidence_provenance", "Evidence Provenance"),
-    ]
-    _has_checks = any(
-        [str(v) for v in list(checks.get(key, []) or []) if str(v).strip()]
-        for key, _ in check_labels
-    )
-
-    if summary.analyst_verdict:
-        verdict = str(summary.analyst_verdict)
-        confidence = str(
-            getattr(summary, "analyst_confidence", "low") or "low"
-        ).capitalize()
-        reasons = [
-            str(v)
-            for v in list(getattr(summary, "analyst_reasons", []) or [])
-            if str(v).strip()
-        ]
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Analyst Verdict"))
-        if verdict.startswith("YES"):
-            lines.append(danger(verdict))
-        elif verdict.startswith("LIKELY") or verdict.startswith("POSSIBLE"):
-            lines.append(warn(verdict))
-        else:
-            lines.append(ok(verdict))
-        lines.append(_format_kv("Confidence", confidence))
-        if reasons:
-            lines.append(muted("Why confidence:"))
-            for reason in reasons[: _limit_value(8)]:
-                lines.append(muted(f"- {_redact_in_text(reason)}"))
-
-    if _has_checks:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Deterministic Host Security Checks"))
-        for key, label_text in check_labels:
-            values = [
-                str(v) for v in list(checks.get(key, []) or []) if str(v).strip()
-            ]
-            if not values:
+    def _profile(title: str, field: str, header_row: list[str], keys: list[str], default: bool = True) -> None:
+        rows = []
+        for item in getattr(summary, field, None) or []:
+            if not isinstance(item, dict):
                 continue
-            lines.append(label(label_text))
-            lines.append(
-                warn(
-                    f"Yes, there is evidence for {label_text.lower()}, here is the evidence:"
-                )
-            )
-            for value in values[: _limit_value(8)]:
-                lines.append(muted(f"- {_redact_in_text(value)}"))
+            rows.append([", ".join(str(v) for v in item.get(k)) if isinstance(item.get(k), (list, tuple, set))
+                         else item.get(k, "-") for k in keys])
+        rep.section(title, st.table(header_row, rows, max_rows=12), detail=not default)
 
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Host Table"))
-    if not summary.hosts:
-        lines.append(muted("No host entries discovered in the capture."))
-    else:
-        rows = [["IP", "MAC", "Hostname", "OS", "Sent", "Recv", "Open Ports"]]
+    _profile("Priority hosts", "host_risk_profiles", ["Host", "Score", "Severity", "Confidence", "OS", "Reasons"],
+             ["host", "score", "severity", "confidence", "os", "reasons"])
+    _profile("Lateral movement", "lateral_movement_profiles", ["Host", "Admin ports", "Count", "Confidence"],
+             ["host", "admin_ports", "admin_port_count", "confidence"])
+    _profile("Role drift", "role_drift_profiles", ["Host", "Roles", "Hostnames", "Admin ports", "OS"],
+             ["host", "roles", "hostnames", "admin_ports", "os"])
+    _profile("Identity drift", "identity_drift_profiles", ["Hostname", "Hosts", "Addresses"], ["hostname", "host_count", "hosts"])
+    clusters = [[c.get("cluster", "-"), c.get("host", "-"), len(c.get("indicators", []) or []), c.get("target_count", "-"),
+                 c.get("confidence", "-")] for c in (getattr(summary, "incident_clusters", None) or []) if isinstance(c, dict)]
+    rep.section("Incident clusters", st.table(["Cluster", "Host", "Indicators", "Targets", "Confidence"], clusters, max_rows=12))
 
-        def _join_limited(values: list[str], max_items: int, max_len: int) -> str:
-            if not values:
-                return "-"
-            display = ", ".join(values[:max_items])
-            if len(values) > max_items:
-                display += "..."
-            return _truncate_text(display, max_len)
-
-        def _format_ports(ports: list[object]) -> str:
-            if not ports:
-                return "-"
-            entries: list[str] = []
-            for port in ports:
-                proto = str(getattr(port, "protocol", "") or "").lower() or "-"
-                service = str(getattr(port, "service", "") or "-")
-                label_text = f"{int(getattr(port, 'port', 0) or 0)}/{proto} {service}"
-                if verbose:
-                    software = str(getattr(port, "software", "") or "")
-                    if software:
-                        label_text = f"{label_text} ({software})"
-                entries.append(label_text)
-            port_limit = _limit_value(6)
-            display = ", ".join(
-                _truncate_text(item, 48) for item in entries[:port_limit]
-            )
-            if len(entries) > port_limit:
-                display += "..."
-            return display or "-"
-
-        row_hosts = summary.hosts if verbose else summary.hosts[:limit]
-        for host in row_hosts:
-            mac_display = _join_limited(host.mac_addresses, _limit_value(3), 48)
-            host_display = _join_limited(host.hostnames, _limit_value(3), 48)
-            os_display = _truncate_text(host.operating_system or "Unknown", 28)
-            sent_display = (
-                f"{format_bytes_as_mb(host.bytes_sent)} ({host.packets_sent})"
-            )
-            recv_display = (
-                f"{format_bytes_as_mb(host.bytes_recv)} ({host.packets_recv})"
-            )
-            ports_display = _format_ports(host.open_ports)
-            rows.append(
-                [
-                    host.ip,
-                    mac_display,
-                    host_display,
-                    os_display,
-                    sent_display,
-                    recv_display,
-                    ports_display,
-                ]
-            )
-        lines.append(_format_table(rows))
-        if not verbose and len(summary.hosts) > limit:
-            lines.append(muted(f"... {len(summary.hosts) - limit} additional hosts"))
-
-    host_risks = list(getattr(summary, "host_risk_profiles", []) or [])
-    if host_risks:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Priority Host Queue"))
-        rows = [["Host", "Score", "Severity", "Confidence", "OS", "Reasons"]]
-        for item in host_risks[: _limit_value(limit if verbose else 15)]:
-            reasons_val = item.get("reasons", [])
-            rows.append(
-                [
-                    str(item.get("host", "-")),
-                    str(item.get("score", "-")),
-                    str(item.get("severity", "-")),
-                    str(item.get("confidence", "-")),
-                    _truncate_text(str(item.get("os", "-")), 32),
-                    _truncate_text(
-                        ", ".join(
-                            str(v)
-                            for v in (
-                                reasons_val[:3] if isinstance(reasons_val, list) else []
-                            )
-                        )
-                        or "-",
-                        90,
-                    ),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    lateral_profiles = list(getattr(summary, "lateral_movement_profiles", []) or [])
-    if lateral_profiles:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Lateral Movement Analytics"))
-        rows = [["Host", "Admin Ports", "Port Count", "Confidence"]]
-        for item in lateral_profiles[: _limit_value(limit if verbose else 12)]:
-            ports = item.get("admin_ports", [])
-            rows.append(
-                [
-                    str(item.get("host", "-")),
-                    ", ".join(
-                        str(v) for v in (ports[:8] if isinstance(ports, list) else [])
-                    )
-                    or "-",
-                    str(item.get("admin_port_count", "-")),
-                    str(item.get("confidence", "-")),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    role_drift = list(getattr(summary, "role_drift_profiles", []) or [])
-    if role_drift:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Role Drift Profiles"))
-        rows = [["Host", "Roles", "Hostnames", "Admin Ports", "OS"]]
-        for item in role_drift[: _limit_value(limit if verbose else 12)]:
-            roles = item.get("roles", [])
-            hostnames = item.get("hostnames", [])
-            admin_ports = item.get("admin_ports", [])
-            rows.append(
-                [
-                    str(item.get("host", "-")),
-                    _truncate_text(
-                        ", ".join(
-                            str(v)
-                            for v in (roles[:4] if isinstance(roles, list) else [])
-                        )
-                        or "-",
-                        50,
-                    ),
-                    _truncate_text(
-                        ", ".join(
-                            str(v)
-                            for v in (
-                                hostnames[:3] if isinstance(hostnames, list) else []
-                            )
-                        )
-                        or "-",
-                        70,
-                    ),
-                    _truncate_text(
-                        ", ".join(
-                            str(v)
-                            for v in (
-                                admin_ports[:8] if isinstance(admin_ports, list) else []
-                            )
-                        )
-                        or "-",
-                        40,
-                    ),
-                    _truncate_text(str(item.get("os", "-")), 28),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    identity_drift = list(getattr(summary, "identity_drift_profiles", []) or [])
-    if identity_drift:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Identity Drift Profiles"))
-        rows = [["Hostname", "Host Count", "Hosts"]]
-        for item in identity_drift[: _limit_value(limit if verbose else 12)]:
-            hosts = item.get("hosts", [])
-            rows.append(
-                [
-                    _truncate_text(str(item.get("hostname", "-")), 50),
-                    str(item.get("host_count", "-")),
-                    _truncate_text(
-                        ", ".join(
-                            str(v)
-                            for v in (hosts[:6] if isinstance(hosts, list) else [])
-                        )
-                        or "-",
-                        90,
-                    ),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    clusters = list(getattr(summary, "incident_clusters", []) or [])
-    if clusters:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Incident Clusters"))
-        rows = [["Cluster", "Host", "Indicators", "Targets", "Confidence"]]
-        for item in clusters[: _limit_value(limit if verbose else 12)]:
-            indicators = item.get("indicators", [])
-            rows.append(
-                [
-                    str(item.get("cluster", "-")),
-                    str(item.get("host", "-")),
-                    str(len(indicators) if isinstance(indicators, list) else 0),
-                    str(item.get("target_count", "-")),
-                    str(item.get("confidence", "-")),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    false_positive = [
-        str(v)
-        for v in list(getattr(summary, "false_positive_context", []) or [])
-        if str(v).strip()
-    ]
-    if false_positive:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("False-Positive Context"))
-        for note in false_positive[: _limit_value(8)]:
-            lines.append(muted(f"- {_redact_in_text(note)}"))
-
-    if verbose:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("OS Evidence"))
-        evidence_rows = [["IP", "OS Guess", "Evidence"]]
-        for host in summary.hosts:
-            if not host.os_evidence:
-                continue
-            evidence_rows.append(
-                [
-                    host.ip,
-                    host.operating_system or "Unknown",
-                    _truncate_text(" | ".join(host.os_evidence), 120),
-                ]
-            )
-        if len(evidence_rows) == 1:
-            lines.append(muted("No OS fingerprinting evidence captured for hosts."))
-        else:
-            lines.append(_format_table(evidence_rows))
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Forensics Notes"))
-    lines.append(
-        muted(
-            "- OS guesses are passive and should be confirmed with endpoint telemetry."
-        )
-    )
-    lines.append(
-        muted(
-            "- Open ports are inferred from server-side responses or banners; absence does not imply closed."
-        )
-    )
-    lines.append(
-        muted(
-            "- MACs are derived from IP/Ethernet/ARP mapping and can change across segments."
-        )
-    )
-
-    lines.append(SECTION_BAR)
-    return _finalize_output(lines)
+    rep.section("Assessment", st.kv([
+        ("Verdict", str(summary.analyst_verdict or "")),
+        ("Confidence", str(getattr(summary, "analyst_confidence", "") or "")),
+    ]) + st.bullets([_redact_in_text(str(r)) for r in (getattr(summary, "analyst_reasons", None) or [])], max_items=None),
+        detail=True)
+    rep.section("OS evidence", st.table(
+        ["IP", "OS guess", "Evidence"], [[h.ip, h.operating_system or "unknown", " | ".join(h.os_evidence)] for h in hosts if h.os_evidence],
+        max_rows=None,
+    ), detail=True)
+    rep.section("Windows", st.table(["IP", "First seen", "Last seen"],
+                                    [[h.ip, st.ts(h.first_seen), st.ts(h.last_seen)] for h in hosts], max_rows=None), detail=True)
+    rep.section("False-positive context", st.bullets(
+        [_redact_in_text(str(v)) for v in (getattr(summary, "false_positive_context", None) or []) if str(v).strip()],
+        max_items=None), detail=True)
+    rep.section("Method", st.bullets([
+        "OS guesses are passive and should be confirmed with endpoint telemetry.",
+        "Open ports are inferred from server-side responses or banners; absence does not imply closed.",
+        "MACs come from IP/Ethernet/ARP mapping and can change across segments.",
+    ], max_items=None), detail=True)
+    if st.analysis_sections():
+        legacy: list[str] = []
+        _render_deterministic_checks(legacy, summary, "Deterministic Host Security Checks", [
+            ("service_exposure_risk", "Service Exposure Risk"), ("identity_drift_or_collision", "Identity Drift or Collision"),
+            ("boundary_cross_zone_exposure", "Boundary Cross-Zone Exposure"), ("ot_it_boundary_crossing", "OT/IT Boundary Crossing"),
+            ("evidence_provenance", "Evidence Provenance"),
+        ])
+        rep.section("Deterministic checks", legacy[2:])
+    return rep.render()

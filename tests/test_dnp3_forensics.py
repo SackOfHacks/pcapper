@@ -232,3 +232,51 @@ def test_message_detail_storage_is_bounded_and_reported(tmp_path: Path, monkeypa
     assert len(result.messages) == 1
     assert sum(result.func_counts.values()) == 2
     assert any("message record limit" in error for error in result.errors)
+
+
+def test_endpoints_and_roles_order_ties_by_ip(tmp_path) -> None:
+    """Endpoints with equal counts were listed in set-iteration order, so the
+    table changed with PYTHONHASHSEED; ties now order by IP."""
+    from scapy.all import IP, TCP, Ether, wrpcap  # type: ignore
+
+    from pcapper.dnp3 import analyze_dnp3
+    from pcapper.reporting.dnp3 import render_dnp3_summary
+
+    frame = b"\x05\x64\x05\xc0\x01\x00\x0a\x00\x00\x00"
+    path = tmp_path / "ties.pcap"
+    wrpcap(
+        str(path),
+        [
+            Ether() / IP(src="10.0.0.9", dst=dst) / TCP(sport=40000, dport=20000) / frame
+            for dst in ("10.0.0.4", "10.0.0.30")
+        ],
+    )
+    block = render_dnp3_summary(analyze_dnp3(path, show_status=False)).split("Endpoints ─")[1]
+    assert block.index("10.0.0.30") < block.index("10.0.0.4")
+
+
+def test_tcp_gap_on_non_dnp3_traffic_is_not_a_dnp3_error(tmp_path: Path) -> None:
+    # An HTTP-ish stream whose payload happens to contain 05 64 (and end in
+    # 05) is tracked as possible DNP3; a sequence gap in it must not surface
+    # as a DNP3 error when no DNP3 was ever decoded.
+    def seg(payload: bytes, seq: int, ts: float):
+        pkt = _tcp("192.0.2.30", "192.0.2.40", 51000, 8080, payload, seq=seq)
+        pkt.time = ts
+        return pkt
+
+    pcap = _write(tmp_path, "not_dnp3.pcap", [seg(b"GET /x\x05\x64abc\x05", 5000, T0), seg(b"more\x05", 9000, T0 + 0.1)])
+    result = analyze_dnp3(pcap, show_status=False)
+    assert result.dnp3_packets == 0
+    assert not any("sequence gap" in e for e in result.errors)
+
+
+def test_tcp_gap_in_real_dnp3_stream_is_reported(tmp_path: Path) -> None:
+    frame = _frame(b"\xc0\xc0\x05")
+    pcap = _write(tmp_path, "dnp3_gap.pcap", [
+        _tcp_packet(frame, 1000, T0),
+        _tcp_packet(frame[:7], 1000 + len(frame), T0 + 0.1),
+        _tcp_packet(frame, 1000 + len(frame) + 50, T0 + 0.2),
+    ])
+    result = analyze_dnp3(pcap, show_status=False)
+    assert result.dnp3_packets
+    assert any("TCP sequence gap" in e for e in result.errors)

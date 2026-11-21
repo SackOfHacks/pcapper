@@ -59,6 +59,33 @@ def test_rendered_output_matches_golden(
     golden(name, render(summary))
 
 
+# The -v view of the reports redesigned for v3: every section and every row,
+# so a section that silently stops rendering under -v fails here.
+VERBOSE_CASES = [
+    ("modbus_verbose", "modbus.pcap", analyze_modbus, render_modbus_summary),
+    ("voip_attack_verbose", "voip_attack.pcap", analyze_voip, render_voip_summary),
+    ("dns_verbose", "dns.pcap", analyze_dns, render_dns_summary),
+    ("http_verbose", "http.pcap", analyze_http, render_http_summary),
+]
+
+
+@pytest.mark.parametrize(
+    "name,capture,analyze,render", VERBOSE_CASES, ids=[case[0] for case in VERBOSE_CASES]
+)
+def test_verbose_output_matches_golden(
+    name: str, capture: str, analyze, render, pcap, golden
+) -> None:
+    from pcapper.reporting import set_verbose_output
+
+    summary = analyze(pcap(capture), show_status=False)
+    set_verbose_output(True)
+    try:
+        text = render(summary)
+    finally:
+        set_verbose_output(False)
+    golden(name, text)
+
+
 @pytest.mark.parametrize(
     "name,capture,analyze,render", CASES, ids=[case[0] for case in CASES]
 )

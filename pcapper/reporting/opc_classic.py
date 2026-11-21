@@ -1,118 +1,70 @@
-"""Rendered output for OPC Classic (DA / A&E / HDA over DCOM) analysis."""
+"""Rendered output for OPC Classic (DA / A&E / HDA over DCOM): the items a
+client wrote and the values, the items it touched, and who the OPC servers
+and clients are."""
 
 from __future__ import annotations
 
-from ..coloring import danger, header, muted, warn
 from ..opc_classic import OpcClassicSummary
-from ..utils import format_ts
-from ._common import (
-    _filtered_detections,
-    _finalize_output,
-    _format_counter,
-    _format_kv,
-    _format_table,
-    _limit_value,
-    _ot_full_render,
-    _render_ot_verdict,
-    _truncate_text,
-)
+from . import _style as st
+from ._kv import counter_line, findings_for, window
 
 
-@_ot_full_render
-def render_opc_classic_summary(
-    summary: OpcClassicSummary, verbose: bool = False
-) -> str:
-    lines = [header("OPC CLASSIC ANALYSIS")]
-    _render_ot_verdict(lines, "OPC Classic (DCOM)", getattr(summary, "detections", []))
-    lines.append(_format_kv("OPC Packets", str(summary.opc_packets)))
-    lines.append(_format_kv("Interfaces", _format_counter(summary.interface_counts, 8)))
-    lines.append(_format_kv("Top Clients", _format_counter(summary.client_counts, 5)))
-    lines.append(_format_kv("Top Servers", _format_counter(summary.server_counts, 5)))
-    operations = getattr(summary, "operation_counts", None)
-    if operations:
-        lines.append(_format_kv("Operations", _format_counter(operations, _limit_value(12), 60)))
-    unattributed = getattr(summary, "unattributed_requests", None)
-    if unattributed:
-        lines.append(
-            _format_kv(
-                "Unattributed",
-                f"{sum(unattributed.values())} request(s) on contexts bound before "
-                f"the capture started: {_format_counter(unattributed, 4, 40)}",
-            )
-        )
-    for label, attr in (
-        ("Server ProgIDs", "server_progids"),
-        ("Client Names", "client_names"),
-        ("Group Names", "group_names"),
-        ("Faults", "faults"),
-    ):
-        value = getattr(summary, attr, None)
-        if value:
-            lines.append(_format_kv(label, _format_counter(value, 6, 60)))
-
-    items = getattr(summary, "items", None) or {}
-    if items:
-        lines.append(header(f"Items ({len(items)})"))
-        rows = [["Item ID", "Type", "Rights", "Reads", "Writes", "Updates", "Last Value"]]
-        ranked = sorted(
-            items.values(),
-            key=lambda item: (item.writes, item.updates + item.reads),
-            reverse=True,
-        )
-        for item in ranked[: _limit_value(25)]:
-            rows.append(
-                [
-                    _truncate_text(item.item_id, 48),
-                    item.canonical_type or "-",
-                    item.access_rights or "-",
-                    str(item.reads),
-                    str(item.writes),
-                    str(item.updates),
-                    _truncate_text(item.last_value or "-", 40),
-                ]
-            )
-        lines.append(_format_table(rows))
-
-    writes = getattr(summary, "writes", None) or []
-    if writes:
-        lines.append(header(f"Item Writes ({len(writes)})"))
-        rows = [["Time", "Client -> Server", "Operation", "Item", "Value"]]
-        for event in writes[: _limit_value(30)]:
-            rows.append(
-                [
-                    format_ts(event.ts),
-                    f"{event.client} -> {event.server}",
-                    event.operation,
-                    _truncate_text(event.item, 40),
-                    _truncate_text(f"{event.value} ({event.vartype})", 48),
-                ]
-            )
-        lines.append(_format_table(rows))
-        text = getattr(summary, "write_value_text", "")
-        if text:
-            lines.append(_format_kv("Writes as ASCII", repr(text)))
-
-    browse = getattr(summary, "browse_names", None) or []
-    if browse:
-        shown = ", ".join(_truncate_text(name, 40) for name in browse[: _limit_value(15)])
-        more = f" (+{len(browse) - _limit_value(15)} more)" if len(browse) > _limit_value(15) else ""
-        lines.append(_format_kv("Browsed Names", shown + more))
-
+def render_opc_classic_summary(summary: OpcClassicSummary, verbose: bool = False) -> str:
+    rep = st.Report("OPC Classic", summary.path)
+    findings = findings_for(summary)
+    if not summary.opc_packets and not st.material(findings):
+        return rep.absent("OPC Classic (DCOM) traffic", summary.errors)
+    severity, text = st.verdict(
+        findings,
+        high="item writes or other state changes: confirm the OPC client is authorized",
+        medium="OPC Classic activity to review",
+    )
+    writes = list(getattr(summary, "writes", None) or [])
+    items = dict(getattr(summary, "items", None) or {})
+    rep.headline(severity, text, st.join([
+        f"{st.count(summary.opc_packets)} OPC packets",
+        st.duration(summary.duration_seconds) if summary.duration_seconds else "",
+        window(summary),
+    ]))
+    rep.scope(st.join([
+        f"{st.plural(len(summary.client_counts), 'client')} -> {st.plural(len(summary.server_counts), 'server')}",
+        st.plural(len(items), "item"),
+        st.plural(len(writes), "item write"),
+    ]))
     if summary.errors:
-        lines.append(_format_kv("Errors", "; ".join(summary.errors[:5])))
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+    rep.section("Findings", st.findings_block(findings))
 
-    detections = _filtered_detections(summary, verbose)
-    if detections:
-        lines.append(header("Detections"))
-        for item in detections[: _limit_value(8)]:
-            sev = str(item.get("severity", "info")).upper()
-            sev_color = danger if sev in {"CRITICAL", "HIGH"} else warn
-            if sev in {"INFO", "LOW"}:
-                sev_color = muted
-            lines.append(sev_color(f"[{sev}] {item.get('summary', '')}"))
-            details = str(item.get("details", "") or "")
-            if details:
-                lines.append(muted(f"  {details}"))
-            for line in list(item.get("evidence", []) or [])[: _limit_value(6)]:
-                lines.append(muted(f"    - {_truncate_text(str(line), 140)}"))
-    return _finalize_output(lines)
+    rep.section("Item writes", st.table(
+        ["Time", "Client -> server", "Operation", "Item", "Value"],
+        [[st.ts(e.ts), st.flow(e.client, e.server), e.operation, e.item, f"{e.value} ({e.vartype})"] for e in writes],
+        widths=(None, None, None, 40, 48), noun="write",
+    ) + ([f"  {st.dim('As ASCII:')} {summary.write_value_text!r}"] if getattr(summary, "write_value_text", "") else []))
+
+    ranked = sorted(items.values(), key=lambda i: (i.writes, i.updates + i.reads), reverse=True)
+    rep.section("Items", st.table(
+        ["Item ID", "Type", "Rights", "Reads", "Writes", "Updates", "Last value"],
+        [[i.item_id, i.canonical_type or "-", i.access_rights or "-", st.count(i.reads),
+          st.bad(str(i.writes)) if i.writes else "0", st.count(i.updates), i.last_value or "-"] for i in ranked],
+        align="lllrrrl", widths=(48, None, None, None, None, None, 40), noun="item",
+    ))
+    rep.section("Operations", st.kv([counter_line("Operations", getattr(summary, "operation_counts", None), 12)]))
+    rep.section("Identity", st.kv([
+        counter_line("Server ProgIDs", getattr(summary, "server_progids", None), 6),
+        counter_line("Client names", getattr(summary, "client_names", None), 6),
+        counter_line("Group names", getattr(summary, "group_names", None), 6),
+        counter_line("Faults", getattr(summary, "faults", None), 6),
+        counter_line("Clients", summary.client_counts),
+        counter_line("Servers", summary.server_counts),
+    ]))
+
+    unattributed = getattr(summary, "unattributed_requests", None)
+    browse = list(getattr(summary, "browse_names", None) or [])
+    rep.section("Protocol", st.kv([
+        counter_line("Interfaces", summary.interface_counts, 8),
+        ("Unattributed", f"{sum(unattributed.values())} request(s) on contexts bound before the capture started: "
+                         f"{st.top(unattributed, None)}" if unattributed else ""),
+        ("Browsed names", ", ".join(browse)),
+        ("Total packets", st.count(summary.total_packets)),
+    ]), detail=True)
+    return rep.render()

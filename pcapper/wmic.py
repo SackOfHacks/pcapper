@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .utils import is_valid_ip as _valid_ip, packet_length, extract_ascii_strings as _extract_ascii_strings
 from .utils import is_public_ip as _is_public_ip
+from .utils import extract_utf16le_strings
 from .utils import beacon_score as _beaconing_score
 import re
 from collections import Counter, defaultdict
@@ -10,7 +11,7 @@ from pathlib import Path
 from typing import Optional
 
 from .pcap_cache import PcapMeta, iter_packets
-from .utils import extract_packet_endpoints, memoize_analysis, safe_float
+from .utils import domain_user_pairs, extract_packet_endpoints, memoize_analysis, safe_float
 
 try:
     from scapy.layers.inet import IP, TCP
@@ -38,7 +39,6 @@ WMI_NAMESPACE_RE = re.compile(r"root\\[A-Za-z0-9_\\]+", re.IGNORECASE)
 WMI_CLASS_RE = re.compile(r"\b(?:Win32|CIM|MSFT)_[A-Za-z0-9_]+", re.IGNORECASE)
 
 NODE_RE = re.compile(r"(?:/node:|/NODE:|\\\\)([A-Za-z0-9_.-]{1,64})")
-DOMAIN_USER_RE = re.compile(r"\b([A-Za-z0-9_.-]{1,64})\\([A-Za-z0-9_.-]{1,64})\b")
 HOST_VALUE_RE = re.compile(
     r"(?:hostname|computername|name)\s*[:=]\s*([A-Za-z0-9_.-]{2,64})", re.IGNORECASE
 )
@@ -258,26 +258,8 @@ class _SessionState:
 def _extract_utf16le_strings(
     data: bytes, min_len: int = 4, max_len: int = 200
 ) -> list[str]:
-    results: list[str] = []
-    if not data:
-        return results
-    current = bytearray()
-    i = 0
-    while i + 1 < len(data):
-        ch = data[i]
-        if 32 <= ch <= 126 and data[i + 1] == 0x00:
-            current.append(ch)
-            i += 2
-        else:
-            if len(current) >= min_len:
-                value = current.decode("latin-1", errors="ignore")
-                results.append(value[:max_len])
-            current = bytearray()
-            i += 1
-    if len(current) >= min_len:
-        value = current.decode("latin-1", errors="ignore")
-        results.append(value[:max_len])
-    return results
+    # Steps one byte after a pair that is not text: finds strings at odd offsets.
+    return extract_utf16le_strings(data, min_len, max_len, aligned=False)
 
 
 def _direction(
@@ -523,7 +505,7 @@ def analyze_wmic(
                 if host_match:
                     hostnames[host_match.group(1).lower()] += 1
 
-                for dom, user in DOMAIN_USER_RE.findall(value):
+                for dom, user in domain_user_pairs(value):
                     domains[dom.lower()] += 1
                     usernames[user.lower()] += 1
 

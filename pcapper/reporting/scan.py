@@ -1,40 +1,44 @@
-"""Rendered output for scan analysis.
-
-Split out of the former 30,000-line ``reporting.py``; the code is
-verbatim, only its location changed.
-"""
+"""Rendered output for --scan: every scanning source in triage order (OT
+reconnaissance first, then internal scanners, stealth techniques and wide
+sweeps), what each one learned (open services, banners, brute force), the
+OT assets it touched and the ATT&CK techniques; per-scanner fingerprint
+detail (MACs, OS and tool guesses, top ports) is -v."""
 
 from __future__ import annotations
+
 from typing import TYPE_CHECKING
-from ..coloring import (
-    danger,
-    header,
-    muted,
-    ok,
-    warn,
-)
+
 from ..scan import ScanSummary
-from ..utils import (
-    format_duration,
-    format_ts,
-)
+from ..utils import display_safe, format_duration, format_ts
+from . import _style as st
+
 if TYPE_CHECKING:
     from ..scan import ScanSourceResult
 
-from ._common import (
-    SUBSECTION_BAR,
-    _always_full_render,
-    _finalize_output,
-    _format_kv,
-    _format_table,
-    _limit_value,
-)
-
-
 _SCAN_SEVERITY_RANK = {"CRITICAL": 3, "HIGH": 2, "MEDIUM": 1, "LOW": 0}
-
-
 _SCAN_STEALTH_MARKERS = ("FIN", "NULL", "XMAS", "Maimon", "ACK")
+_VERDICT = {
+    "CRITICAL": "active reconnaissance against OT/ICS assets",
+    "HIGH": "deliberate network reconnaissance",
+    "MEDIUM": "network scanning",
+    "LOW": "limited probing",
+}
+
+
+def _ot_open(src: "ScanSourceResult") -> list[int]:
+    """OT service ports that answered open: the scanner learned they exist."""
+    ot = set(getattr(src, "ot_ports", None) or [])
+    return sorted({p for t in (src.targets or []) for p in (t.open_ports or []) if p in ot})
+
+
+def _ot_focused(src: "ScanSourceResult") -> bool:
+    """OT reconnaissance, as opposed to a broad sweep that happens to cover a
+    few OT ports (nmap's default top-1000 list includes 2222, 4000, 20000):
+    a narrow port set, a large OT share, or an OT port that answered open."""
+    ot = list(getattr(src, "ot_ports", None) or [])
+    if not ot:
+        return False
+    return src.unique_ports <= 64 or len(ot) / max(src.unique_ports, 1) >= 0.2 or bool(_ot_open(src))
 
 
 def _scan_source_severity(src: "ScanSourceResult") -> tuple[str, list[str]]:
@@ -42,209 +46,118 @@ def _scan_source_severity(src: "ScanSourceResult") -> tuple[str, list[str]]:
     reasons: list[str] = []
     rank = 1  # MEDIUM: any reconnaissance is at least notable
     techniques = list(getattr(src, "techniques", []) or [])
-    stealth = [
-        t for t in techniques if any(m in t for m in _SCAN_STEALTH_MARKERS)
-    ]
-
-    if getattr(src, "ot_ports", None):
-        rank = max(rank, 3)
-        ports = ", ".join(str(p) for p in src.ot_ports[:8])
-        reasons.append(
-            f"OT/ICS service ports probed ({ports}) across "
-            f"{len(src.ot_targets)} asset(s) — ICS reconnaissance (ATT&CK ICS T0846)"
-        )
+    stealth = [t for t in techniques if any(m in t for m in _SCAN_STEALTH_MARKERS)]
+    ot_ports = list(getattr(src, "ot_ports", None) or [])
+    if ot_ports:
+        ports = ", ".join(str(p) for p in ot_ports[:8])
+        if _ot_focused(src):
+            rank = 3
+            opened = _ot_open(src)
+            reasons.append(f"OT/ICS service ports probed ({ports}) across {len(src.ot_targets)} asset(s)"
+                           + (f", open: {', '.join(str(p) for p in opened)}" if opened else "")
+                           + " - ICS reconnaissance (ATT&CK ICS T0846)")
+        else:
+            reasons.append(f"broad sweep of {src.unique_ports} ports included OT ports ({ports}); none answered open - not OT-specific")
     if getattr(src, "scanner_scope", "-") == "internal":
         rank = max(rank, 2)
-        reasons.append(
-            "Scanner is an INTERNAL host — likely post-compromise lateral "
-            "discovery rather than external recon"
-        )
-    elif getattr(src, "scanner_scope", "-") == "external" and getattr(
-        src, "target_scope", "-"
-    ) in ("internal", "mixed"):
+        reasons.append("scanner is an internal host - likely post-compromise lateral discovery rather than external recon")
+    elif getattr(src, "scanner_scope", "-") == "external" and getattr(src, "target_scope", "-") in ("internal", "mixed"):
         rank = max(rank, 2)
-        reasons.append("External host scanning internal assets (inbound recon)")
+        reasons.append("external host scanning internal assets (inbound recon)")
     if stealth:
         rank = max(rank, 2)
-        reasons.append(
-            "Stealth/firewall-evasion technique(s): " + ", ".join(stealth)
-        )
+        reasons.append("stealth / firewall-evasion technique: " + ", ".join(stealth))
     if src.unique_ports >= 500 or src.unique_targets >= 100:
         rank = max(rank, 2)
-        reasons.append(
-            f"Wide sweep: {src.unique_targets} target(s), {src.unique_ports} port(s)"
-        )
+        reasons.append(f"wide sweep: {st.plural(src.unique_targets, 'target')}, {st.plural(src.unique_ports, 'port')}")
     if src.open_responses:
-        reasons.append(
-            f"{src.open_responses} open-service response(s) — attacker learned live services"
-        )
-    label_for = {3: "CRITICAL", 2: "HIGH", 1: "MEDIUM", 0: "LOW"}
-    return label_for[rank], reasons
+        reasons.append(f"{src.open_responses} open-service responses - the scanner learned live services")
+    return {3: "CRITICAL", 2: "HIGH", 1: "MEDIUM", 0: "LOW"}[rank], reasons
 
 
 def _scan_mitre_techniques(summary: ScanSummary) -> list[str]:
     tids: list[str] = []
-
-    def _add(tid: str) -> None:
-        if tid not in tids:
-            tids.append(tid)
-
     for src in summary.scan_sources:
+        candidates = []
         if src.scan_type == "vertical":
-            _add("T1046 Network Service Discovery")
+            candidates.append("T1046 Network Service Discovery")
         if src.scan_type == "horizontal":
-            _add("T1018 Remote System Discovery")
+            candidates.append("T1018 Remote System Discovery")
         if getattr(src, "scanner_scope", "-") == "external":
-            _add("T1595 Active Scanning")
-        if getattr(src, "ot_ports", None):
-            _add("ICS T0846 Remote System Discovery")
-            _add("ICS T0840 Network Connection Enumeration")
+            candidates.append("T1595 Active Scanning")
+        if _ot_focused(src):
+            candidates += ["ICS T0846 Remote System Discovery", "ICS T0840 Network Connection Enumeration"]
+        tids += [t for t in candidates if t not in tids]
     return tids
 
 
-@_always_full_render
+def _rate(pps: float) -> str:
+    return f"{pps:.1f}" if 0 < pps < 100 else f"{pps:.0f}"
+
+
 def render_scan_summary(summary: ScanSummary, verbose: bool = False) -> str:
-    verbose = True  # --scan always shows the complete picture
-    lines = [header("SCAN ANALYSIS")]
-    lines.append(_format_kv("Packets", str(summary.total_packets)))
-    lines.append(_format_kv("Relevant Packets", str(summary.relevant_packets)))
-    lines.append(_format_kv("Scanner Count", str(summary.scanner_count)))
-
+    rep = st.Report("Scan", summary.path)
     if not summary.scan_sources:
-        lines.append(ok("No network scanning behavior detected."))
+        rep.headline(None, "no network scanning detected",
+                     f"{st.count(summary.total_packets)} packets examined" if summary.total_packets else "")
         if summary.errors:
-            lines.append(
-                _format_kv("Errors", "; ".join(summary.errors[: _limit_value(4)]))
-            )
-        return _finalize_output(lines)
-
-    # Per-source severity + worst-case verdict.
+            rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+        return rep.render()
     scored = [(src, *_scan_source_severity(src)) for src in summary.scan_sources]
-    worst = max(_SCAN_SEVERITY_RANK[s[1]] for s in scored)
-    worst_label = {3: "CRITICAL", 2: "HIGH", 1: "MEDIUM", 0: "LOW"}[worst]
-
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Analyst Verdict"))
-    verdict_text = {
-        "CRITICAL": "CRITICAL - active reconnaissance against OT/ICS or crown-jewel assets.",
-        "HIGH": "HIGH - deliberate network reconnaissance (internal lateral discovery, stealth scan, or wide sweep).",
-        "MEDIUM": "MEDIUM - network scanning activity detected.",
-        "LOW": "LOW - limited probing activity.",
-    }[worst_label]
-    paint = danger if worst >= 2 else (warn if worst == 1 else ok)
-    lines.append(paint(verdict_text))
-    internal_scanners = [s for s, _l, _r in scored if s.scanner_scope == "internal"]
-    if internal_scanners:
-        lines.append(
-            danger(
-                f"{len(internal_scanners)} internal scanner(s) observed — treat as "
-                "possible compromised host / lateral movement."
-            )
-        )
-
-    # Findings table (triage-ordered: severity, then breadth).
-    scored.sort(
-        key=lambda x: (_SCAN_SEVERITY_RANK[x[1]], x[0].unique_ports, x[0].unique_targets),
-        reverse=True,
-    )
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Scanning Sources (triage order)"))
-    rows = [
-        [
-            "Sev",
-            "Scanner",
-            "Scope",
-            "Type",
-            "Technique",
-            "Tgts",
-            "Ports",
-            "Open/Closed/Filt",
-            "Rate(pps)",
-        ]
-    ]
-    for src, sev, _reasons in scored[: _limit_value(15)]:
-        tech = ", ".join(t.split(" (")[0] for t in src.techniques) or src.scan_type
-        rows.append(
-            [
-                sev,
-                src.scanner_ip,
-                src.scanner_scope,
-                src.scan_type,
-                tech,
-                str(src.unique_targets),
-                str(src.unique_ports),
-                f"{src.open_responses}/{src.closed_responses}/{src.filtered_responses}",
-                (
-                    f"{src.packets_per_second:.1f}"
-                    if 0 < src.packets_per_second < 100
-                    else f"{src.packets_per_second:.0f}"
-                ),
-            ]
-        )
-    lines.append(_format_table(rows))
-
-    # OT/ICS exposure callout.
-    ot_sources = [s for s in summary.scan_sources if getattr(s, "ot_ports", None)]
-    if ot_sources:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("OT/ICS Reconnaissance"))
-        for src in ot_sources[: _limit_value(8)]:
-            lines.append(
-                danger(
-                    f"- {src.scanner_ip} probed OT ports "
-                    f"[{', '.join(str(p) for p in src.ot_ports[:10])}] on "
-                    f"{', '.join(src.ot_targets[:5])}"
-                )
-            )
-
-    # MITRE ATT&CK mapping.
-    tids = _scan_mitre_techniques(summary)
-    if tids:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("ATT&CK Mapping"))
-        for tid in tids:
-            lines.append(muted(f"- {tid}"))
-
-    # Focus Here First — top sources with reasons + timing.
-    lines.append(SUBSECTION_BAR)
-    lines.append(header("Focus Here First"))
-    for src, sev, reasons in scored[: _limit_value(5)]:
-        window = "-"
-        if src.first_seen is not None and src.last_seen is not None:
-            window = f"{format_ts(src.first_seen)} -> {format_ts(src.last_seen)} ({format_duration(src.duration_seconds)})"
-        lines.append(
-            f"[{sev}] {src.scanner_ip} ({src.scanner_scope}) -> "
-            f"{src.scan_type} scan, {src.responsive_targets} live target(s)"
-        )
-        lines.append(muted(f"    window: {window}"))
-        if src.scanner_software_guess and src.scanner_software_guess != "-":
-            lines.append(muted(f"    tooling: {src.scanner_software_guess}"))
-        for reason in reasons[: _limit_value(4)]:
-            lines.append(muted(f"    - {reason}"))
-
-    # Per-target detail (verbose).
-    if verbose:
-        lines.append(SUBSECTION_BAR)
-        lines.append(header("Discovered Services / Targets"))
-        rows = [
-            ["Scanner", "Target", "Open Ports", "Banners", "Brute-Force"]
-        ]
-        for src, _sev, _r in scored[: _limit_value(6)]:
-            for tgt in src.targets[: _limit_value(6)]:
-                if not (tgt.open_ports or tgt.banner_samples or tgt.brute_force_attempts):
-                    continue
-                rows.append(
-                    [
-                        src.scanner_ip,
-                        tgt.target_ip,
-                        ",".join(str(p) for p in tgt.open_ports[:8]) or "-",
-                        (tgt.banner_samples[0][:40] if tgt.banner_samples else "-"),
-                        str(tgt.brute_force_attempts) if tgt.brute_force_attempts else "-",
-                    ]
-                )
-        if len(rows) > 1:
-            lines.append(_format_table(rows))
-
+    scored.sort(key=lambda x: (_SCAN_SEVERITY_RANK[x[1]], x[0].unique_ports, x[0].unique_targets), reverse=True)
+    worst = scored[0][1]
+    internal = sum(1 for s, _l, _r in scored if s.scanner_scope == "internal")
+    rep.headline(worst.lower(), _VERDICT[worst], st.join([
+        st.plural(len(scored), "scanner") + (f" ({internal} internal)" if internal else ""),
+        f"{st.count(summary.relevant_packets)} probe packets of {st.count(summary.total_packets)}",
+    ]))
+    if internal:
+        rep.scope(st.bad(f"{internal} internal scanner{'s' if internal != 1 else ''}: treat as a possibly compromised host"))
     if summary.errors:
-        lines.append(_format_kv("Errors", "; ".join(summary.errors[: _limit_value(4)])))
-    return _finalize_output(lines)
+        rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
+
+    rep.section("Scanners", st.table(
+        ["Severity", "Scanner", "Scope", "Type", "Technique", "Targets", "Ports", "Open/closed/filtered", "Rate (pps)", "Start"],
+        [[st.badge(sev), src.scanner_ip, src.scanner_scope, src.scan_type,
+          ", ".join(t.split(" (")[0] for t in src.techniques) or src.scan_type, st.count(src.unique_targets), st.count(src.unique_ports),
+          f"{src.open_responses}/{src.closed_responses}/{src.filtered_responses}", _rate(src.packets_per_second), st.ts(src.first_seen)]
+         for src, sev, _r in scored],
+        align="lllllrrrrl", widths=(None, None, None, None, 48), max_rows=10, noun="scanner",
+    ))
+    focus: list[str] = []
+    for src, sev, reasons in scored if st.verbose() else scored[:3]:
+        window = (f"{st.ts_range(src.first_seen, src.last_seen)} ({format_duration(src.duration_seconds)})"
+                  if src.first_seen is not None and src.last_seen is not None else "")
+        focus.append(f"  {st.badge(sev)}  {st.strong(src.scanner_ip)} ({src.scanner_scope}) -> {src.scan_type} scan, "
+                     f"{st.plural(src.responsive_targets, 'live target')}")
+        pad = " " * (st.BADGE_W + 4)
+        for line in ([window] if window else []) + ([f"tool: {src.scanner_software_guess}"] if src.scanner_software_guess not in ("", "-") else []) \
+                + reasons:
+            focus.append(f"{pad}{st.dim(line)}")
+    rep.section("Focus", focus)
+    ot_sources = [s for s, _l, _r in scored if _ot_focused(s)]
+    rep.section("OT reconnaissance", st.table(
+        ["Scanner", "OT ports probed", "Open", "OT assets"],
+        [[s.scanner_ip, ", ".join(str(p) for p in s.ot_ports), ", ".join(str(p) for p in _ot_open(s)) or "-", st.listing(s.ot_targets, 5)]
+         for s in ot_sources], max_rows=8, noun="scanner",
+    ))
+    rep.section("ATT&CK", st.bullets(_scan_mitre_techniques(summary), max_items=None))
+    learned = [[src.scanner_ip, t.target_ip, ",".join(str(p) for p in t.open_ports) or "-",
+                display_safe(t.banner_samples[0], preserve_newlines=False) if t.banner_samples else "-",
+                f"{t.brute_force_attempts} ({t.brute_force_failures} failed)" if t.brute_force_attempts else "-"]
+               for src, _s, _r in scored for t in src.targets
+               if t.open_ports or t.banner_samples or t.brute_force_attempts]
+    rep.section("What the scanners learned", st.table(
+        ["Scanner", "Target", "Open ports", "Banner", "Brute force"], learned, widths=(None, None, 40, 48), max_rows=10, noun="target",
+    ))
+    creds = [[src.scanner_ip, t.target_ip, display_safe(c, preserve_newlines=False)]
+             for src, _s, _r in scored for t in src.targets for c in (t.credential_samples or [])]
+    rep.section("Credential samples", st.table(["Scanner", "Target", "Sample"], creds, max_rows=None), detail=True)
+    rep.section("Scanner detail", st.table(
+        ["Scanner", "MACs", "OS guess", "Hostnames", "Top ports", "OT ports", "OT assets", "SYN", "Probes", "First", "Last", "Duration"],
+        [[s.scanner_ip, ", ".join(s.mac_addresses) or "-", s.possible_os or "-", ", ".join(s.hostname_hints) or "-",
+          ", ".join(str(p) for p in s.top_ports) or "-", ", ".join(str(p) for p in s.ot_ports) or "-", ", ".join(s.ot_targets) or "-",
+          st.count(s.syn_packets), st.count(s.probe_packets), format_ts(s.first_seen), format_ts(s.last_seen), format_duration(s.duration_seconds)]
+         for s, _l, _r in scored], align="lllllllrrlll", max_rows=None,
+    ), detail=True)
+    return rep.render()

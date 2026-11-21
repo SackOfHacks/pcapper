@@ -5,7 +5,7 @@ from .utils import extract_utf16le_strings as _extract_utf16le_strings
 import os
 import re
 from collections import Counter, defaultdict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Set, Tuple
 from urllib.parse import urlsplit
@@ -17,7 +17,7 @@ except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore
 
 from .pcap_cache import PcapMeta, iter_packets
-from .utils import extract_packet_endpoints, memoize_analysis
+from .utils import extract_packet_endpoints, memoize_analysis, plausible_domain, ranked_slice
 
 SUSPICIOUS_PATTERNS = [
     (re.compile(r"password\s*[:=]", re.IGNORECASE), "Credential exposure"),
@@ -41,7 +41,9 @@ SUSPICIOUS_PATTERNS = [
 
 URL_PATTERN = re.compile(r"https?://[^\s'\"]+", re.IGNORECASE)
 EMAIL_PATTERN = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
-DOMAIN_PATTERN = re.compile(r"\b([A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}\b")
+# Non-capturing: with a group, findall() returns the group's last repetition
+# ("www.adobe.com" -> "adobe."), which was every domain this listed.
+DOMAIN_PATTERN = re.compile(r"\b(?:[A-Za-z0-9-]{1,63}\.)+[A-Za-z]{2,63}\b")
 FLAG_PATTERN = re.compile(r"\b(?:flag|ctf|picoctf)\{[^}]{1,220}\}", re.IGNORECASE)
 BASE64_LONG_PATTERN = re.compile(r"\b(?:[A-Za-z0-9+/]{40,}={0,2})\b")
 HEX_BLOB_PATTERN = re.compile(r"\b(?:0x)?[A-Fa-f0-9]{32,}\b")
@@ -133,6 +135,9 @@ class StringsSummary:
     ot_findings: List[str]
     ctf_indicators: List[str]
     errors: List[str]
+    # How many distinct values each ranking had (urls/emails/domains keep
+    # their top and their true bottom; top/bottom_strings 20 each).
+    ranking_totals: Dict[str, int] = field(default_factory=dict)
 
 
 def _get_ip_pair(pkt: Packet) -> Tuple[str, str]:
@@ -272,7 +277,8 @@ def analyze_strings(
                 for email in EMAIL_PATTERN.findall(value):
                     email_counter[email] += 1
                 for domain in DOMAIN_PATTERN.findall(value):
-                    domain_counter[domain] += 1
+                    if plausible_domain(domain):  # not "element.value" or "n.push"
+                        domain_counter[domain.lower()] += 1
 
     except Exception as e:
         errors.append(str(e))
@@ -285,6 +291,10 @@ def analyze_strings(
 
     def _top_artifacts(counter: Counter[str], limit: int = 15) -> List[StringArtifact]:
         return [StringArtifact(value=k, count=v) for k, v in counter.most_common(limit)]
+
+    def _ranked_artifacts(counter: Counter[str], keep: int = 5000) -> List[StringArtifact]:
+        """Most to least frequent, with the true bottom kept when cut."""
+        return [StringArtifact(value=k, count=v) for k, v in ranked_slice(counter.most_common(), keep)]
 
     def _bottom_artifacts(
         counter: Counter[str], limit: int = 15
@@ -495,9 +505,11 @@ def analyze_strings(
         bottom_strings=_bottom_artifacts(string_counter, 20),
         suspicious_strings=_top_artifacts(suspicious_counter, 20),
         suspicious_details=suspicious_details,
-        urls=_top_artifacts(url_counter, 15),
-        emails=_top_artifacts(email_counter, 15),
-        domains=_top_artifacts(domain_counter, 15),
+        urls=_ranked_artifacts(url_counter),
+        emails=_ranked_artifacts(email_counter),
+        domains=_ranked_artifacts(domain_counter),
+        ranking_totals={"urls": len(url_counter), "emails": len(email_counter), "domains": len(domain_counter),
+                        "strings": len(string_counter)},
         client_strings=client_strings,
         server_strings=server_strings,
         anomalies=anomalies,
@@ -712,9 +724,15 @@ def merge_strings_summaries(summaries: List[StringsSummary]) -> StringsSummary:
         bottom_strings=_to_artifacts(bottom_counter, 20),
         suspicious_strings=_to_artifacts(suspicious_counter, 20),
         suspicious_details=suspicious_details,
-        urls=_to_artifacts(url_counter, 15),
-        emails=_to_artifacts(email_counter, 15),
-        domains=_to_artifacts(domain_counter, 15),
+        urls=[StringArtifact(value=k, count=v) for k, v in ranked_slice(url_counter.most_common(), 5000)],
+        emails=[StringArtifact(value=k, count=v) for k, v in ranked_slice(email_counter.most_common(), 5000)],
+        domains=[StringArtifact(value=k, count=v) for k, v in ranked_slice(domain_counter.most_common(), 5000)],
+        ranking_totals={
+            "urls": max([len(url_counter)] + [int((s.ranking_totals or {}).get("urls", 0)) for s in summaries]),
+            "emails": max([len(email_counter)] + [int((s.ranking_totals or {}).get("emails", 0)) for s in summaries]),
+            "domains": max([len(domain_counter)] + [int((s.ranking_totals or {}).get("domains", 0)) for s in summaries]),
+            "strings": unique_strings,
+        },
         client_strings=client_strings,
         server_strings=server_strings,
         anomalies=anomalies,

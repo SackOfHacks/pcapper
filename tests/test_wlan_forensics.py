@@ -50,3 +50,26 @@ def test_signal_average_and_peak_use_constant_space_accumulators(tmp_path) -> No
 
     assert result.networks[0].avg_signal_dbm == -50
     assert result.networks[0].peak_signal_dbm == -40
+
+
+def test_wpa_handshake_names_the_access_point_as_bssid(tmp_path) -> None:
+    """EAPOL frames are counted per sorted MAC pair (both directions of the
+    4-way handshake together); the report labelled the lower MAC "bssid", so a
+    client whose MAC sorts first was reported as the access point."""
+    from scapy.all import EAPOL, LLC, SNAP  # type: ignore
+
+    ap, client = "50:0f:80:70:18:d0", "40:40:a7:50:73:db"  # the client sorts first
+    frames = []
+    for msg in range(4):
+        to_ap = msg % 2 == 1  # M1/M3 from the AP, M2/M4 from the client
+        dot11 = (
+            Dot11(type=2, subtype=0, FCfield=1, addr1=ap, addr2=client, addr3=ap)  # to-DS
+            if to_ap
+            else Dot11(type=2, subtype=0, FCfield=2, addr1=client, addr2=ap, addr3=ap)  # from-DS
+        )
+        frames.append(RadioTap() / dot11 / LLC() / SNAP(OUI=0, code=0x888E) / EAPOL(version=1, type=3))
+    capture = tmp_path / "handshake.pcap"
+    wrpcap(str(capture), frames)
+
+    result = analyze_wlan(capture, show_status=False)
+    assert result.wpa_handshakes == [{"bssid": ap, "station": client, "eapol_frames": 4}]

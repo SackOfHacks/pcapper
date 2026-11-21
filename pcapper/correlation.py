@@ -8,6 +8,7 @@ from typing import Iterable
 from .hosts import HostSummary
 from .services import ServiceSummary
 from .utils import is_public_ip as _is_public
+from .utils import is_unicast_host_ip
 
 
 @dataclass(frozen=True)
@@ -43,7 +44,7 @@ def correlate(
         pcap_name = str(summary.path)
         for host in getattr(summary, "hosts", []) or []:
             ip = str(getattr(host, "ip", "") or "")
-            if not ip:
+            if not ip or not is_unicast_host_ip(ip):
                 continue
             host_map[ip].add(pcap_name)
         for err in getattr(summary, "errors", []) or []:

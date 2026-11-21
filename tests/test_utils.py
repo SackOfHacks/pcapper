@@ -151,3 +151,19 @@ def test_dataclass_counters_serialize_as_mappings() -> None:
         "counts": {"Get CP status": 338, "Run program": 1},
         "nested": [{"a": 2}],
     }
+
+
+def test_domain_user_pairs_skips_paths_namespaces_and_unc_shares() -> None:
+    from pcapper.utils import domain_user_pairs
+
+    # Real account references survive, in their original case.
+    assert domain_user_pairs(r"logon as CORP\Alice") == [("CORP", "Alice")]
+    assert domain_user_pairs(r"NT AUTHORITY\SYSTEM") == [("AUTHORITY", "SYSTEM")]
+    # WMI namespaces, filesystem paths, registry keys and UNC host\share
+    # prefixes have the same shape and were reported as domains and users.
+    for text in (
+        r"root\cimv2", r"ROOT\CIMV2", r"cmd.exe /Q /c del /q /f /s C:\windows\temp\*",
+        r"system32\cmd.exe", r"HKLM\Software\Microsoft", r"\\127.0.0.1\ADMIN$\__1640620178",
+        r"10.0.0.5\c", r"tools\run.ps1",
+    ):
+        assert domain_user_pairs(text) == [], text

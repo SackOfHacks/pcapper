@@ -115,9 +115,9 @@ class TestCli:
         assert _run_cli(monkeypatch, str(tmp_path), "--protocols", errors=errors) == 0
         out = capfd.readouterr().out
         assert any("Joined 3 split-capture parts" in e for e in errors)
-        assert out.count("PROTOCOL & CONVERSATION ANALYSIS ::") == 1
+        assert out.count("PROTOCOLS · ") == 1
         assert "mixed.pcap [3 parts joined]" in out
-        assert "Total Packets           : 25" in out
+        assert "25 packets" in out
 
     def test_no_join_parts_keeps_them_separate(
         self, pcap, tmp_path: Path, monkeypatch, capfd
@@ -128,4 +128,4 @@ class TestCli:
             == 0
         )
         out = capfd.readouterr().out
-        assert out.count("PROTOCOL & CONVERSATION ANALYSIS ::") == 3
+        assert out.count("PROTOCOLS · ") == 3

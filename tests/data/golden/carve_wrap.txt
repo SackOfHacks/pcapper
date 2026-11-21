@@ -1,6 +1,9 @@
-STREAM CARVING
-Streams                 : 1
-Hits                    : 1
-Stream        Dir     Type  Len  Missing  Src                  Dst               
-fbdf7ff96498  client  PDF   193  -        192.168.10.10:44300  192.168.10.50:8080
-Output is summarized/truncated. Use -v to view all output.
+
+STREAM CARVING · carve_wrap.pcap
+════════════════════════════════════════════════════════════════════════════════
+  OK        1 file signature
+            1 stream searched
+
+Hits ───────────────────────────────────────────────────────────────────────────
+  STREAM        DIR     TYPE  BYTES  MISSING  SOURCE               DESTINATION
+  fbdf7ff96498  client  PDF     193        -  192.168.10.10:44300  192.168.10.50:8080
