@@ -1003,7 +1003,7 @@ def test_jobs_workers_leave_the_parent_s_copies_alone(tmp_path: Path, monkeypatc
     monkeypatch.setattr(pcap_cache.TeeSink, "put", _marking_put)
     log = tmp_path / "suricata-reads.log"
     env = {"PCAPPER_SURICATA_BIN": str(_fake_suricata(tmp_path)), "FAKE_SURICATA_LOG": str(log),
-           "PCAPPER_CACHE_ENABLED": "0"}
+           "PCAPPER_CACHE_ENABLED": "0", "PCAPPER_SURICATA_FEED": "1"}
     reference = _run(path, ["--suricata", "--modbus", "--dns", "--icmp", "--jobs", "1"], monkeypatch, **env)
     parallel = _run(path, ["--suricata", "--modbus", "--dns", "--icmp", "--jobs", "3"], monkeypatch, **env)
     assert parallel == reference
@@ -1159,3 +1159,13 @@ def test_split_windows_hash_from_the_index_walk(tmp_path: Path, monkeypatch: pyt
     assert hashlib.sha256(path.read_bytes()).hexdigest() in out
     windows = [line.split()[1] for line in marks.read_text().splitlines()]
     assert sorted(windows) == ["0", "1", "2"], windows  # one read of each window, not two
+
+
+def test_suricata_reads_its_file_unless_asked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """Suricata's results depend on the pace it is fed at, so by default it
+    reads the file itself; PCAPPER_SURICATA_FEED=1 feeds it the run's read."""
+    path = _mixed(tmp_path)
+    log = tmp_path / "suricata-reads.log"
+    monkeypatch.delenv("PCAPPER_SURICATA_FEED", raising=False)
+    _run(path, ["--suricata"], monkeypatch, PCAPPER_SURICATA_BIN=str(_fake_suricata(tmp_path)), FAKE_SURICATA_LOG=str(log))
+    assert log.read_text().split() == [str(path)]
