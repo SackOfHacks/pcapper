@@ -62,7 +62,7 @@ And nothing internal leaves the box: reputation lookups (`-vt`, `--ip-geo`) only
 
 ## Product Highlights
 
-- **Fast on large captures**: pcapper reads a capture once, however many analyses you ask for, and uses several CPU cores when that helps. `--threats` on a 20,000-packet capture went from 6 minutes to 47 seconds.
+- **Reads a capture once, on every core**: every analysis of every flag comes from a single read of the capture -- in memory or one shared pass from disk -- and `--jobs` (automatic) spreads the work over processes that share it. `--overview` from disk: 9 reads → 1, 56 s → 23 s; `--threats` from disk on a 20k-packet slice 359 s → 47 s.
 - **Concise by default, complete with `-v`**: every report leads with a severity headline and its findings, folds repeats, and says what `-v` adds. Rankings (domains, hosts, URLs, user agents, fingerprints, commands ...) show the top 10 and the bottom 10, the rarest. While it works, pcapper shows one progress bar per capture; `-v` shows the processing detail instead (read-pass percentages, per-analysis timing, library warnings).
 - **`--dnsqueries`**: every DNS / LLMNR / mDNS lookup with the response observed (answers, NXDOMAIN, no response), per host with `-ip`, across captures with `-summarize`.
 - **MITRE ATT&CK mapping**: enterprise + ICS TTP alignment with technique heat and host-centric attack paths.
@@ -178,7 +178,7 @@ The goal is actionable signal, not noisy packet dumps.
 | Traditional PCAP Workflow | With Pcapper |
 | --- | --- |
 | Manually pivot protocol by protocol | Single command gives cross-protocol triage |
-| Every tool re-reads the capture | One read covers every analysis |
+| Every tool re-reads the capture | One read covers every analysis; external tools can share it |
 | Raw packet dumps with limited context | Severity-ranked findings with their evidence |
 | Ad-hoc analyst notes for evidence | Built-in pivots and evidence-rich summaries |
 | Separate OT and IT tooling chains | Unified OT/ICS + enterprise workflow |
@@ -211,40 +211,60 @@ Promotional highlights:
 
 ## What's New in v3.0.0 ⚡
 
-### Faster on large captures
+Two headlines: **pcapper now reads a capture once, whatever you ask of it, and spreads the work over your CPUs**, and **every report was rebuilt to be short by default and complete with `-v`**. Reports are unchanged in substance: the new code was checked byte for byte against the previous tree on every flag, in memory and from disk, with and without `--jobs`, and with 160 runs designed to provoke thread races.
 
-Earlier versions read a capture again for nearly every analysis they ran. On a big capture that added up quickly: `--threats` on its own went through the file 96 times. Pcapper now reads a capture once and runs every analysis from that single read, whichever flags you combine.
+### Performance: one read, many cores
 
-| | v2.9 | v3.0 |
+Captures too large to keep in memory used to be read, and every packet dissected, once per analyzer (`--threats` made 96 full passes). Now every analysis of every step is computed from **one read** -- the capture held in memory when it fits, else one shared pass from disk -- and `--jobs` spreads that work over processes that share the read instead of repeating it.
+
+Reads of the capture per run (in file sizes, measured with strace, every process included):
+
+| Run | Before | Now |
 | --- | --- | --- |
-| `--overview` on a capture too large for memory, reads of the file | 9 | 1 |
-| `--decrypt` with 50 TLS streams, reads of the file | 56 | 2 |
-| `--threats` on a 20,000-packet capture read from disk | 6 min | 47 s |
+| `--overview` from disk (NM_2015-08-23, 20k packets) | 9.06 | **1.00** |
+| `--threats` from disk | 7.78 | **1.00** |
+| `--http --dns --tls --files` from disk | 7.69 | **1.00** |
+| `--hostdetails -ip` from disk | 8.67 | **1.00** |
+| `--overview` of a pcapng from disk (wannacry-20170516) | 15.86 | **1.00** |
+| `--suricata --http` from disk (`PCAPPER_SURICATA_FEED=1`) | 6.57 | **1.00** |
+| `--baseline-save` from disk | 19.81 | **1.00** |
+| `--decrypt`, 50 TLS streams (wannacry-20170516) | 56.07 | **2.00** |
+| `--split 4 --http` (asprox_24hr, 202k packets) | 10.25 | **2.21** |
 
-Pcapper also uses several CPU cores when a run is big enough to benefit, with no option to set. On a 200,000-packet capture, `--overview` takes 2 minutes 30 seconds instead of 4 minutes 40 seconds on a single core.
+Wall-clock time:
 
-- The single read works the same for pcapng files, gzip-compressed captures, captures split across several files, and runs filtered with `--bpf` or a time window.
-- `--decrypt` uses pcapper's read to find the streams to decrypt instead of opening the file again.
-- `--jobs` lets you choose the number of processes yourself.
-- `--split N` analyses a large capture as N parts in parallel and reports each part.
+| Run | Before | Now |
+| --- | --- | --- |
+| `--threats` from disk (20k-packet slice) | 359 s | **47 s** |
+| `--overview` in memory (NM_2015-08-23) | 33.7 s | **14.3 s** (`--jobs` 8) |
+| `--overview` from disk (NM_2015-08-23) | 55.8 s | **23.3 s** |
+| `--overview` in memory (asprox_24hr) | 280 s | **151 s** |
+| `--threats` from disk (asprox_24hr) | 464 s | **229 s** (4 workers) |
 
-### Cleaner reports
+- **Read once, everywhere:** the hashes and a pcapng's interface details come from the same read; split captures (`X.pcap.part000.pcap` ...) and gzip-compressed captures read once too; so do BPF and time-window filters (tcpdump filters a copy of pcapper's read), baselines, `--correlate`, `--control-loop` and the `--files` extraction options.
+- **External tools can take a copy:** `PCAPPER_SURICATA_FEED=1` feeds Suricata a copy of pcapper's read through a FIFO; this is off by default because a slow feed can cost Suricata alerts. tshark's `--decrypt` stream listing reads a copy through a FIFO. `--decrypt` follows every stream in one tshark run that stops at the last frame it needs: 2N+1 reads became at most 2.
+- **`--jobs N`, automatic by default:** one process per usable CPU (at most 8) when the run is big enough to gain, never more than the plan has analyses, within available memory. In memory the processes share the packets; from disk they are copied the main process's read through pipes -- they read no file, split captures included.
+- **`--split N`** reports N windows of a capture in parallel (what `editcap -c` plus one run per part gives); the walk that finds the windows also computes the hashes.
+- **Lightweight packets and prefiltered reads:** the OT analyzers read records without full scapy dissection and skip packets they can never claim.
+- **Large-capture notice:** above ~1M packets pcapper says how many packets the capture holds, how long one read takes on this machine, and what makes it faster (with `-v`).
 
-- Every report opens with a one-line verdict, followed by the findings that matter, with the hosts, times and ATT&CK techniques involved.
-- The default output is short. Add `-v` to see everything.
-- Lists of domains, hosts, URLs and the like show the 10 most common and the 10 rarest entries.
-- While it works, pcapper shows a single progress bar. Warnings and processing details appear only with `-v`.
-- Highlights, suggested next steps and follow-up analyses are collected in `--overview`, so each protocol report stays on its protocol.
-- The new `--dnsqueries` lists every DNS lookup and its answer, per host with `-ip`.
-- Running the same capture twice gives the same report.
+### Output: concise, consistent, built to be read
 
-### Fixes
+- **Short by default, complete with `-v`:** every report opens with a severity headline, then the findings with their flow, time and ATT&CK technique; aligned tables, repeats folded, and a note of what `-v` adds. Checked token by token: `-v` loses nothing the old output had.
+- **One progress bar per capture** while it works, and nothing else; `-v` shows the processing detail (pass percentages, per-analysis timing, library warnings).
+- **Top 10 and bottom 10:** ranked tables (domains, hosts, URLs, user agents, fingerprints, commands ...) show the most common and the rarest -- where the outliers hide.
+- **`--dnsqueries`:** every DNS / LLMNR / mDNS lookup with its observed answer (NXDOMAIN, no response), per host with `-ip`, across captures with `-summarize`.
+- **`--overview` is the briefing:** highlights, immediate leads and auto-run deep dives appear there, each once; protocol reports stay focused on their protocol.
+- **Same capture, same report:** ties sort by name and Suricata's examples are its earliest events, so two runs give identical output.
 
-- `--suricata` and `--bpf` now work on gzip-compressed captures.
-- Fewer false positives in `--scan` and the OT checks, and new detections for DCSync, reverse VNC, IS-IS and Schneider UMAS program reads.
-- `--files` now finds large HTTP downloads and matches file names to the right transfers.
+### Fixed along the way
 
-The full list of changes is in [CHANGELOG.md](CHANGELOG.md).
+- `--suricata` on a gzip-compressed capture found nothing (Suricata cannot read gzip); it now reads an inflated copy.
+- `--bpf` on a gzip-compressed capture silently fell back to the unfiltered capture; filtered runs now apply the filter to nested analyses too.
+- False positives removed from `--scan`, OT port detection and "OT risk" scores; missing detections added (DCSync without its bind, IS-IS over LLC, reverse VNC with its repeater ID, Schneider UMAS program reads).
+- `--files` extracts large HTTP downloads it used to miss and pairs filenames with the right responses.
+
+See [CHANGELOG.md](CHANGELOG.md) for every change, with its measurement.
 
 ## What's New in v2.9.0 🏭
 
@@ -373,9 +393,9 @@ CRIT  Pivot    IT->OT pivot: remote access then OT command  45.137.21.9(1)  10.0
 ## Current Release: v3.0.0
 
 Headline changes in this release:
-- Much faster on large captures: each capture is read once, and the work is spread over your CPU cores.
-- Shorter, clearer reports, with the full detail behind `-v`.
-- New `--dnsqueries`, support for gzip-compressed captures, and `--split N` for analysing a large capture in parallel parts.
+- **One read per run, whatever the flags** -- pcapng, split and gzip captures, filters, and `--decrypt`; Suricata can share the read when `PCAPPER_SURICATA_FEED=1` -- and **automatic `--jobs`** over processes that share it: `--overview` from disk 9.06 reads → 1, 55.8 s → 23.3 s.
+- **Every report rebuilt**: concise by default, complete with `-v`, findings first, top/bottom 10 rankings, one progress bar while it works.
+- **`--dnsqueries`**, gzip-compressed captures read directly, `--split N` parallel windows.
 
 Carried forward from v2.5.0:
 - **Beacon detection works for reconnecting and persistent C2 again**, and routine OT polling is context rather than compromise evidence in `--compromised` and `--mitre`.

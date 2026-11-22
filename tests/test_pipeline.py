@@ -1161,7 +1161,6 @@ def test_split_windows_hash_from_the_index_walk(tmp_path: Path, monkeypatch: pyt
     assert sorted(windows) == ["0", "1", "2"], windows  # one read of each window, not two
 
 
-
 def test_suricata_reads_its_file_unless_asked(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     """Suricata's results depend on the pace it is fed at, so by default it
     reads the file itself; PCAPPER_SURICATA_FEED=1 feeds it the run's read."""
