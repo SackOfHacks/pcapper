@@ -178,7 +178,7 @@ The goal is actionable signal, not noisy packet dumps.
 | Traditional PCAP Workflow | With Pcapper |
 | --- | --- |
 | Manually pivot protocol by protocol | Single command gives cross-protocol triage |
-| Every tool re-reads the capture | One read covers every analysis; external tools can share it |
+| Every tool re-reads the capture | One read covers every analysis |
 | Raw packet dumps with limited context | Severity-ranked findings with their evidence |
 | Ad-hoc analyst notes for evidence | Built-in pivots and evidence-rich summaries |
 | Separate OT and IT tooling chains | Unified OT/ICS + enterprise workflow |
