@@ -178,7 +178,7 @@ The goal is actionable signal, not noisy packet dumps.
 | Traditional PCAP Workflow | With Pcapper |
 | --- | --- |
 | Manually pivot protocol by protocol | Single command gives cross-protocol triage |
-| Every tool re-reads the capture | One read covers every analysis, Suricata included |
+| Every tool re-reads the capture | One read covers every analysis |
 | Raw packet dumps with limited context | Severity-ranked findings with their evidence |
 | Ad-hoc analyst notes for evidence | Built-in pivots and evidence-rich summaries |
 | Separate OT and IT tooling chains | Unified OT/ICS + enterprise workflow |
@@ -224,7 +224,7 @@ Earlier versions read a capture again for nearly every analysis they ran. On a b
 Pcapper also uses several CPU cores when a run is big enough to benefit, with no option to set. On a 200,000-packet capture, `--overview` takes 2 minutes 30 seconds instead of 4 minutes 40 seconds on a single core.
 
 - The single read works the same for pcapng files, gzip-compressed captures, captures split across several files, and runs filtered with `--bpf` or a time window.
-- Suricata and `--decrypt` use pcapper's read instead of opening the file again.
+- `--decrypt` uses pcapper's read to find the streams to decrypt instead of opening the file again.
 - `--jobs` lets you choose the number of processes yourself.
 - `--split N` analyses a large capture as N parts in parallel and reports each part.
 
