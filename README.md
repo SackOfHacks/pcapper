@@ -178,7 +178,7 @@ The goal is actionable signal, not noisy packet dumps.
 | Traditional PCAP Workflow | With Pcapper |
 | --- | --- |
 | Manually pivot protocol by protocol | Single command gives cross-protocol triage |
-| Each tool and pass re-reads the capture | One read feeds every analysis, Suricata and tshark included |
+| Every tool re-reads the capture | One read covers every analysis; external tools can share it |
 | Raw packet dumps with limited context | Severity-ranked findings with their evidence |
 | Ad-hoc analyst notes for evidence | Built-in pivots and evidence-rich summaries |
 | Separate OT and IT tooling chains | Unified OT/ICS + enterprise workflow |
@@ -226,7 +226,7 @@ Reads of the capture per run (in file sizes, measured with strace, every process
 | `--http --dns --tls --files` from disk | 7.69 | **1.00** |
 | `--hostdetails -ip` from disk | 8.67 | **1.00** |
 | `--overview` of a pcapng from disk (wannacry-20170516) | 15.86 | **1.00** |
-| `--suricata --http` from disk | 6.57 | **1.00** |
+| `--suricata --http` from disk (`PCAPPER_SURICATA_FEED=1`) | 6.57 | **1.00** |
 | `--baseline-save` from disk | 19.81 | **1.00** |
 | `--decrypt`, 50 TLS streams (wannacry-20170516) | 56.07 | **2.00** |
 | `--split 4 --http` (asprox_24hr, 202k packets) | 10.25 | **2.21** |
@@ -242,7 +242,7 @@ Wall-clock time:
 | `--threats` from disk (asprox_24hr) | 464 s | **229 s** (4 workers) |
 
 - **Read once, everywhere:** the hashes and a pcapng's interface details come from the same read; split captures (`X.pcap.part000.pcap` ...) and gzip-compressed captures read once too; so do BPF and time-window filters (tcpdump filters a copy of pcapper's read), baselines, `--correlate`, `--control-loop` and the `--files` extraction options.
-- **External tools take a copy:** Suricata and tshark's `--decrypt` stream listing read a copy of pcapper's read through a FIFO instead of the file. `--decrypt` follows every stream in one tshark run that stops at the last frame it needs: 2N+1 reads became at most 2.
+- **External tools can take a copy:** `PCAPPER_SURICATA_FEED=1` feeds Suricata a copy of pcapper's read through a FIFO; this is off by default because a slow feed can cost Suricata alerts. tshark's `--decrypt` stream listing reads a copy through a FIFO. `--decrypt` follows every stream in one tshark run that stops at the last frame it needs: 2N+1 reads became at most 2.
 - **`--jobs N`, automatic by default:** one process per usable CPU (at most 8) when the run is big enough to gain, never more than the plan has analyses, within available memory. In memory the processes share the packets; from disk they are copied the main process's read through pipes -- they read no file, split captures included.
 - **`--split N`** reports N windows of a capture in parallel (what `editcap -c` plus one run per part gives); the walk that finds the windows also computes the hashes.
 - **Lightweight packets and prefiltered reads:** the OT analyzers read records without full scapy dissection and skip packets they can never claim.
@@ -259,7 +259,7 @@ Wall-clock time:
 
 ### Fixed along the way
 
-- `--suricata` on a gzip-compressed capture found nothing (Suricata cannot read gzip); it is now fed the capture inflated.
+- `--suricata` on a gzip-compressed capture found nothing (Suricata cannot read gzip); it now reads an inflated copy.
 - `--bpf` on a gzip-compressed capture silently fell back to the unfiltered capture; filtered runs now apply the filter to nested analyses too.
 - False positives removed from `--scan`, OT port detection and "OT risk" scores; missing detections added (DCSync without its bind, IS-IS over LLC, reverse VNC with its repeater ID, Schneider UMAS program reads).
 - `--files` extracts large HTTP downloads it used to miss and pairs filenames with the right responses.
@@ -393,7 +393,7 @@ CRIT  Pivot    IT->OT pivot: remote access then OT command  45.137.21.9(1)  10.0
 ## Current Release: v3.0.0
 
 Headline changes in this release:
-- **One read per run, whatever the flags** -- pcapng, split and gzip captures, filters, Suricata and `--decrypt` included -- and **automatic `--jobs`** over processes that share it: `--overview` from disk 9.06 reads → 1, 55.8 s → 23.3 s.
+- **One read per run, whatever the flags** -- pcapng, split and gzip captures, filters, and `--decrypt`; Suricata can share the read when `PCAPPER_SURICATA_FEED=1` -- and **automatic `--jobs`** over processes that share it: `--overview` from disk 9.06 reads → 1, 55.8 s → 23.3 s.
 - **Every report rebuilt**: concise by default, complete with `-v`, findings first, top/bottom 10 rankings, one progress bar while it works.
 - **`--dnsqueries`**, gzip-compressed captures read directly, `--split N` parallel windows.
 

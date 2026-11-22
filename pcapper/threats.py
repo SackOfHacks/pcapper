@@ -1059,10 +1059,14 @@ def _feed_key(path: Path, rules_path: Path | None, config_path: Path | None) -> 
 def start_suricata_feed(path: Path, rules_path: Path | None = None, config_path: Path | None = None) -> bool:
     """Start Suricata on a copy of the read the run makes of ``path`` -- one
     Suricata per part of a split capture, as Suricata scans them, each started
-    when the read nears its part (PCAPPER_SURICATA_FEED=0 turns it off). True
+    when the read nears its part. Off unless PCAPPER_SURICATA_FEED=1:
+    Suricata's results depend on the pace it is fed at -- fed slower than it
+    reads a file (a run whose own analyses set the pace), it raises fewer
+    alerts (asprox_24hr fed at 1 MB/s: 4,580 alerts, from the file 4,698).
+    True
     when the feeds are set up."""
     suricata_bin = _suricata_binary()
-    if os.environ.get("PCAPPER_SURICATA_FEED", "1") == "0" or not suricata_bin:
+    if os.environ.get("PCAPPER_SURICATA_FEED", "0") != "1" or not suricata_bin:
         return False
 
     def _command(source: str, workdir: Path) -> list[str]:
