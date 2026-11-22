@@ -1495,7 +1495,7 @@ class _CaptureRaw(io.RawIOBase):
         self._size = st.st_size
         self.meta_key = (str(key), st.st_size, st.st_mtime_ns)
         try:
-            head = os.pread(self._file.fileno(), 4, 0)
+            head = _read_at(self._file, 0, 4)
         except OSError:
             head = b""
         # Compressed: inflated by the layer above (:class:`_InflatingRaw`).
@@ -1547,7 +1547,7 @@ class _CaptureRaw(io.RawIOBase):
             sink.expected = self._size - start
         offset = start
         while offset < self._front:
-            data = os.pread(self._file.fileno(), min(1 << 20, self._front - offset), offset)
+            data = _read_at(self._file, offset, min(1 << 20, self._front - offset))
             if not data:
                 break
             for sink in sinks:
@@ -1595,7 +1595,7 @@ class _CaptureRaw(io.RawIOBase):
             return
         offset = self._front
         while offset < upto:
-            data = os.pread(self._file.fileno(), min(1 << 20, upto - offset), offset)
+            data = _read_at(self._file, offset, min(1 << 20, upto - offset))
             if not data:
                 break
             self._pass_on(data)
@@ -1706,6 +1706,19 @@ _SMALL_SKIP = 4 * 1024 * 1024
 # Callbacks per split capture (by its head), told the index of each part the
 # moment a read opens it (fifo_feed starts the next part's copies then).
 _PART_HOOKS: dict[Path, list] = {}
+
+
+def _read_at(file: io.FileIO, offset: int, size: int) -> bytes:
+    """Read from an absolute offset on platforms without ``os.pread``."""
+    pread = getattr(os, "pread", None)
+    if pread is not None:
+        return pread(file.fileno(), size, offset)
+    current = file.tell()
+    try:
+        file.seek(offset)
+        return file.read(size)
+    finally:
+        file.seek(current)
 
 
 def on_part_open(path: Path, callback) -> None:  # type: ignore[no-untyped-def]
