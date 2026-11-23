@@ -14,7 +14,7 @@ An `--overview` of a 10M-packet capture (maccdc2010, 883 MB, from disk) took 80 
 - **No deadlock from waiting workers.** A worker whose analyses all wait for others before reading still drains its copy of the capture (one lightweight reader takes the first round), so the main process's read -- and every other worker -- never stalls on it.
 - **Balanced by measured cost.** Workers are grouped by each analysis's measured cost (hostname ~7x a typical analysis) instead of two weights; from disk, analyses that read lightweight records are grouped apart, so their workers never dissect the capture with scapy. The plan's dry run now notes what each analysis reads.
 - **Automatic count: one per usable CPU, at most 16** (was 8); from disk no longer cut to the 3 workers that kept pace with the main process.
-- `--overview`, maccdc2010 slice of 250,000 packets: from disk 212 s → 68 s; in memory 132 s → 62 s (of which 32 s is loading the packets with scapy). Full capture (10M packets, from disk): 80 min → ~47 min, now bounded by each worker dissecting the capture once.
+- `--overview`, maccdc2010 slice of 250,000 packets: from disk 212 s → 68 s; in memory 132 s → 62 s (of which 32 s is loading the packets with scapy). Full capture (10M packets, from disk): 80 min → 70.5 min only -- 16 workers busy throughout, each spending about as long as one of the 4 processes did before: on a capture this size a worker's time is dominated by what does not shrink with fewer analyses (dissecting every packet once, and costs that grow faster than the packet count), not by its share of the analyses.
 
 ### Faster analysis
 
