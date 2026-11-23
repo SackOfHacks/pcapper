@@ -1031,6 +1031,10 @@ _COORDINATE = False
 _MEMO_RECORDER: Optional[list] = None
 _FAN_OUT_HOOK: Optional[Any] = None
 _BLOCK_HOOK: Optional[Any] = None
+# Called with the key of every result computed and memoised in this process
+# (--jobs: a worker sends it on to the others that wait for it). Never under
+# _MEMO_LOCK: it may block.
+_STORE_HOOK: Optional[Any] = None
 _NO_HIT = object()
 
 
@@ -1283,11 +1287,15 @@ def memoize_analysis(func):
             result = func(path, *args, **kwargs)
             _memo_store(key, result, copy_results)
             _progress.subtask_done(module=func.__module__)  # a finished analysis moves the capture bar
+            store_hook = _STORE_HOOK
+            if store_hook is not None:
+                store_hook(key)
             return result
         finally:
             if flight is not None:
                 with _MEMO_LOCK:
-                    _IN_FLIGHT.pop(key, None)
+                    if _IN_FLIGHT.get(key) is flight:
+                        del _IN_FLIGHT[key]
                 flight.event.set()
 
     return wrapper

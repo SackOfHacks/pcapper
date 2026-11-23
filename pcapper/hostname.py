@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 
+import functools
 import ipaddress
 import re
 import struct
@@ -383,11 +384,28 @@ def _extract_payload(raw_layer, tcp_layer, udp_layer) -> bytes:
     return b""
 
 
+_MAC_RE = re.compile(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}")
+
+
+@functools.lru_cache(maxsize=65536)
+def _normalize_mac_text(text: str) -> str:
+    text = text.strip().lower()
+    return text if _MAC_RE.fullmatch(text) else ""
+
+
 def _normalize_mac(value: object) -> str:
-    text = str(value or "").strip().lower()
-    if re.fullmatch(r"[0-9a-f]{2}(?::[0-9a-f]{2}){5}", text):
-        return text
-    return ""
+    # Every packet passes its MACs here, and a capture has few distinct ones.
+    return _normalize_mac_text(value if type(value) is str else str(value or ""))
+
+
+@functools.lru_cache(maxsize=65536)
+def _ip_facts(ip_value: str) -> Optional[tuple[str, bool, bool]]:
+    """(canonical text, unspecified, multicast) of an address; None if it is not one."""
+    try:
+        ip_obj = ipaddress.ip_address(ip_value)
+    except Exception:
+        return None
+    return str(ip_obj), ip_obj.is_unspecified, ip_obj.is_multicast
 
 
 def _remember_ip_mac(
@@ -396,13 +414,18 @@ def _remember_ip_mac(
     mac = _normalize_mac(mac_value)
     if not mac:
         return
-    try:
-        ip_obj = ipaddress.ip_address(ip_value)
-    except Exception:
+    facts = _ip_facts(ip_value) if type(ip_value) is str else None
+    if facts is None:
+        if type(ip_value) is str:
+            return
+        try:
+            ip_obj = ipaddress.ip_address(ip_value)
+        except Exception:
+            return
+        facts = (str(ip_obj), ip_obj.is_unspecified, ip_obj.is_multicast)
+    if facts[1]:
         return
-    if ip_obj.is_unspecified:
-        return
-    ip_to_macs[str(ip_obj)].add(mac)
+    ip_to_macs[facts[0]].add(mac)
 
 
 def _remember_mac_ip(
@@ -411,13 +434,18 @@ def _remember_mac_ip(
     mac = _normalize_mac(mac_value)
     if not mac:
         return
-    try:
-        ip_obj = ipaddress.ip_address(ip_value)
-    except Exception:
+    facts = _ip_facts(ip_value) if type(ip_value) is str else None
+    if facts is None:
+        if type(ip_value) is str:
+            return
+        try:
+            ip_obj = ipaddress.ip_address(ip_value)
+        except Exception:
+            return
+        facts = (str(ip_obj), ip_obj.is_unspecified, ip_obj.is_multicast)
+    if facts[1] or facts[2]:
         return
-    if ip_obj.is_unspecified or ip_obj.is_multicast:
-        return
-    mac_to_ips[mac].add(str(ip_obj))
+    mac_to_ips[mac].add(facts[0])
 
 
 def _safe_dns_attr(dns_layer, attr: str, default=None):
@@ -1631,6 +1659,16 @@ def _extract_cdp_hostnames(
     dst_mac = _normalize_mac(getattr(eth_layer, "dst", ""))
     raw_payload = payload
     if not raw_payload:
+        if dst_mac != CDP_MULTICAST_MAC:
+            # Only a payload opening with the SNAP header can hold CDP here.
+            # A dissected layer's bytes open with its own header as read
+            # (raw_packet_cache): when that cannot begin the SNAP header,
+            # skip rebuilding the frame's bytes -- the answer is no CDP.
+            head = getattr(eth_layer.payload, "raw_packet_cache", None)
+            if isinstance(head, bytes) and head:
+                head = head[: len(CDP_SNAP_HEADER)]
+                if CDP_SNAP_HEADER[: len(head)] != head:
+                    return []
         try:
             raw_payload = bytes(eth_layer.payload)
         except Exception:

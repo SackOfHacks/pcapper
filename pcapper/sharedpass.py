@@ -36,8 +36,8 @@ already consumed), so no wait can stall the reader. Disable with
 from __future__ import annotations
 
 import collections
-import math
 import os
+import struct
 import sys
 import threading
 import time
@@ -610,12 +610,21 @@ class _Recorder:
     def __init__(self) -> None:
         self.calls: list[tuple[Callable, tuple, dict]] = []
         self.children: list[set[int]] = []
+        self.reads: list[Optional[str]] = []  # None, "lite" or "packets"
         self._stack: list[int] = []
+
+    def note_read(self, lite: bool) -> None:
+        """The innermost call running reads the capture (iter_packets)."""
+        if self._stack:
+            index = self._stack[-1]
+            if not lite or self.reads[index] is None:
+                self.reads[index] = "lite" if lite else "packets"
 
     def enter(self, func: Callable, _path: Path, args: tuple, kwargs: dict) -> int:
         index = len(self.calls)
         self.calls.append((func, args, {k: v for k, v in kwargs.items() if k not in ("packets", "meta")}))
         self.children.append(set())
+        self.reads.append(None)
         if self._stack:
             self.children[self._stack[-1]].add(index)
         self._stack.append(index)
@@ -635,6 +644,21 @@ class Plan:
         self.keys: list[tuple] = []
         self.levels: list[int] = []
         self.children: list[set[int]] = []  # the calls each call needs
+        # What each call reads of the capture itself: None (nothing), "lite"
+        # (lite records only: no scapy dissection from disk) or "packets".
+        self.reads: list[Optional[str]] = []
+
+    def needs(self, index: int) -> set[int]:
+        """Every call ``index`` needs, directly or through others."""
+        seen: set[int] = set()
+        stack = list(self.children[index])
+        while stack:
+            kid = stack.pop()
+            if kid in seen:
+                continue
+            seen.add(kid)
+            stack.extend(self.children[kid])
+        return seen
 
     def __len__(self) -> int:
         return len(self.calls)
@@ -677,6 +701,7 @@ def discover(path: Path, roots: list[tuple[Callable, tuple, dict]]) -> Plan:
     saved_hook = utils._FAN_OUT_HOOK
     utils._FAN_OUT_HOOK = None
     utils._MEMO_RECORDER = recorder
+    pcap_cache._READ_NOTE = recorder.note_read
     try:
         for func, args, kwargs in roots:
             call_kwargs = dict(kwargs)
@@ -687,6 +712,7 @@ def discover(path: Path, roots: list[tuple[Callable, tuple, dict]]) -> Plan:
             except Exception:  # noqa: BLE001 - a partial plan still saves reads
                 pass
     finally:
+        pcap_cache._READ_NOTE = None
         utils._MEMO_RECORDER = None
         utils._FAN_OUT_HOOK = saved_hook
         _restore_view(path, saved)
@@ -703,7 +729,11 @@ def discover(path: Path, roots: list[tuple[Callable, tuple, dict]]) -> Plan:
             index_of[key] = len(plan.calls)
             plan.calls.append((func, args, kwargs))
             plan.keys.append(key)
+            plan.reads.append(None)
         mapped.append(index_of[key])
+        read = recorder.reads[len(mapped) - 1]
+        if read is not None and plan.reads[mapped[-1]] != "packets":
+            plan.reads[mapped[-1]] = read
     children: list[set[int]] = [set() for _ in plan.calls]
     for raw, kids in enumerate(recorder.children):
         parent = mapped[raw]
@@ -743,11 +773,17 @@ def prefetch(
     calls: list[tuple[Callable, tuple, dict]],
     *,
     show_status: bool = False,
+    drain: bool = False,
 ) -> Optional[SharedPass]:
     """Compute ``calls`` (memoised analyzers) over ``path`` in shared rounds.
 
     Results land in the analysis memo; calls already memoised are skipped.
     Returns the finished pass (None when nothing needed computing).
+
+    ``drain``: the first round reads the whole capture whatever the calls do
+    -- even when every one of them first waits for a result computed in
+    another process. Copies of this read (--jobs) then always flow: a read
+    held up by such a wait would hold up the processes computing it.
     """
     key = pcap_cache._path_key(path)
     with _lock:
@@ -768,8 +804,15 @@ def prefetch(
                 return func(path, *call_args, **kwargs)
 
             pending.append((getattr(func, "__qualname__", "analysis"), _call))
-        if len(pending) < 2:
+        if not pending or (len(pending) < 2 and not drain):
             return None
+        if drain:
+
+            def _drain() -> None:
+                for _record in pcap_cache.iter_packets(path, show_status=False, lite=True):
+                    pass
+
+            pending.append(("drain", _drain))
         session = SharedPass(path, pending, show_status=show_status)
         started = time.monotonic()
         previous_max = utils._ANALYSIS_MEMO_MAX
@@ -806,12 +849,13 @@ def prefetch(
 # ---------------------------------------------------------------------------
 
 _JOBS: Optional[int] = 1  # None: chosen per capture (jobs_for)
-# The analyses of a plan form a dependency graph whose longest chain bounds
-# the run however many processes share it: past this many, more cost memory
-# and forks and save nothing measurable. --overview of a 20k-packet capture
-# held in memory: 33.7 s in one process, 19.5 s with 4, 14.3 s with 8 and
-# 14.3 s with 16 or 32 (its longest chain is ~7.7 s of the 34).
-AUTO_JOBS_MAX = 8
+# Workers run their analyses side by side, a dependent one's packet loop
+# beside what it waits for, so the run is bounded by the costliest worker:
+# its analyses, plus (from disk) dissecting the capture once. Past this many
+# workers, more cost memory and dissections and save little. --overview of
+# 250k packets (maccdc2010) from disk: 102 s with 8, 82 s with 16, 81 s
+# with 24 (212 s before workers took dependent analyses).
+AUTO_JOBS_MAX = 16
 # Without a plan to size it by (the large-capture note), a capture of this
 # many packets is taken to be worth processes.
 AUTO_JOBS_MIN_PACKETS = 200_000
@@ -917,61 +961,6 @@ def parallel_available() -> bool:
     return hasattr(os, "fork") and not sys.platform.startswith("win")
 
 
-def _jobs_child(
-    path: Path,
-    calls: list[tuple[Callable, tuple, dict]],
-    group: list[int],
-    feed: Optional[int],
-    result: int,
-    resume: bool = False,
-) -> None:
-    """A --jobs worker, forked: compute ``group`` -- from the copy of the
-    capture its parent sends down ``feed`` (from the file when there is none)
-    -- and send back, pickled, every result it added. Never returns."""
-    import pickle
-
-    status = 1
-    try:
-        # The parent's waits for workers' results, its primed reader and its
-        # copies are its own (the reader and the copies share file offsets and
-        # pipes with it): none of them is touched here.
-        utils._IN_FLIGHT.clear()
-        if feed is not None:
-            pcap_cache.use_feed(path, feed, resume=resume)  # takes the inherited head along
-        pcap_cache.forget_primed(keep_complete=True)  # a whole capture in memory: replayed here too
-        pcap_cache.forget_tees()
-        before = set(utils._ANALYSIS_MEMO)
-        try:
-            prefetch(path, [calls[i] for i in group])
-        except Exception:  # noqa: BLE001 - an aborted pass leaves no results behind
-            pass
-        for i in group:  # a single call (or a failed pass) still gets computed
-            func, args, kwargs = calls[i]
-            call_kwargs = dict(kwargs)
-            if utils._call_accepts_kwarg(func, "show_status"):
-                call_kwargs["show_status"] = False
-            try:
-                func(path, *args, **call_kwargs)
-            except Exception:  # noqa: BLE001 - the parent's own call reports it
-                pass
-        blobs: dict = {}
-        for key, value in list(utils._ANALYSIS_MEMO.items()):
-            if key in before:
-                continue
-            try:
-                blobs[key] = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
-            except Exception:  # noqa: BLE001 - the parent computes it itself
-                continue
-        data = memoryview(pickle.dumps(blobs, protocol=pickle.HIGHEST_PROTOCOL))
-        while data:
-            data = data[os.write(result, data):]
-        status = 0
-    except BaseException:  # noqa: BLE001 - never unwind into the parent's code
-        pass
-    finally:
-        os._exit(status)
-
-
 def _grow_pipe(fd: int) -> None:
     try:
         import fcntl
@@ -981,79 +970,326 @@ def _grow_pipe(fd: int) -> None:
         pass
 
 
+# What an analysis costs, relative to the others: CPU seconds per 250,000
+# packets of an IT capture (maccdc2010, --overview, each analysis alone in a
+# process over the packets in memory). The order matters, not the values:
+# it decides which analyses share a worker. Analyses not listed cost
+# _DEFAULT_COST.
+_COSTS: dict[str, float] = {
+    "hostname": 35.5, "analyzer": 20.5, "protocols": 14.3, "scan": 14.0, "ips": 13.8,
+    "threats": 11.8, "routing": 11.8, "beacon": 11.4, "malware": 11.2, "services": 10.8,
+    "files": 9.5, "tls": 9.5, "certificates": 9.3, "rdp": 8.9, "vnc": 8.5, "ftp": 8.4, "dnp3": 8.4,
+    "tcp": 7.8, "voip": 7.7, "vpn": 7.7, "ctf": 7.7, "winrm": 7.7, "remote_access": 7.3,
+    "netbios": 7.2, "ssh": 7.0, "safety": 6.9, "ldap": 6.9, "syslog": 6.7, "powershell": 6.6,
+    "obfuscation": 6.5, "wmic": 6.4, "exfil": 6.3, "encrypted_dns": 6.2, "rpc": 6.0, "aim": 5.9,
+    "telnet": 5.8, "enip": 5.7, "cip": 5.7, "modbus": 5.6, "kerberos": 5.5, "dns": 5.3,
+    "powerlink": 5.2, "creds": 5.0, "carving": 4.9, "email": 4.7, "profinet": 4.5,
+    "synchrophasor": 4.0, "snmp": 3.7, "goose": 3.5, "icmp": 3.5, "nfs": 3.3, "lldp_dcp": 3.2,
+    "genisys": 3.2, "modicon": 3.1, "df1": 3.1, "opc": 3.0, "ads": 3.0, "c1222": 3.0, "hart": 3.0,
+    "iccp": 3.0, "knx": 3.0, "ntlm": 3.0, "ptp": 3.0, "xgt": 3.0, "dlms": 3.0, "fins": 3.0,
+    "pccc": 3.0, "rocplus": 3.0, "codesys": 2.9, "iec104": 2.9, "pcworx": 2.9, "s7": 2.9,
+    "coap": 2.9, "crimson": 2.9, "lontalk": 2.9, "melsec": 2.9, "mms": 2.9, "mqtt": 2.9,
+    "srtp": 2.9, "bsap": 2.8, "bacnet": 2.8, "iec101_103": 2.8, "niagara": 2.8, "prconos": 2.8,
+    "yokogawa": 2.8, "csp": 2.8, "honeywell": 2.8, "opc_classic": 2.5, "http": 2.3, "smb": 2.3,
+    "udp": 2.2, "arp": 2.2, "dhcp": 2.2, "quic": 2.1, "ethercat": 2.0, "sv": 1.8,
+}
+_DEFAULT_COST = 4.0
+# A worker reading from disk dissects every packet with scapy once if any
+# of its analyses wants scapy packets (lite records need none): on that
+# capture ~32 s per 250,000 packets, in the units above.
+_DISSECT_COST = 32.0
+
+
 def _analysis_cost(func: Callable) -> float:
-    """Relative cost of an analysis for balancing work (the bar's weights:
-    OT protocol analyses, cheap on IT traffic, below payload-scanning IT ones)."""
-    weigher = progress._WEIGHER
-    module = getattr(func, "__module__", "")
-    try:
-        return float(weigher(module)) if weigher is not None and module else 1.0
-    except Exception:  # noqa: BLE001
-        return 1.0
+    module = getattr(func, "__module__", "") or ""
+    return _COSTS.get(module.rsplit(".", 1)[-1], _DEFAULT_COST)
 
 
-def _balanced_groups(indices: list[int], workers: int, plan: Plan) -> list[list[int]]:
+def _balanced_groups(indices: list[int], workers: int, plan: Plan, *, from_disk: bool = False) -> list[list[int]]:
     """``indices`` split over ``workers``: the costliest first, each to the
-    least-loaded worker (longest-processing-time first)."""
+    worker it finishes soonest on (longest-processing-time first). From disk,
+    the first analysis that wants scapy packets in a worker adds the
+    dissection of the capture to it, so lite-only analyses gather in workers
+    that never dissect."""
     loads = [0.0] * workers
+    dissects = [False] * workers
     groups: list[list[int]] = [[] for _ in range(workers)]
     for i in sorted(indices, key=lambda i: (-_analysis_cost(plan.calls[i][0]), i)):
-        w = min(range(workers), key=lambda w: (loads[w], w))
+        cost = _analysis_cost(plan.calls[i][0])
+        scapy = from_disk and i < len(plan.reads) and plan.reads[i] == "packets"
+
+        def _after(w: int, cost: float = cost, scapy: bool = scapy) -> float:
+            return loads[w] + cost + (_DISSECT_COST if scapy and not dissects[w] else 0.0)
+
+        w = min(range(workers), key=lambda w: (_after(w), w))
+        loads[w] = _after(w)
+        dissects[w] = dissects[w] or scapy
         groups[w].append(i)
-        loads[w] += _analysis_cost(plan.calls[i][0])
     return [sorted(group) for group in groups if group]
 
 
-def _parallel(path: Path, plan: Plan, jobs: int, show_status: bool) -> None:
-    """Analyses that depend on no other (most of a --threats run) are split
-    over ``jobs`` forked workers. They read no file: this process copies every
-    byte its own read of the capture passes into a pipe per worker, which
-    parses the capture from there (a capture in several part files, which
-    cannot be copied so, is read by each worker). The rest run here at the
-    same time, in a shared pass of their own -- the read the copies come
-    from: their own packet loops first, an analysis that needs a worker's
-    result waiting for it to arrive instead of computing it again."""
+# Results travel between processes as frames: 8 bytes of length, then a
+# pickled (memo key, pickled result or None). None: the analysis failed or
+# its result cannot be sent -- whoever needs it computes it.
+_FRAME_HEADER = struct.Struct("<Q")
+_MISSING = object()
+
+
+def _write_all(fd: int, data: bytes) -> None:
+    view = memoryview(data)
+    while view:
+        view = view[os.write(fd, view):]
+
+
+def _frame(key: tuple, value: Any, *, required: bool = True) -> Optional[bytes]:
+    """The frame of a result; ``required``: a frame saying none came when it
+    cannot be sent, else None."""
     import pickle
+
+    blob: Optional[bytes] = None
+    if value is not _MISSING:
+        try:
+            blob = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
+        except Exception:  # noqa: BLE001 - its reader computes it itself
+            blob = None
+    if blob is None and not required:
+        return None
+    payload = pickle.dumps((key, blob), protocol=pickle.HIGHEST_PROTOCOL)
+    return _FRAME_HEADER.pack(len(payload)) + payload
+
+
+class _Frames:
+    """The frames of a byte stream, in order, as they complete."""
+
+    def __init__(self) -> None:
+        self._buffer = bytearray()
+
+    def feed(self, data: bytes) -> list[bytes]:
+        self._buffer += data
+        frames: list[bytes] = []
+        while len(self._buffer) >= _FRAME_HEADER.size:
+            (size,) = _FRAME_HEADER.unpack_from(self._buffer)
+            end = _FRAME_HEADER.size + size
+            if len(self._buffer) < end:
+                break
+            frames.append(bytes(self._buffer[_FRAME_HEADER.size:end]))
+            del self._buffer[:end]
+        return frames
+
+
+def _unframe(payload: bytes) -> tuple[tuple, Any]:
+    """(key, result) of a frame; the result is _MISSING when none came."""
+    import pickle
+
+    key, blob = pickle.loads(payload)
+    if blob is None:
+        return key, _MISSING
+    try:
+        return key, pickle.loads(blob)
+    except Exception:  # noqa: BLE001
+        return key, _MISSING
+
+
+def _call_quietly(path: Path, call: tuple[Callable, tuple, dict]) -> None:
+    func, args, kwargs = call
+    call_kwargs = dict(kwargs)
+    if utils._call_accepts_kwarg(func, "show_status"):
+        call_kwargs["show_status"] = False
+    try:
+        func(path, *args, **call_kwargs)
+    except Exception:  # noqa: BLE001 - the run's own call reports it
+        pass
+
+
+def _run_in_threads(path: Path, calls: list[tuple[Callable, tuple, dict]]) -> None:
+    """``calls`` over the packets held in memory, each on a thread of its own:
+    one waiting for a result another process computes holds up none of the
+    others. Builds of a shared packet take turns, as in a shared pass."""
+    global _guarded_passes
+    _guard_scapy_builds()
+    with _lock:
+        _guarded_passes += 1
+    utils._COORDINATE = True
+    try:
+        threads = [
+            threading.Thread(target=_call_quietly, args=(path, call), name="pcapper-jobs-analysis", daemon=True)
+            for call in calls
+        ]
+        for thread in threads:
+            thread.start()
+        for thread in threads:
+            thread.join()
+    finally:
+        utils._COORDINATE = False
+        with _lock:
+            _guarded_passes -= 1
+
+
+def _group_worker(
+    path: Path,
+    plan: Plan,
+    group: list[int],
+    needs: set[tuple],
+    feed: Optional[int],
+    result: int,
+    inbox: int,
+    *,
+    resume: bool,
+    in_memory: bool,
+) -> None:
+    """A --jobs worker, forked: compute the analyses ``group`` (plan indices)
+    -- from the packets in memory, the copy of the capture its parent sends
+    down ``feed``, or else the file -- sending each result up ``result`` as
+    soon as it is done. A result it ``needs`` from another worker comes down
+    ``inbox`` (the analysis waiting for it waits meanwhile; one that never
+    comes is computed here). Never returns."""
+    status = 1
+    try:
+        # The parent's waits, primed reader and copies are its own (the reader
+        # and the copies share file offsets and pipes with it).
+        utils._IN_FLIGHT.clear()
+        if feed is not None:
+            pcap_cache.use_feed(path, feed, resume=resume)  # takes the inherited head along
+        pcap_cache.forget_primed(keep_complete=True)  # a whole capture in memory: replayed here too
+        pcap_cache.forget_tees()
+        memo = utils._ANALYSIS_MEMO
+        before = set(memo)
+        own = {plan.keys[i] for i in group}
+        received: set[tuple] = set()
+        sent: set[tuple] = set()
+        send_lock = threading.Lock()
+        flights: dict[tuple, utils._Flight] = {}
+        with utils._MEMO_LOCK:
+            utils._ANALYSIS_MEMO_MAX = max(utils._ANALYSIS_MEMO_MAX, len(memo) + 2 * len(plan) + 64)
+            for key in needs:
+                if key not in memo:
+                    flights[key] = utils._IN_FLIGHT[key] = utils._Flight()
+
+        def _land(key: tuple) -> None:
+            with utils._MEMO_LOCK:
+                flight = flights.pop(key, None)
+                if flight is not None and utils._IN_FLIGHT.get(key) is flight:
+                    del utils._IN_FLIGHT[key]
+            if flight is not None:
+                flight.event.set()
+
+        def _receive() -> None:
+            frames = _Frames()
+            try:
+                while True:
+                    data = os.read(inbox, 1 << 20)
+                    if not data:
+                        break
+                    for payload in frames.feed(data):
+                        key, value = _unframe(payload)
+                        if value is not _MISSING:
+                            with utils._MEMO_LOCK:
+                                if key not in memo:
+                                    memo[key] = value
+                                    received.add(key)
+                        _land(key)
+            except Exception:  # noqa: BLE001 - what never came is computed here
+                pass
+            finally:
+                for key in list(flights):
+                    _land(key)
+
+        def _ship(key: tuple) -> None:
+            if key not in own:
+                return
+            with send_lock:
+                if key in sent:
+                    return
+                sent.add(key)
+                _write_all(result, _frame(key, memo.get(key, _MISSING)))
+
+        receiver = threading.Thread(target=_receive, name="pcapper-jobs-inbox", daemon=True)
+        receiver.start()
+        utils._STORE_HOOK = _ship
+        calls = [plan.calls[i] for i in group]
+        if in_memory:
+            _run_in_threads(path, calls)
+        else:
+            try:
+                prefetch(path, calls, drain=feed is not None)
+            except Exception:  # noqa: BLE001 - an aborted pass leaves no results behind
+                pass
+        for call in calls:  # a single call (or a failed pass) still gets computed
+            _call_quietly(path, call)
+        for key in own:  # failed ones too: who waits for them computes them
+            _ship(key)
+        utils._STORE_HOOK = None
+        # Whatever else was computed here (memoised helpers outside the plan):
+        # the run would otherwise compute it again.
+        for key, value in list(memo.items()):
+            if key in before or key in received or key in sent:
+                continue
+            frame = _frame(key, value, required=False)
+            if frame is not None:
+                _write_all(result, frame)
+        status = 0
+    except BaseException:  # noqa: BLE001 - never unwind into the parent's code
+        pass
+    finally:
+        os._exit(status)
+
+
+def _run_groups(path: Path, plan: Plan, jobs: int, *, show_status: bool, in_memory: bool) -> int:
+    """The plan's analyses over ``jobs`` forked workers, each computing a
+    group of them (balanced by cost) side by side: over the packets in memory
+    (``in_memory``: shared with this process, nothing read), or else each
+    over a copy of this process's one read of the capture, sent down a pipe
+    (a capture in several part files is read by each worker). An analysis
+    that needs another's result -- computed in another worker -- waits for it
+    to be passed on, after its own packet loop: dependent analyses overlap
+    instead of following each other. Only the analyses reporting the
+    capture's hashes stay here, where the read computing them is made.
+    Returns how many results came back; anything that failed is left to the
+    run (from disk: computed here, in one shared pass)."""
+    import gc
+    import queue
     import selectors
     import signal
     import warnings
 
     debug = os.environ.get("PCAPPER_SHARED_PASS_DEBUG") == "1"
     memo = utils._ANALYSIS_MEMO
-    # Analyses reporting the capture's hashes stay here, where the read that
-    # computes them on the way is made.
-    leaves = [
-        i for i, level in enumerate(plan.levels)
-        if level == 0 and plan.keys[i] not in memo and not getattr(plan.calls[i][0], "reports_hashes", False)
-    ]
-    if len(leaves) < 2:
-        prefetch(path, [plan.calls[i] for i, key in enumerate(plan.keys) if key not in memo], show_status=show_status)
-        return
-    leaf_set = set(leaves)
-    rest_indices = [i for i, key in enumerate(plan.keys) if key not in memo and i not in leaf_set]
-    rest = [plan.calls[i] for i in rest_indices]
+    todo = [i for i, key in enumerate(plan.keys) if key not in memo]
+    local = [] if in_memory else [i for i in todo if getattr(plan.calls[i][0], "reports_hashes", False)]
+    local_set = set(local)
+    remote = [i for i in todo if i not in local_set]
+    if len(remote) < 2:
+        if not in_memory:
+            prefetch(path, [plan.calls[i] for i in todo], show_status=show_status)
+        return 0
     started = time.monotonic()
-    workers = min(jobs, len(leaves))
-    if _JOBS is None and rest_indices:
-        # Automatic: this process works through the rest meanwhile, and the
-        # run ends when it does -- workers past what keeps the leaves within
-        # that time only add work. (--overview from disk: 56 s in one
-        # process, 23.7 s with 2 workers, 23.3 s with 8.)
-        leaf_cost = sum(_analysis_cost(plan.calls[i][0]) for i in leaves)
-        rest_cost = sum(_analysis_cost(plan.calls[i][0]) for i in rest_indices)
-        workers = min(workers, max(1, math.ceil(leaf_cost / max(rest_cost, 1e-9))))
-    groups = _balanced_groups(leaves, workers, plan)
-    # The decode-as check may have kept the whole capture (a small one read
-    # from disk): each worker then replays its own copy, no pipe needed. When
-    # it kept only the head, workers replay that and are copied the rest.
-    # A split capture's workers are copied every part, framed, from the first.
-    split = len(capture_parts(path)) > 1
-    copy = pcap_cache.can_tee(path, single=True) and not pcap_cache.primed_complete(path)
+    groups = _balanced_groups(remote, min(jobs, len(remote)), plan, from_disk=not in_memory)
+    todo_keys = {plan.keys[i] for i in todo}
+    needs: list[set[tuple]] = []
+    for group in groups:
+        own = {plan.keys[i] for i in group}
+        wanted: set[tuple] = set()
+        for i in group:
+            wanted.update(plan.keys[k] for k in plan.needs(i))
+        needs.append((wanted & todo_keys) - own)
+    needed_by: dict[tuple, list[int]] = {}
+    for w, wanted in enumerate(needs):
+        for key in wanted:
+            needed_by.setdefault(key, []).append(w)
+    split = copy = False
     resume: object = None
-    if copy:
-        resume = pcap_cache.primed_part_resume(path) if split else pcap_cache.primed_resume_point(path)
+    if not in_memory:
+        # The decode-as check may have kept the whole capture (a small one read
+        # from disk): each worker then replays its own copy, no pipe needed.
+        # When it kept only the head, workers replay that and are copied the
+        # rest. A split capture's workers are copied every part, framed.
+        split = len(capture_parts(path)) > 1
+        copy = pcap_cache.can_tee(path, single=True) and not pcap_cache.primed_complete(path)
+        if copy:
+            resume = pcap_cache.primed_part_resume(path) if split else pcap_cache.primed_resume_point(path)
     feeds: list[Optional[tuple[int, int]]] = []
     results: list[tuple[int, int]] = []
+    inboxes: list[tuple[int, int]] = []
     for _group in groups:
         if copy:
             feed = os.pipe()
@@ -1062,7 +1298,13 @@ def _parallel(path: Path, plan: Plan, jobs: int, show_status: bool) -> None:
         else:
             feeds.append(None)
         results.append(os.pipe())
+        inboxes.append(os.pipe())
+    with utils._MEMO_LOCK:
+        utils._ANALYSIS_MEMO_MAX = max(utils._ANALYSIS_MEMO_MAX, len(memo) + 2 * len(plan) + 64)
     pids: list[int] = []
+    # Frozen: no collection walks (and so copies into a worker) the objects
+    # that exist now -- above all the packets held in memory.
+    gc.freeze()
     try:
         for index, group in enumerate(groups):
             with warnings.catch_warnings():
@@ -1072,40 +1314,45 @@ def _parallel(path: Path, plan: Plan, jobs: int, show_status: bool) -> None:
                 warnings.simplefilter("ignore", DeprecationWarning)
                 pid = os.fork()
             if pid == 0:
-                for other, (feed, result) in enumerate(zip(feeds, results)):
+                for other in range(len(groups)):
+                    feed = feeds[other]
                     if feed is not None:
                         os.close(feed[1])
                         if other != index:
                             os.close(feed[0])
-                    os.close(result[0])
+                    os.close(results[other][0])
+                    os.close(inboxes[other][1])
                     if other != index:
-                        os.close(result[1])
-                own = feeds[index]
-                _jobs_child(
-                    path, plan.calls, group, own[0] if own is not None else None, results[index][1],
-                    resume=resume is not None,
+                        os.close(results[other][1])
+                        os.close(inboxes[other][0])
+                own_feed = feeds[index]
+                _group_worker(
+                    path, plan, group, needs[index], own_feed[0] if own_feed is not None else None,
+                    results[index][1], inboxes[index][0], resume=resume is not None, in_memory=in_memory,
                 )
             pids.append(pid)
     except BaseException:
+        gc.unfreeze()
         for pid in pids:
             try:
                 os.kill(pid, signal.SIGKILL)
                 os.waitpid(pid, 0)
             except OSError:
                 pass
-        for feed, result in zip(feeds, results):
-            for fd in (*(feed or ()), *result):
+        for feed, result, inbox in zip(feeds, results, inboxes):
+            for fd in (*(feed or ()), *result, *inbox):
                 try:
                     os.close(fd)
                 except OSError:
                     pass
         raise
     sinks: list[pcap_cache.TeeSink] = []
-    for feed, result in zip(feeds, results):
+    for feed, result, inbox in zip(feeds, results, inboxes):
         if feed is not None:
             os.close(feed[0])
             sinks.append(pcap_cache.TeeSink(feed[1], name="jobs-copy"))
         os.close(result[1])
+        os.close(inbox[0])
     if sinks:
         # Through the read this process makes next (or the primed one it goes
         # on with, from where its head stopped).
@@ -1114,7 +1361,50 @@ def _parallel(path: Path, plan: Plan, jobs: int, show_status: bool) -> None:
         else:
             pcap_cache.tee_capture(path, sinks, resume or 0)  # type: ignore[arg-type]
 
+    # Results on their way to the workers that wait for them: one thread
+    # writes them all, so neither the collector nor an analysis here ever
+    # waits on a worker's pipe.
+    outbox: "queue.SimpleQueue[Optional[tuple[tuple, bytes]]]" = queue.SimpleQueue()
+    inbox_fds: list[Optional[int]] = [inbox[1] for inbox in inboxes]
+
+    def _forward() -> None:
+        while True:
+            item = outbox.get()
+            if item is None:
+                break
+            key, frame = item
+            for w in needed_by.get(key, ()):
+                fd = inbox_fds[w]
+                if fd is None:
+                    continue
+                try:
+                    _write_all(fd, frame)
+                except OSError:  # the worker is gone
+                    inbox_fds[w] = None
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
+        for w, fd in enumerate(inbox_fds):
+            if fd is not None:
+                inbox_fds[w] = None
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
     flights: dict[tuple, utils._Flight] = {}
+    passed_on: set[tuple] = set()
+    pass_lock = threading.Lock()
+
+    def _pass_on(key: tuple, frame: Optional[bytes] = None) -> None:
+        if key not in needed_by:
+            return
+        with pass_lock:
+            if key in passed_on:
+                return
+            passed_on.add(key)
+        outbox.put((key, frame if frame is not None else _frame(key, memo.get(key, _MISSING))))
 
     def _land(key: tuple) -> None:
         """A worker's result arrived (or never will): wake whoever waits."""
@@ -1126,51 +1416,54 @@ def _parallel(path: Path, plan: Plan, jobs: int, show_status: bool) -> None:
             flight.event.set()
 
     with utils._MEMO_LOCK:
-        for i in leaves:
+        for i in remote:
             key = plan.keys[i]
             if key not in utils._IN_FLIGHT:
                 flights[key] = utils._IN_FLIGHT[key] = utils._Flight()
 
     running = {results[index][0]: index for index in range(len(groups))}
+    returned = 0
 
     def _collect() -> None:
+        nonlocal returned
         selector = selectors.DefaultSelector()
-        chunks: dict[int, list[bytes]] = {fd: [] for fd in running}
+        readers = {fd: _Frames() for fd in running}
+        arrived: set[tuple] = set()
         try:
             for fd in running:
                 selector.register(fd, selectors.EVENT_READ)
-            while chunks:
+            while readers:
                 for selected, _events in selector.select():
                     fd = selected.fd
                     data = os.read(fd, 1 << 20)
                     if data:
-                        chunks[fd].append(data)
+                        for payload in readers[fd].feed(data):
+                            key, value = _unframe(payload)
+                            arrived.add(key)
+                            if value is not _MISSING:
+                                with utils._MEMO_LOCK:
+                                    utils._ANALYSIS_MEMO_MAX = max(utils._ANALYSIS_MEMO_MAX, len(memo) + 64)
+                                    fresh = key not in memo
+                                    if fresh:
+                                        memo[key] = value
+                                if fresh:
+                                    returned += 1
+                                    progress.subtask_done(module=str(key[0]) if isinstance(key, tuple) and key else "")
+                            _land(key)
+                            _pass_on(key, _FRAME_HEADER.pack(len(payload)) + payload)
                         continue
                     selector.unregister(fd)
+                    del readers[fd]
                     index = running[fd]
                     try:
                         os.waitpid(pids[index], 0)
                     except OSError:
                         pass
-                    try:
-                        blobs = pickle.loads(b"".join(chunks.pop(fd)))
-                    except Exception:  # noqa: BLE001 - a worker that died mid-write
-                        blobs = {}
-                    entries: dict = {}
-                    for key, blob in blobs.items():
-                        try:
-                            entries[key] = pickle.loads(blob)
-                        except Exception:  # noqa: BLE001
-                            continue
-                    with utils._MEMO_LOCK:
-                        utils._ANALYSIS_MEMO_MAX = max(utils._ANALYSIS_MEMO_MAX, len(memo) + len(entries) + 64)
-                        for key, value in entries.items():
-                            memo.setdefault(key, value)
-                    for key in entries:  # a worker's analyses are done
-                        progress.subtask_done(module=str(key[0]) if isinstance(key, tuple) and key else "")
-                        _land(key)
-                    for i in groups[index]:  # none came back: computed by who needs it
-                        _land(plan.keys[i])
+                    for i in groups[index]:  # never came: computed by who needs it
+                        key = plan.keys[i]
+                        if key not in arrived:
+                            _land(key)
+                            _pass_on(key, _frame(key, _MISSING))
         finally:
             selector.close()
             for fd in running:
@@ -1181,12 +1474,27 @@ def _parallel(path: Path, plan: Plan, jobs: int, show_status: bool) -> None:
             for key in list(flights):  # failed or not sendable: computed by who needs it
                 _land(key)
 
+    local_keys = {plan.keys[i] for i in local}
+
+    def _store_hook(key: tuple) -> None:
+        if key in local_keys:
+            _pass_on(key)
+
+    forwarder = threading.Thread(target=_forward, name="pcapper-jobs-forward", daemon=True)
+    forwarder.start()
     collector = threading.Thread(target=_collect, name="pcapper-jobs-results", daemon=True)
     collector.start()
+    saved_hook = utils._STORE_HOOK
+    utils._STORE_HOOK = _store_hook
     finished = False
     try:
-        if rest:
-            prefetch(path, rest, show_status=show_status)
+        if local:
+            prefetch(path, [plan.calls[i] for i in local], show_status=show_status, drain=bool(sinks))
+            for i in local:
+                if plan.keys[i] not in memo:  # a failed pass: on its own
+                    _call_quietly(path, plan.calls[i])
+            for key in local_keys:  # failed ones too: who waits for them computes them
+                _pass_on(key)
         if sinks:
             # The copies no read here took up (no analysis left to run here,
             # or its pass ended before the capture did): read on for them.
@@ -1194,6 +1502,8 @@ def _parallel(path: Path, plan: Plan, jobs: int, show_status: bool) -> None:
         collector.join()
         finished = True
     finally:
+        utils._STORE_HOOK = saved_hook
+        gc.unfreeze()
         if not finished:  # interrupted: stop the workers
             for sink in sinks:
                 sink.abandon()
@@ -1206,177 +1516,17 @@ def _parallel(path: Path, plan: Plan, jobs: int, show_status: bool) -> None:
             collector.join(5.0)
         for key in list(flights):
             _land(key)
-    if debug:
-        sys.stderr.write(
-            f"[pcapper] --jobs: {len(leaves)} independent analyses in {len(groups)} processes"
-            f"{' fed a copy of this read' if sinks else ''}, {len(rest)} more here meanwhile, "
-            f"{time.monotonic() - started:.1f}s\n"
-        )
+        outbox.put(None)
+        forwarder.join(5.0 if not finished else None)
     left = [plan.calls[i] for i, key in enumerate(plan.keys) if key not in memo]
-    if left:  # a worker that failed: its analyses, and what waited for them
-        prefetch(path, left, show_status=show_status)
-
-
-def _compute_in_child(path: Path, call: tuple[Callable, tuple, dict]) -> bytes:
-    """In a forked worker: compute one analysis (what it needs is memoised
-    already) and pickle every result it added, each on its own so one that
-    cannot be pickled -- the parent then computes it itself -- spoils none."""
-    import pickle
-
-    func, args, kwargs = call
-    before = set(utils._ANALYSIS_MEMO)
-    call_kwargs = dict(kwargs)
-    if utils._call_accepts_kwarg(func, "show_status"):
-        call_kwargs["show_status"] = False
-    try:
-        func(path, *args, **call_kwargs)
-    except Exception:  # noqa: BLE001 - the parent's own call reports it
-        pass
-    blobs: dict = {}
-    for key, value in list(utils._ANALYSIS_MEMO.items()):
-        if key in before:
-            continue
-        try:
-            blobs[key] = pickle.dumps(value, protocol=pickle.HIGHEST_PROTOCOL)
-        except Exception:  # noqa: BLE001
-            continue
-    return pickle.dumps(blobs, protocol=pickle.HIGHEST_PROTOCOL)
-
-
-def _fork_analysis(path: Path, call: tuple[Callable, tuple, dict]) -> tuple[int, int]:
-    """Start one analysis in a forked worker: (read end of its pipe, pid)."""
-    import warnings
-
-    read_end, write_end = os.pipe()
-    with warnings.catch_warnings():
-        # "This process is multi-threaded, use of fork() may lead to
-        # deadlocks": the threads here (the bar's ticker) hold no lock a
-        # worker takes -- progress hands its write lock over a fork.
-        warnings.simplefilter("ignore", DeprecationWarning)
-        pid = os.fork()
-    if pid == 0:
-        status = 1
-        try:
-            os.close(read_end)
-            pcap_cache.forget_primed()
-            pcap_cache.forget_tees()
-            data = memoryview(_compute_in_child(path, call))
-            while data:
-                data = data[os.write(write_end, data):]
-            status = 0
-        except BaseException:  # noqa: BLE001 - never unwind into the parent's code
-            pass
-        finally:
-            os._exit(status)
-    os.close(write_end)
-    return read_end, pid
-
-
-def _parallel_in_memory(path: Path, plan: Plan, jobs: int) -> int:
-    """The plan over a capture held in memory, ``jobs`` analyses at a time,
-    each in a process forked once every analysis it needs is done: it finds
-    them -- and the packets -- in the memory it shares with this one (no
-    read, no copy of the packets), and sends back only what it computed.
-    The analyses the longest chains wait for start first. Returns how many
-    results came back; what failed or could not be sent stays for the run."""
-    import gc
-    import pickle
-    import selectors
-    import signal
-
-    memo = utils._ANALYSIS_MEMO
-    todo = {i for i, key in enumerate(plan.keys) if key not in memo}
-    if len(todo) < 2:
-        return 0
-    parents: list[list[int]] = [[] for _ in plan.calls]
-    for i, kids in enumerate(plan.children):
-        for kid in kids:
-            parents[kid].append(i)
-    height: dict[int, int] = {}
-
-    def _height(i: int, depth: int = 0) -> int:
-        if i in height:
-            return height[i]
-        if depth > 64:
-            return 0
-        height[i] = 0
-        height[i] = 1 + max((_height(p, depth + 1) for p in parents[i]), default=0)
-        return height[i]
-
-    for i in todo:
-        _height(i)
-    with utils._MEMO_LOCK:
-        utils._ANALYSIS_MEMO_MAX = max(utils._ANALYSIS_MEMO_MAX, len(memo) + 2 * len(plan) + 64)
-    debug = os.environ.get("PCAPPER_SHARED_PASS_DEBUG") == "1"
-    started = time.monotonic()
-    selector = selectors.DefaultSelector()
-    running: dict[int, list] = {}  # pipe -> [pid, plan index, chunks]
-    returned = forked = 0
-    # Frozen: the collector never walks (and so never copies into a worker)
-    # the objects that exist now -- above all the packets.
-    gc.freeze()
-    try:
-        while True:
-            ready = sorted(
-                (i for i in todo if all(plan.keys[k] in memo for k in plan.children[i])),
-                key=lambda i: (-height[i], i),
-            )
-            for i in ready:
-                if len(running) >= jobs:
-                    break
-                todo.discard(i)
-                read_end, pid = _fork_analysis(path, plan.calls[i])
-                forked += 1
-                running[read_end] = [pid, i, []]
-                selector.register(read_end, selectors.EVENT_READ)
-            if not running:
-                break  # all done, or the rest wait for an analysis that failed
-            for selected, _events in selector.select():
-                read_end = selected.fd
-                entry = running[read_end]
-                chunk = os.read(read_end, 1 << 20)
-                if chunk:
-                    entry[2].append(chunk)
-                    continue
-                selector.unregister(read_end)
-                os.close(read_end)
-                del running[read_end]
-                os.waitpid(entry[0], 0)
-                try:
-                    blobs = pickle.loads(b"".join(entry[2])) if entry[2] else {}
-                except Exception:  # noqa: BLE001 - a worker that died mid-write
-                    blobs = {}
-                for key, blob in blobs.items():
-                    if key in memo:
-                        continue
-                    try:
-                        value = pickle.loads(blob)
-                    except Exception:  # noqa: BLE001
-                        continue
-                    utils._memo_store(key, value, False)
-                    returned += 1
-                    progress.subtask_done(module=str(key[0]) if isinstance(key, tuple) and key else "")
-    finally:
-        for read_end, entry in running.items():  # interrupted: stop the rest
-            try:
-                os.kill(entry[0], signal.SIGKILL)
-            except OSError:
-                pass
-            try:
-                os.waitpid(entry[0], 0)
-            except OSError:
-                pass
-            try:
-                os.close(read_end)
-            except OSError:
-                pass
-        selector.close()
-        gc.unfreeze()
     if debug:
         sys.stderr.write(
-            f"[pcapper] --jobs {jobs} (in memory): {forked} analyses in forked workers, "
-            f"{returned} results, {len(todo)} left to the run, {time.monotonic() - started:.1f}s\n"
+            f"[pcapper] --jobs {jobs}{' (in memory)' if in_memory else ''}: {len(remote)} analyses in "
+            f"{len(groups)} processes{' fed a copy of this read' if sinks else ''}, {len(local)} here, "
+            f"{returned} results, {len(left)} left, {time.monotonic() - started:.1f}s\n"
         )
+    if left and not in_memory:  # a worker that failed: its analyses, and what waited for them
+        prefetch(path, left, show_status=show_status)
     return returned
 
 
@@ -1394,7 +1544,7 @@ def _run_in_memory(path: Path, roots: list[tuple[Callable, tuple, dict]]) -> boo
     if jobs < 2 or todo < 2:
         return False
     try:
-        _parallel_in_memory(path, plan, jobs)
+        _run_groups(path, plan, jobs, show_status=False, in_memory=True)
     except Exception as exc:  # noqa: BLE001 - fall back to one process
         sys.stderr.write(f"--jobs: parallel analysis failed ({type(exc).__name__}: {exc}); continuing in one process.\n")
     return True
@@ -1447,7 +1597,7 @@ def run_plan(
     )
     if jobs > 1 and parallel_available() and os.getpid() == _MAIN_PID:
         try:
-            _parallel(path, plan, jobs, show_status)
+            _run_groups(path, plan, jobs, show_status=show_status, in_memory=False)
             return True
         except Exception as exc:  # noqa: BLE001 - fall back to one process
             sys.stderr.write(f"--jobs: parallel analysis failed ({type(exc).__name__}: {exc}); continuing in one process.\n")

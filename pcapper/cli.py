@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import argparse
+import atexit
 import copy
 import dataclasses
 import functools
 import difflib
+import gc
 import glob
 import inspect
 import ipaddress
@@ -2157,9 +2159,11 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
             "identical to a single-process run; what parallelises is the work of a "
             "multi-flag or fan-out run (--threats, --overview, --ot-commands ...). The capture "
             "is still read once: held in memory it is shared with the processes, read from disk "
-            "the main process's read is copied to them. Default: one per "
-            "usable CPU, at most 8, when the run is big enough to gain (packets x analyses "
-            "500,000+), and for a capture in memory no more than half the free memory allows."
+            "the main process's read is copied to them. Each process computes a share of the "
+            "analyses, dependent ones included, and passes its results to the others. Default: "
+            "one per usable CPU, at most 16, when the run is big enough to gain (packets x "
+            "analyses 500,000+), and for a capture in memory no more than half the free memory "
+            "allows."
         ),
     )
     general.add_argument(
@@ -5572,6 +5576,13 @@ def _analyze_paths(
 
 
 def main() -> int:
+    # At exit the interpreter's last collection walks every object still
+    # alive -- millions with a capture's packets in memory: 3.6 s of a run's
+    # end for 250,000 packets, ~16 s with their analyses' results. Frozen,
+    # they are skipped. Handlers run in reverse order: this one after every
+    # clean-up the run registers, before weakref finalizers (temporary
+    # directories), registered earlier.
+    atexit.register(gc.freeze)
     sharedpass.install()
     argv = _normalize_timeline_category_argv(sys.argv[1:])
     plugins_enabled = _plugins_enabled_from_argv(argv)

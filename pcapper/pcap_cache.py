@@ -2933,6 +2933,11 @@ def _iter_raw(
         stream.close()
 
 
+# While a shared pass makes its plan (sharedpass.discover): told, for every
+# read of the capture an analysis starts, whether it reads lite records.
+_READ_NOTE: Optional[object] = None
+
+
 def iter_packets(
     path: Path,
     *,
@@ -2964,6 +2969,9 @@ def iter_packets(
     A shared analysis pass in progress for the capture (see
     :mod:`pcapper.sharedpass`) serves its packets instead of a new read.
     """
+    note = _READ_NOTE
+    if note is not None and packets is None:
+        note(lite)  # a shared pass's plan: what each analysis reads
     if _SHARED_PASS_HOOK is not None:
         shared = _SHARED_PASS_HOOK(path, packets, lite, prefilter, stats)
         if shared is not None:
@@ -3107,6 +3115,11 @@ def install_layer_memo() -> None:
     Packet.getlayer = memo_getlayer  # type: ignore[method-assign]
     Packet.haslayer = memo_haslayer  # type: ignore[method-assign]
     _LAYER_MEMO_INSTALLED = True
+    # Packets dissected from disk records are shared by the analyses of a
+    # shared pass as those held in memory are: they keep their lookups too.
+    from . import lite as lite_module
+
+    lite_module.LAYER_MEMO_KEY = key
 
 
 def clear_forced_packet_view(path: Path) -> None:

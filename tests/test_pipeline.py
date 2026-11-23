@@ -221,17 +221,19 @@ def test_in_memory_jobs_give_the_same_report(tmp_path: Path, monkeypatch: pytest
         pytest.skip("needs fork()")
     path = _mixed(tmp_path)
     single = _run(path, ["--overview", "--jobs", "1"], monkeypatch)
-    forked: list[int] = []
-    real_fork = sharedpass._fork_analysis
+    returned: list[tuple[bool, int]] = []
+    real_groups = sharedpass._run_groups
 
-    def _counting_fork(*args, **kwargs):  # type: ignore[no-untyped-def]
-        forked.append(1)
-        return real_fork(*args, **kwargs)
+    def _counting_groups(*args, **kwargs):  # type: ignore[no-untyped-def]
+        count = real_groups(*args, **kwargs)
+        returned.append((kwargs.get("in_memory"), count))
+        return count
 
-    monkeypatch.setattr(sharedpass, "_fork_analysis", _counting_fork)
+    monkeypatch.setattr(sharedpass, "_run_groups", _counting_groups)
     parallel = _run(path, ["--overview", "--jobs", "4"], monkeypatch)
     assert parallel == single
-    assert len(forked) > 10  # the analyses really ran in workers
+    assert returned and all(in_memory for in_memory, _count in returned)
+    assert sum(count for _in_memory, count in returned) > 10  # the analyses really ran in workers
 
 
 def test_jobs_for_a_capture_in_memory(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -564,6 +566,24 @@ def test_suricata_reads_a_copy_of_the_run_s_read(
     assert set(Path(tempfile.gettempdir()).glob("pcapper-suricata-*")) == workdirs  # FIFO and output removed
 
 
+def _mark_whole_reads(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+    """A file the pid of every process opening a whole read of a capture
+    (pcap_cache.capture_file: a LiteStream's, or feed_tees's for copies) is
+    written to -- forked workers included."""
+    marks = tmp_path / "reads.log"
+    real_capture_file = pcap_cache.capture_file
+
+    def _marking_capture_file(*args, **kwargs):  # type: ignore[no-untyped-def]
+        handle = real_capture_file(*args, **kwargs)
+        if handle is not None:
+            with open(marks, "a") as log:
+                log.write(f"{os.getpid()}\n")
+        return handle
+
+    monkeypatch.setattr(pcap_cache, "capture_file", _marking_capture_file)
+    return marks
+
+
 @pytest.mark.parametrize("mode", ["head", "resume", "copy"])
 def test_disk_jobs_workers_take_the_one_read(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, mode: str) -> None:
     """From disk --jobs workers read no file: they replay the head the
@@ -583,18 +603,12 @@ def test_disk_jobs_workers_take_the_one_read(tmp_path: Path, monkeypatch: pytest
         kwdefaults["max_packets"] = 7  # a head shorter than the capture
         monkeypatch.setattr(port_heuristics.detect_nonstandard_ports, "__kwdefaults__", kwdefaults)
     reference = _run(path, [*flags[:1], "--jobs", "1", *flags[3:]], monkeypatch, PCAPPER_CACHE_ENABLED="0")
-    marks = tmp_path / "reads.log"
-    real_init = LiteStream.__init__
-
-    def _marking_init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-        with open(marks, "a") as handle:  # forked workers write here too
-            handle.write(f"{os.getpid()}\n")
-        real_init(self, *args, **kwargs)
-
-    monkeypatch.setattr(LiteStream, "__init__", _marking_init)
+    marks = _mark_whole_reads(tmp_path, monkeypatch)
     parallel = _run(path, flags, monkeypatch, PCAPPER_CACHE_ENABLED="0")
     assert parallel == reference
-    assert marks.read_text().split() == [str(os.getpid())]  # one read, in this process
+    # One read, in this process: an analysis's (a LiteStream), or with none
+    # left here the one that feeds the workers' copies (feed_tees).
+    assert marks.read_text().split() == [str(os.getpid())]
 
 
 def _pcapng_block(block_type: int, body: bytes) -> bytes:
@@ -882,15 +896,7 @@ def test_split_capture_jobs_workers_take_the_one_read(tmp_path: Path, monkeypatc
         kwdefaults["max_packets"] = 7  # a head that stops inside the first part
         monkeypatch.setattr(port_heuristics.detect_nonstandard_ports, "__kwdefaults__", kwdefaults)
     reference = _run(directory, [*flags[:1], "--jobs", "1", *flags[3:]], monkeypatch, PCAPPER_CACHE_ENABLED="0")
-    marks = tmp_path / "reads.log"
-    real_init = LiteStream.__init__
-
-    def _marking_init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
-        with open(marks, "a") as handle:  # forked workers write here too
-            handle.write(f"{os.getpid()}\n")
-        real_init(self, *args, **kwargs)
-
-    monkeypatch.setattr(LiteStream, "__init__", _marking_init)
+    marks = _mark_whole_reads(tmp_path, monkeypatch)
     parallel = _run(directory, flags, monkeypatch, PCAPPER_CACHE_ENABLED="0")
     assert parallel == reference
     assert set(marks.read_text().split()) == {str(os.getpid())}  # read in this process only

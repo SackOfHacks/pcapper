@@ -82,6 +82,10 @@ _POW = {"us": Decimal(10) ** Decimal(-6), "ns": Decimal(10) ** Decimal(-9)}
 # Serialises on-demand dissection when several threads share one lite packet
 # (the shared analysis pass); scapy itself is not re-entrant per packet.
 _MATERIALIZE_LOCK = threading.Lock()
+# Set by pcap_cache.install_layer_memo(): the key under which a packet keeps
+# its layer lookups. A packet built here is shared by every analysis of a
+# shared pass and never modified, as one held in memory is.
+LAYER_MEMO_KEY: Optional[str] = None
 
 
 def lite_available() -> bool:
@@ -187,6 +191,11 @@ class LitePacket:
             pkt = self._pkt
             if pkt is None:
                 pkt = _build_scapy(self)
+                memo_key = LAYER_MEMO_KEY
+                if memo_key is not None:
+                    store = getattr(pkt, "__dict__", None)
+                    if store is not None:
+                        store[memo_key] = (id(pkt), {})
                 self._pkt = pkt
         return pkt
 

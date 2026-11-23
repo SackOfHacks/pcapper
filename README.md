@@ -4,7 +4,7 @@
 ![CI](https://github.com/SackOfHacks/pcapper/actions/workflows/ci.yml/badge.svg)
 ![Tests](https://img.shields.io/badge/tests-1141%20passing-1B5E20)
 ![Analyzers](https://img.shields.io/badge/analyzers-120%2B-3D5A80)
-![Version](https://img.shields.io/badge/release-v3.0.0-7C3AED)
+![Version](https://img.shields.io/badge/release-v3.0.1-7C3AED)
 ![License](https://img.shields.io/badge/license-MIT-6C757D)
 ![CLI](https://img.shields.io/badge/cli-incident--grade-1B5E20)
 ![OT/ICS](https://img.shields.io/badge/ot%2Fics-ready-3D5A80)
@@ -243,7 +243,7 @@ Wall-clock time:
 
 - **Read once, everywhere:** the hashes and a pcapng's interface details come from the same read; split captures (`X.pcap.part000.pcap` ...) and gzip-compressed captures read once too; so do BPF and time-window filters (tcpdump filters a copy of pcapper's read), baselines, `--correlate`, `--control-loop` and the `--files` extraction options.
 - **External tools can take a copy:** `PCAPPER_SURICATA_FEED=1` feeds Suricata a copy of pcapper's read through a FIFO; this is off by default because a slow feed can cost Suricata alerts. tshark's `--decrypt` stream listing reads a copy through a FIFO. `--decrypt` follows every stream in one tshark run that stops at the last frame it needs: 2N+1 reads became at most 2.
-- **`--jobs N`, automatic by default:** one process per usable CPU (at most 8) when the run is big enough to gain, never more than the plan has analyses, within available memory. In memory the processes share the packets; from disk they are copied the main process's read through pipes -- they read no file, split captures included.
+- **`--jobs N`, automatic by default:** one process per usable CPU (at most 16) when the run is big enough to gain, never more than the plan has analyses, within available memory. In memory the processes share the packets; from disk they are copied the main process's read through pipes -- they read no file, split captures included.
 - **`--split N`** reports N windows of a capture in parallel (what `editcap -c` plus one run per part gives); the walk that finds the windows also computes the hashes.
 - **Lightweight packets and prefiltered reads:** the OT analyzers read records without full scapy dissection and skip packets they can never claim.
 - **Large-capture notice:** above ~1M packets pcapper says how many packets the capture holds, how long one read takes on this machine, and what makes it faster (with `-v`).
@@ -390,9 +390,11 @@ CRIT  Pivot    IT->OT pivot: remote access then OT command  45.137.21.9(1)  10.0
   source) and subsequently issued a Modbus command to 10.0.0.20.   [ATT&CK T0859 / T0855]
 ```
 
-## Current Release: v3.0.0
+## Current Release: v3.0.1
 
-Headline changes in this release:
+v3.0.1 makes `--jobs` use the machine: every analysis -- the heaviest, dependent ones included -- now runs in a worker, which takes the results it needs from the others as they finish. `--overview` of 250,000 packets (maccdc2010) from disk: 212 s → 68 s; held in memory: 132 s → 62 s. Reports are byte-identical. See the [changelog](CHANGELOG.md).
+
+Headline changes in v3.0.0:
 - **One read per run, whatever the flags** -- pcapng, split and gzip captures, filters, and `--decrypt`; Suricata can share the read when `PCAPPER_SURICATA_FEED=1` -- and **automatic `--jobs`** over processes that share it: `--overview` from disk 9.06 reads → 1, 55.8 s → 23.3 s.
 - **Every report rebuilt**: concise by default, complete with `-v`, findings first, top/bottom 10 rankings, one progress bar while it works.
 - **`--dnsqueries`**, gzip-compressed captures read directly, `--split N` parallel windows.
@@ -488,7 +490,7 @@ python -m pcapper "~/Downloads/pcaps/Un*" -summarize --ips
 python -m pcapper one.pcap two.pcapng ~/Downloads/pcaps/ -summarize --timeline -ip 10.182.207.28
 ```
 
-Large captures (millions of packets) are read from disk with lightweight packet parsing in one shared pass, and pcapper says up front how long one full read takes on your machine. The analyses of a multi-flag or fan-out run go to one process per CPU (at most 8; `--jobs N` to choose) with an identical report; `--split N` reports N windows of the capture in parallel:
+Large captures (millions of packets) are read from disk with lightweight packet parsing in one shared pass, and pcapper says up front how long one full read takes on your machine. The analyses of a multi-flag or fan-out run go to one process per CPU (at most 16; `--jobs N` to choose) with an identical report; `--split N` reports N windows of the capture in parallel:
 
 ```bash
 python -m pcapper big_ot_day.pcapng --ot-commands --modbus --dnp3
