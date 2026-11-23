@@ -4,6 +4,27 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## 3.0.1 — 2026-11-23
+
+### `--jobs` uses the machine
+
+An `--overview` of a 10M-packet capture (maccdc2010, 883 MB, from disk) took 80 minutes on a 72-CPU machine with 4 of its CPUs busy: the main process read the capture, fed copies to 3 workers and ran the 16 heaviest analyses itself (hostname, the capture summary, threats, IPs, malware, TLS ...), because they needed other analyses' results; the workers ran at its pace. On a 250,000-packet slice `--jobs 8` and `--jobs 16` gained nothing over the default.
+
+- **Workers take every analysis, dependent ones included.** Each worker computes a share of the plan side by side (in a shared pass from disk, on threads in memory). An analysis needing a result another worker computes runs its own packet loop meanwhile, then waits for the result, which its worker sends up as soon as it is done and the main process passes on to the workers waiting for it. A result that cannot be sent, or a worker that fails, leaves the analysis to be computed where it is needed, as before. From disk only the analyses reporting the capture's hashes stay in the main process, whose read computes them. In memory a dependent analysis no longer waits to be started until everything it needs is done (that chain -- hostname, IPs, malware, threats -- was the run's length).
+- **No deadlock from waiting workers.** A worker whose analyses all wait for others before reading still drains its copy of the capture (one lightweight reader takes the first round), so the main process's read -- and every other worker -- never stalls on it.
+- **Balanced by measured cost.** Workers are grouped by each analysis's measured cost (hostname ~7x a typical analysis) instead of two weights; from disk, analyses that read lightweight records are grouped apart, so their workers never dissect the capture with scapy. The plan's dry run now notes what each analysis reads.
+- **Automatic count: one per usable CPU, at most 16** (was 8); from disk no longer cut to the 3 workers that kept pace with the main process.
+- `--overview`, maccdc2010 slice of 250,000 packets: from disk 212 s → 68 s; in memory 132 s → 62 s (of which 32 s is loading the packets with scapy). Full capture (10M packets, from disk): 80 min → 70.5 min only -- 16 workers busy throughout, each spending about as long as one of the 4 processes did before: on a capture this size a worker's time is dominated by what does not shrink with fewer analyses (dissecting every packet once, and costs that grow faster than the packet count), not by its share of the analyses.
+
+### Faster analysis
+
+- **hostname**: MAC normalisation and address parsing are cached (a capture has few distinct ones), and the CDP check no longer rebuilds every frame without a payload: a dissected layer whose header cannot open the SNAP header cannot hold CDP. 7.1 s → 4.7 s on 50,000 packets.
+- **capture summary** (`analyze_pcap`): looking for interface attributes no longer makes scapy search every layer's fields nine times per packet when no layer has such a field (a Linux cooked v2 capture's `ifindex` still answers); `pkt[TCP]` is looked up once. 3.7 s → 2.4 s on 50,000 packets.
+- **Packets dissected from disk keep their layer lookups** for the analyses sharing them, as packets held in memory already did.
+- **A run no longer pauses at exit**: the interpreter's last garbage collection walked every object still alive -- up to 16 s with 250,000 packets in memory. They are frozen first.
+
+Every change was checked against 3.0.0: reports byte-identical on 32 captures (OT, malware, IT, attack sets; in memory and from disk; `--jobs 4` and automatic -- 128 comparisons), hostname and capture-summary results identical on 22 captures, and the new tests (`tests/test_jobs_groups.py`) pin the group workers, result frames, cost balancing and each fast path.
+
 ## 3.0.0 — 2026-11-20
 
 ### Reports redesigned

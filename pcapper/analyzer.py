@@ -54,9 +54,10 @@ def _layer_names(packet) -> Iterable[str]:
 def _port_protocol_name(pkt) -> str | None:
     if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
         try:
-            sport = int(pkt[TCP].sport)
-            dport = int(pkt[TCP].dport)
-            payload = bytes(getattr(pkt[TCP], "payload", b"") or b"")
+            tcp = pkt[TCP]
+            sport = int(tcp.sport)
+            dport = int(tcp.dport)
+            payload = bytes(getattr(tcp, "payload", b"") or b"")
         except Exception:
             return None
         if is_openvpn_tcp_control(payload):
@@ -66,9 +67,10 @@ def _port_protocol_name(pkt) -> str | None:
         return COMMON_PORTS.get(sport) or COMMON_PORTS.get(dport)
     if UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
         try:
-            sport = int(pkt[UDP].sport)
-            dport = int(pkt[UDP].dport)
-            payload = bytes(getattr(pkt[UDP], "payload", b"") or b"")
+            udp = pkt[UDP]
+            sport = int(udp.sport)
+            dport = int(udp.dport)
+            payload = bytes(getattr(udp, "payload", b"") or b"")
         except Exception:
             return None
         if (sport in {1194, 4433} or dport in {1194, 4433}) and is_openvpn_udp_control(payload):
@@ -84,6 +86,10 @@ def _ethertype_protocol_name(pkt) -> str | None:
     return ETHERTYPE_PROTOCOLS.get(ethertype)
 
 
+def _getattr_or_none(pkt, name: str) -> object:
+    return getattr(pkt, name, None)
+
+
 def _get_iface_name(pkt) -> Optional[str]:
     iface = getattr(pkt, "sniffed_on", None)
     if iface:
@@ -91,26 +97,61 @@ def _get_iface_name(pkt) -> Optional[str]:
     return None
 
 
+_IFACE_ATTRS = ("interface", "iface", "ifname", "if_name", "ifindex", "if_index", "if_id", "ifid")
+_IFACE_LOOKUPS = frozenset((*_IFACE_ATTRS, "metadata"))
+
+
+def _layer_answers(layer) -> bool:
+    """scapy answers getattr() of an interface attribute from this layer: it
+    has a field (or a deprecated alias) of that name -- what
+    Packet.getfield_and_val looks in."""
+    try:
+        if layer.deprecated_fields and not _IFACE_LOOKUPS.isdisjoint(layer.deprecated_fields):
+            return True
+        return not (
+            _IFACE_LOOKUPS.isdisjoint(layer.fields)
+            and _IFACE_LOOKUPS.isdisjoint(layer.overloaded_fields)
+            and _IFACE_LOOKUPS.isdisjoint(layer.default_fields)
+        )
+    except Exception:  # noqa: BLE001 - unknown: look it up the slow way
+        return True
+
+
+def _plain_attr(pkt, name: str) -> object:
+    """getattr(pkt, name, None) without scapy's search of every layer's fields
+    for the name: right when no layer of ``pkt`` has such a field."""
+    try:
+        return object.__getattribute__(pkt, name)
+    except AttributeError:
+        return None
+
+
 def _get_iface_key(pkt) -> Optional[object]:
     iface = _get_iface_name(pkt)
     if iface:
         return iface
 
-    for attr in (
-        "interface",
-        "iface",
-        "ifname",
-        "if_name",
-        "ifindex",
-        "if_index",
-        "if_id",
-        "ifid",
-    ):
-        value = getattr(pkt, attr, None)
+    # A miss walks every layer's fields (scapy's __getattr__) before failing:
+    # nine misses a packet were a third of this analysis. Only a layer with a
+    # field of that name answers, so without one plain attributes do.
+    lookup = _getattr_or_none
+    if getattr(type(pkt), "fields_desc", None) is not None:  # a scapy packet (not a lite record)
+        lookup = _plain_attr
+        layer = pkt
+        while layer is not None and getattr(type(layer), "fields_desc", None) is not None:
+            if _layer_answers(layer):
+                lookup = _getattr_or_none
+                break
+            layer = getattr(layer, "payload", None)
+            if layer is not None and not layer:  # NoPayload: the end of the chain
+                break
+
+    for attr in _IFACE_ATTRS:
+        value = lookup(pkt, attr)
         if value is not None:
             return value
 
-    metadata = getattr(pkt, "metadata", None)
+    metadata = lookup(pkt, "metadata")
     if isinstance(metadata, dict):
         for key in (
             "ifname",
