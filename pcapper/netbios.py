@@ -21,6 +21,7 @@ except ImportError:
     TCP = UDP = Raw = None
     NBNSQueryRequest = NBNSQueryResponse = NBNSNodeStatusResponse = None
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length
 from .utils import is_public_ip as _is_public_ip
@@ -891,7 +892,9 @@ def analyze_netbios(
 
 
     try:
-        for pkt in iter_packets(pcap_path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            pcap_path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             if not pkt:
                 continue
 
@@ -905,6 +908,20 @@ def analyze_netbios(
             if not src_ip or not dst_ip:
                 src_ip = "0.0.0.0"
                 dst_ip = "0.0.0.0"
+
+            if type(pkt) is LitePacket:
+                # Only the NetBIOS ports (udp/137-138, tcp/139) go further: the
+                # ports come from the record's only TCP/UDP header.
+                l4 = pkt.lite_l4()
+                if l4 is None:
+                    continue
+                if l4 is not UNSUPPORTED and not (
+                    (l4[1] == 139 or l4[2] == 139)
+                    if l4[0]
+                    else (l4[1] in (137, 138) or l4[2] in (137, 138))
+                ):
+                    continue
+                pkt = pkt.materialize()
 
             sport = 0
             dport = 0

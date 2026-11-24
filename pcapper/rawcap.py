@@ -441,6 +441,47 @@ class LiteStream:
         self._current = self._first = None
 
 
+def head_quiet_share(path: Path, sample_bytes: int = 256 * 1024) -> Optional[float]:
+    """Share of a capture's first records (those within its first
+    ``sample_bytes``) that lightweight analyses need no dissection for: a
+    TCP/UDP record whose only transport layer carries no payload (Ethernet
+    padding at most) -- most of a scan. None when it cannot tell (a gzip
+    file, an unknown format, no complete record).
+
+    A plain read of the head of the first part, beside the run's own read
+    (which hashes the capture): callers ask only about captures large enough
+    for it to be a small fraction of them."""
+    import io
+
+    from .lite import UNSUPPORTED
+
+    parts = [str(p) for p in capture_parts(path)]
+    if not parts or PcapReader_metaclass is None or _is_gzip(parts[0]):
+        return None
+    try:
+        with open(parts[0], "rb") as handle:
+            head = handle.read(sample_bytes)
+        _name, fdesc, magic = PcapReader_metaclass.open(io.BytesIO(head))
+        reader = (
+            _PcapNgReader(parts[0], fdesc, magic)
+            if bytes(magic) == _PCAPNG_MAGIC
+            else _ClassicReader(parts[0], fdesc, magic)
+        )
+    except Exception:  # noqa: BLE001 - unknown format: no answer
+        return None
+    refresh_bindings()
+    total = quiet = 0
+    try:
+        for record in reader.records(None):
+            total += 1
+            l4 = record.lite_l4()
+            if l4 is not None and l4 is not UNSUPPORTED and l4[5] >= 0 and l4[6] <= l4[5]:
+                quiet += 1
+    except Exception:  # noqa: BLE001 - the sample ends mid-record
+        pass
+    return quiet / total if total else None
+
+
 def iter_lite(path: Path, window: Optional[CaptureWindow] = None) -> Iterator[LitePacket]:
     stream = LiteStream(path, window)
     try:

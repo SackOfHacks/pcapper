@@ -4,7 +4,7 @@
 ![CI](https://github.com/SackOfHacks/pcapper/actions/workflows/ci.yml/badge.svg)
 ![Tests](https://img.shields.io/badge/tests-1141%20passing-1B5E20)
 ![Analyzers](https://img.shields.io/badge/analyzers-120%2B-3D5A80)
-![Version](https://img.shields.io/badge/release-v3.0.1-7C3AED)
+![Version](https://img.shields.io/badge/release-v3.0.2-7C3AED)
 ![License](https://img.shields.io/badge/license-MIT-6C757D)
 ![CLI](https://img.shields.io/badge/cli-incident--grade-1B5E20)
 ![OT/ICS](https://img.shields.io/badge/ot%2Fics-ready-3D5A80)
@@ -390,9 +390,11 @@ CRIT  Pivot    IT->OT pivot: remote access then OT command  45.137.21.9(1)  10.0
   source) and subsequently issued a Modbus command to 10.0.0.20.   [ATT&CK T0859 / T0855]
 ```
 
-## Current Release: v3.0.1
+## Current Release: v3.0.2
 
-v3.0.1 makes `--jobs` use the machine: every analysis -- the heaviest, dependent ones included -- now runs in a worker, which takes the results it needs from the others as they finish. `--overview` of 250,000 packets (maccdc2010) from disk: 212 s → 68 s; held in memory: 132 s → 62 s. Reports are byte-identical. See the [changelog](CHANGELOG.md).
+v3.0.2 makes scan-heavy captures fast: no analysis of `--creds`, `--threats` or `--overview` has scapy dissect every packet any more. Each one skips, from the packet's bytes, the packets its code would do nothing with -- 92% of maccdc2010's packets are scan segments without a payload -- and dissects the rest as before. maccdc2010 (10M packets): `--creds -v` 38.7 min → 6.4 min, `--overview` 69.6 min → 19.0 min. Reports are byte-identical. See the [changelog](CHANGELOG.md).
+
+v3.0.1 made `--jobs` use the machine: every analysis -- the heaviest, dependent ones included -- runs in a worker, which takes the results it needs from the others as they finish. `--overview` of 250,000 packets (maccdc2010) from disk: 212 s → 68 s; held in memory: 132 s → 62 s.
 
 Headline changes in v3.0.0:
 - **One read per run, whatever the flags** -- pcapng, split and gzip captures, filters, and `--decrypt`; Suricata can share the read when `PCAPPER_SURICATA_FEED=1` -- and **automatic `--jobs`** over processes that share it: `--overview` from disk 9.06 reads → 1, 55.8 s → 23.3 s.

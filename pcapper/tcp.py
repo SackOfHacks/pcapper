@@ -8,6 +8,7 @@ from typing import Optional
 
 from .files import analyze_files
 from .http import analyze_http
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import iter_packets
 from .progress import run_with_busy_status
 from .services import analyze_services
@@ -261,6 +262,93 @@ def _build_tcp_enrichment(
         "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
     }
 
+
+def _tcp_fields(pkt: object, tcp_layer: object) -> tuple[int, int, int, int, int, int]:
+    """``(sport, dport, flags, seq, window, payload_len)`` of a dissected
+    packet's TCP layer, ``flags`` as an int."""
+    sport = int(getattr(tcp_layer, "sport", 0))
+    dport = int(getattr(tcp_layer, "dport", 0))
+    flags = getattr(tcp_layer, "flags", 0)
+    flags_val = int(flags)
+    seq = int(getattr(tcp_layer, "seq", 0))
+    window = int(getattr(tcp_layer, "window", 0))
+    # Derive the true TCP segment data length from the IP length fields.
+    # bytes(tcp_layer.payload) is wrong for small frames: scapy attaches
+    # Ethernet padding (frames are padded to the 60-byte minimum) as a
+    # Padding layer under TCP, so a data-less scan packet (NULL/FIN/Xmas/
+    # ACK) reports a non-zero payload and the `payload_len == 0` scan
+    # checks silently never fire. IP header math is immune to padding.
+    payload_len = 0
+    try:
+        ip4 = pkt.getlayer(IP) if IP is not None else None
+        if ip4 is not None and getattr(ip4, "ihl", None):
+            payload_len = max(
+                0,
+                int(getattr(ip4, "len", 0))
+                - int(ip4.ihl) * 4
+                - int(getattr(tcp_layer, "dataofs", 5)) * 4,
+            )
+        else:
+            ip6 = pkt.getlayer(IPv6) if IPv6 is not None else None
+            if ip6 is not None and getattr(ip6, "plen", None) is not None:
+                extension_header_bytes = 0
+                layer = getattr(tcp_layer, "underlayer", None)
+                while layer is not None and layer is not ip6:
+                    payload_layer = getattr(layer, "payload", None)
+                    extension_header_bytes += max(
+                        0,
+                        len(bytes(layer))
+                        - (
+                            len(bytes(payload_layer))
+                            if payload_layer is not None
+                            else 0
+                        ),
+                    )
+                    layer = getattr(layer, "underlayer", None)
+                payload_len = max(
+                    0,
+                    int(ip6.plen)
+                    - extension_header_bytes
+                    - int(getattr(tcp_layer, "dataofs", 5)) * 4,
+                )
+            else:
+                payload_len = len(bytes(tcp_layer.payload))
+    except Exception:
+        try:
+            payload_len = len(bytes(tcp_layer.payload))
+        except Exception:
+            payload_len = 0
+    return sport, dport, flags_val, seq, window, payload_len
+
+
+def _lite_tcp_fields(
+    record: LitePacket, l4: object
+) -> Optional[tuple[int, int, int, int, int, int]]:
+    """``_tcp_fields`` of a record whose first transport layer is TCP, right
+    behind an IPv4 (no options) or IPv6 header (``l4``: its
+    ``lite_ports()``), read from its bytes; None when only scapy can answer
+    (dissect it).
+
+    Only that TCP header and the IP header before it are read -- the payload
+    length comes from the IP header, as there -- and they are what
+    ``getlayer(TCP)``/``getlayer(IP)`` return whatever scapy builds from the
+    payload, so a payload it dissects further (SMB, LDAP, TLS ...) needs no
+    dissection either.
+    """
+    if l4 is UNSUPPORTED or l4 is None or not l4[0]:
+        return None
+    kind, off = record.headers()[1]  # IPv4/IPv6 source address offset
+    data = record.original
+    tcp = off + 8 if kind == 4 else off + 32
+    hlen = (data[tcp + 12] >> 4) * 4
+    if kind == 4:
+        payload_len = max(0, ((data[off - 10] << 8) | data[off - 9]) - 20 - hlen)
+    else:  # IPv6: TCP follows it directly, no extension header between
+        payload_len = max(0, ((data[off - 4] << 8) | data[off - 3]) - hlen)
+    window = (data[tcp + 14] << 8) | data[tcp + 15]
+    return (l4[1], l4[2], l4[4], l4[3], window, payload_len)
+
+
 @memoize_analysis
 def analyze_tcp(
     path: Path,
@@ -379,13 +467,29 @@ def analyze_tcp(
     first_skip_error: str | None = None
     skipped_flows = 0
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    # From disk, lite records: a plain TCP segment's header fields are read
+    # from its bytes (_lite_tcp_fields) and it is never dissected.
+    for pkt in iter_packets(
+        path, packets=packets, meta=meta, show_status=show_status, lite=True
+    ):
         total_packets += 1
         pkt_len = packet_length(pkt)
         total_bytes += pkt_len
-        tcp_layer = pkt.getlayer(TCP) if TCP is not None else None
-        if tcp_layer is None:
-            continue
+        fields = None
+        if type(pkt) is LitePacket:
+            # lite_ports(), not lite_l4(): only the first TCP layer is read
+            # (_lite_tcp_fields). A UDP tuple is still the record's only
+            # transport layer, and None means none at all.
+            l4 = pkt.lite_ports()
+            if l4 is None or (l4 is not UNSUPPORTED and not l4[0]):
+                continue  # no TCP layer anywhere: getlayer(TCP) is None
+            fields = _lite_tcp_fields(pkt, l4)
+            if fields is None:
+                pkt = pkt.materialize()
+        if fields is None:
+            tcp_layer = pkt.getlayer(TCP) if TCP is not None else None
+            if tcp_layer is None:
+                continue
         try:
             ts = safe_float(getattr(pkt, "time", None))
             src_ip, dst_ip = extract_packet_endpoints(pkt)
@@ -398,58 +502,9 @@ def analyze_tcp(
                     first_seen = ts
                 if last_seen is None or ts > last_seen:
                     last_seen = ts
-            sport = int(getattr(tcp_layer, "sport", 0))
-            dport = int(getattr(tcp_layer, "dport", 0))
-            flags = getattr(tcp_layer, "flags", 0)
-            flags_val = int(flags)
-            seq = int(getattr(tcp_layer, "seq", 0))
-            window = int(getattr(tcp_layer, "window", 0))
-            # Derive the true TCP segment data length from the IP length fields.
-            # bytes(tcp_layer.payload) is wrong for small frames: scapy attaches
-            # Ethernet padding (frames are padded to the 60-byte minimum) as a
-            # Padding layer under TCP, so a data-less scan packet (NULL/FIN/Xmas/
-            # ACK) reports a non-zero payload and the `payload_len == 0` scan
-            # checks silently never fire. IP header math is immune to padding.
-            payload_len = 0
-            try:
-                ip4 = pkt.getlayer(IP) if IP is not None else None
-                if ip4 is not None and getattr(ip4, "ihl", None):
-                    payload_len = max(
-                        0,
-                        int(getattr(ip4, "len", 0))
-                        - int(ip4.ihl) * 4
-                        - int(getattr(tcp_layer, "dataofs", 5)) * 4,
-                    )
-                else:
-                    ip6 = pkt.getlayer(IPv6) if IPv6 is not None else None
-                    if ip6 is not None and getattr(ip6, "plen", None) is not None:
-                        extension_header_bytes = 0
-                        layer = getattr(tcp_layer, "underlayer", None)
-                        while layer is not None and layer is not ip6:
-                            payload_layer = getattr(layer, "payload", None)
-                            extension_header_bytes += max(
-                                0,
-                                len(bytes(layer))
-                                - (
-                                    len(bytes(payload_layer))
-                                    if payload_layer is not None
-                                    else 0
-                                ),
-                            )
-                            layer = getattr(layer, "underlayer", None)
-                        payload_len = max(
-                            0,
-                            int(ip6.plen)
-                            - extension_header_bytes
-                            - int(getattr(tcp_layer, "dataofs", 5)) * 4,
-                        )
-                    else:
-                        payload_len = len(bytes(tcp_layer.payload))
-            except Exception:
-                try:
-                    payload_len = len(bytes(tcp_layer.payload))
-                except Exception:
-                    payload_len = 0
+            sport, dport, flags_val, seq, window, payload_len = (
+                fields if fields is not None else _tcp_fields(pkt, tcp_layer)
+            )
 
             is_syn = bool(flags_val & 0x02) and not (flags_val & 0x10)
             is_syn_ack = flags_val & 0x12 == 0x12

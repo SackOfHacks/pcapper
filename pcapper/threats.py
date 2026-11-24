@@ -65,6 +65,7 @@ from .port_heuristics import auto_decode
 from .port_overrides import is_standard as is_standard_port
 from .port_overrides import overrides as port_overrides_for
 from .fifo_feed import FeedRegistry, FifoFeed, can_feed, start_part_feeds
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, capture_hashes, forget_part_hooks, iter_packets
 from .pccc import analyze_pccc
 from .pcworx import analyze_pcworx
@@ -1667,6 +1668,22 @@ def _payload_bytes(pkt) -> bytes:
     return b""
 
 
+def _lite_flow(record: LitePacket) -> Optional[tuple]:
+    """``(is_tcp, sport, dport, flags, payload)`` of a lite record whose only
+    TCP/UDP layer carries a ``Raw`` payload or none, as analyze_threats reads
+    them from scapy: ``payload`` is :func:`_payload_bytes`' answer (the Raw
+    load, else ``bytes(transport.payload)``: the Ethernet padding behind an
+    empty segment, or nothing) and ``flags`` the 9-bit TCP flags as an int
+    (None for UDP). Such a packet has no DNS layer. None when only scapy can
+    tell: no TCP/UDP layer, a payload scapy dissects further, UNSUPPORTED."""
+    l4 = record.lite_l4()
+    if l4 is None or l4 is UNSUPPORTED or l4[5] < 0:
+        return None
+    data = record.original
+    payload = data[l4[5] : l4[6]] if l4[6] > l4[5] else data[l4[7] :]
+    return (l4[0], l4[1], l4[2], l4[4], payload)
+
+
 def _strict_enip_cip_marker(payload: bytes) -> tuple[bool, bool]:
     if len(payload) < 24:
         return False, False
@@ -2973,7 +2990,10 @@ def analyze_threats(
     total_packets = 0
     control_command_total = 0
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    # Read from disk, records come lite: a TCP/UDP segment whose payload scapy
+    # leaves Raw (95% of a scan-heavy capture's packets) is counted from its
+    # bytes, and only the rest is dissected.
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status, lite=True):
         total_packets += 1
 
         ts = safe_float(getattr(pkt, "time", None))
@@ -2987,6 +3007,119 @@ def analyze_threats(
 
         if not src_ip or not dst_ip:
             continue
+
+        if type(pkt) is LitePacket:
+            flow = _lite_flow(pkt)
+            if flow is None:
+                pkt = pkt.materialize()
+            else:
+                # The scapy path's state changes for such a packet, in its
+                # order: one transport layer, no DNS layer, the payload
+                # _payload_bytes reads (tests/test_lite_threats.py).
+                is_tcp, sport, dport, tcp_flags, payload_data = flow
+                counter_inc(src_counts, src_ip)
+                counter_inc(dst_counts, dst_ip)
+
+                pkt_len = packet_length(pkt)
+                if _is_private_ip(src_ip) and _is_public_ip(dst_ip):
+                    outbound_bytes_public[(src_ip, dst_ip)] += pkt_len
+                    setdict_add(outbound_public_dests_by_src, src_ip, dst_ip)
+
+                payload_lower = payload_data.lower() if payload_data else b""
+                if payload_lower:
+                    matched_any = False
+                    for marker_text, marker_bytes in zip(
+                        SUSPICIOUS_PAYLOAD_MARKERS, SUSPICIOUS_PAYLOAD_MARKERS_BYTES
+                    ):
+                        if marker_bytes in payload_lower:
+                            matched_any = True
+                            command_markers[src_ip].add(marker_text)
+                    if matched_any:
+                        counter_inc(suspicious_payload_sources, src_ip)
+
+                ot_match = _ot_proto_for_flow(sport, dport)
+                if ot_match is not None:
+                    proto, _ot_port = ot_match
+                    if _is_public_ip(src_ip) or _is_public_ip(dst_ip):
+                        public_ot_pairs.add((proto, src_ip, dst_ip))
+                        if _is_public_ip(src_ip):
+                            counter_inc(ot_peer_external, src_ip)
+                        if _is_public_ip(dst_ip):
+                            counter_inc(ot_peer_external, dst_ip)
+                    if _is_private_ip(src_ip):
+                        counter_inc(ot_peer_internal, src_ip)
+                    if _is_private_ip(dst_ip):
+                        counter_inc(ot_peer_internal, dst_ip)
+                    counter_inc(loop_ot_protocol_counts, proto)
+
+                    if sport in ENIP_PORTS or dport in ENIP_PORTS:
+                        enip_ok, cip_ok = _strict_enip_cip_marker(payload_data)
+                        if enip_ok:
+                            strict_ot_counts["EtherNet/IP"] += 1
+                            setdict_add(strict_ot_pairs, "EtherNet/IP", (src_ip, dst_ip))
+                        if cip_ok:
+                            strict_ot_counts["CIP"] += 1
+                            setdict_add(strict_ot_pairs, "CIP", (src_ip, dst_ip))
+
+                    if sport == DNP3_PORT or dport == DNP3_PORT:
+                        if _strict_dnp3_marker(payload_data):
+                            strict_ot_counts["DNP3"] += 1
+                            setdict_add(strict_ot_pairs, "DNP3", (src_ip, dst_ip))
+
+                if is_tcp:
+                    # The int flags answer as scapy's FlagValue does (tests).
+                    if _tcp_is_syn(tcp_flags):
+                        if dport:
+                            setdict_add(pair_ports, (src_ip, dst_ip), dport)
+                            setdict_add(src_ports, src_ip, dport)
+                        setdict_add(src_targets, src_ip, dst_ip)
+                        counter_inc(syn_counts, src_ip)
+                        if dport in AUTH_PORTS:
+                            auth_key = (src_ip, dst_ip, AUTH_PORTS[dport])
+                            counter_inc(auth_attempts, auth_key)
+                            if ts is not None:
+                                window = auth_windows.get(auth_key)
+                                auth_windows[auth_key] = (
+                                    (ts, ts)
+                                    if window is None
+                                    else (min(window[0], ts), max(window[1], ts))
+                                )
+
+                    service = AUTH_PORTS.get(dport) or AUTH_PORTS.get(sport)
+                    if (
+                        service
+                        and payload_lower
+                        and any(
+                            pattern in payload_lower
+                            for pattern in FAILED_AUTH_PATTERNS_BYTES
+                        )
+                    ):
+                        if dport in AUTH_PORTS:
+                            counter_inc(auth_failures, (src_ip, dst_ip, service))
+                        elif sport in AUTH_PORTS:
+                            counter_inc(auth_failures, (dst_ip, src_ip, service))
+                        else:
+                            counter_inc(auth_failures, (src_ip, dst_ip, service))
+
+                    lateral_service = LATERAL_PORTS.get(dport)
+                    if (
+                        lateral_service
+                        and _is_private_ip(src_ip)
+                        and _is_private_ip(dst_ip)
+                    ):
+                        setdict_add(lateral_targets, src_ip, dst_ip)
+                        lateral_service_targets[src_ip][lateral_service].add(dst_ip)
+                elif dport:
+                    counter_inc(udp_target_counts, dst_ip)
+                    setdict_add(src_ports, src_ip, dport)
+
+                safety_service = SAFETY_PORTS.get(dport) or SAFETY_PORTS.get(sport)
+                if safety_service:
+                    safety_sources[src_ip] += 1
+                    safety_destinations[dst_ip] += 1
+                    safety_services[safety_service] += 1
+                    safety_pairs.add((src_ip, dst_ip))
+                continue
 
         counter_inc(src_counts, src_ip)
         counter_inc(dst_counts, dst_ip)

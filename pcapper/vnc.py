@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import beacon_score as _beaconing_score
 from .utils import (
@@ -421,10 +422,61 @@ def analyze_vnc(
     pending: dict[tuple, dict] = {}
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
+
+            if type(pkt) is LitePacket:
+                # Read from disk, a segment that is not VNC (yet) only feeds
+                # the pending-flow table: that is done here from the record's
+                # bytes, exactly as the scapy path below does it, and only a
+                # segment that may be VNC is dissected.
+                l4 = pkt.lite_l4()
+                if l4 is None:
+                    continue  # no TCP layer
+                if l4 is not UNSUPPORTED:
+                    if not l4[0]:
+                        continue  # UDP: haslayer(TCP) is false
+                    if l4[5] >= 0:
+                        src_ip, dst_ip = extract_packet_endpoints(pkt)
+                        if not src_ip or not dst_ip:
+                            continue
+                        sport, dport = l4[1], l4[2]
+                        flow = _flow_key(src_ip, sport, dst_ip, dport)
+                        # _tcp_payload_bytes() is a prefix of everything from
+                        # the payload's start (cut to the IP/TCP length): it
+                        # opens with a banner or a hello only if that does.
+                        head = pkt.original[l4[5] : l4[5] + 16]
+                        if sessions.get(flow) is None and not (
+                            dport in VNC_PORTS
+                            or (sport in VNC_PORTS and dport >= _EPHEMERAL_MIN)
+                            or head[:4] == b"RFB "
+                            or ULTRAVNC_ID_RE.match(head) is not None
+                        ):
+                            ts = safe_float(getattr(pkt, "time", None))
+                            state = pending.get(flow)
+                            if state is None:
+                                if len(pending) >= MAX_PENDING_FLOWS:
+                                    pending.clear()
+                                state = pending[flow] = {"packets": Counter(), "bytes": Counter(), "first": ts,
+                                                         "last": ts, "syn": None}
+                            elif state.get("done"):
+                                continue
+                            side = (src_ip, sport)
+                            state["packets"][side] += 1
+                            state["bytes"][side] += pkt_len
+                            if ts is not None:
+                                state["first"] = ts if state["first"] is None else min(state["first"], ts)
+                                state["last"] = ts if state["last"] is None else max(state["last"], ts)
+                            if l4[4] & 0x02 and not l4[4] & 0x10:  # SYN without ACK
+                                state["syn"] = side
+                            if sum(state["packets"].values()) > PENDING_FLOW_PACKETS:
+                                pending[flow] = {"done": True}
+                            continue
+                pkt = pkt.materialize()
 
             if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
                 continue

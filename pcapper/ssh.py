@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 
 from .device_detection import device_fingerprints_from_text
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length, extract_ascii_strings as _extract_ascii_strings
 from .utils import beacon_score as _beaconing_score
@@ -1073,6 +1074,36 @@ def _find_decrypted_payload(
     return None, None
 
 
+def _meta_decrypted(meta: object | None) -> object | None:
+    """The decrypted-payload table :func:`_find_decrypted_payload` reads from
+    ``meta`` (any packet index may have an entry)."""
+    if meta is None:
+        return None
+    if isinstance(meta, dict):
+        return meta.get("ssh_decrypted") or meta.get("ssh_decrypted_packets")
+    return getattr(meta, "ssh_decrypted", None) or getattr(meta, "ssh_decrypted_packets", None)
+
+
+def _lite_not_ssh(record: LitePacket) -> bool:
+    """True when the record is certainly not SSH, read from its bytes: no TCP
+    layer, or a segment off the SSH ports whose first 32 payload bytes (the
+    padding behind a short payload included, as the scapy path reads them)
+    hold no ``SSH-``. Valid only when no decrypted payload can apply: a lite
+    record has no ``pcapper_ssh_decrypted`` attribute of its own."""
+    l4 = record.lite_l4()
+    if l4 is None:
+        return True
+    if l4 is UNSUPPORTED:
+        return False
+    if not l4[0]:
+        return True  # UDP only
+    if l4[1] in SSH_PORTS or l4[2] in SSH_PORTS:
+        return False
+    if l4[5] < 0:
+        return False  # scapy dissects the payload further: let it decide
+    return b"SSH-" not in record.original[l4[7] : l4[7] + 32]
+
+
 def _scan_algorithms(text: str, counters: dict[str, Counter[str]]) -> None:
     if not text:
         return
@@ -1275,11 +1306,26 @@ def analyze_ssh(
     skipped_packets = 0
     first_skip_error: Optional[str] = None
     session_limit_reported = False
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    # Records read from disk are dissected only when they may be SSH: by
+    # port or banner, unless a decrypted payload may apply to any packet.
+    try:
+        lite_skips = not decrypted_payloads and not isinstance(
+            _meta_decrypted(meta), (dict, list)
+        )
+    except Exception:  # noqa: BLE001 - let the scapy path meet it, per packet
+        lite_skips = False
+    for pkt in iter_packets(
+        path, packets=packets, meta=meta, show_status=show_status, lite=True
+    ):
         pkt_index += 1
         total_packets += 1
         pkt_len = packet_length(pkt)
         total_bytes += pkt_len
+
+        if type(pkt) is LitePacket:
+            if lite_skips and _lite_not_ssh(pkt):
+                continue
+            pkt = pkt.materialize()
 
         tcp = pkt.getlayer(TCP) if TCP is not None else None
         if tcp is None:

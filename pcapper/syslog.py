@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
@@ -266,6 +267,25 @@ class SyslogSummary:
         }
 
 
+def _lite_not_syslog(record: LitePacket) -> bool:
+    """True when the packet loop certainly drops the record, read from its
+    bytes: no TCP/UDP layer, or one off the syslog ports whose payload does
+    not open with a PRI. That payload -- ``bytes(pkt[Raw])``, else
+    ``bytes(transport.payload)`` -- runs from the payload's start on into any
+    Ethernet padding either way. Anything else is decided by the scapy path."""
+    l4 = record.lite_l4()
+    if l4 is None:
+        return True
+    if l4 is UNSUPPORTED:
+        return False
+    sport, dport = l4[1], l4[2]
+    if dport in SYSLOG_PORTS or (sport in SYSLOG_PORTS and dport >= 1024):
+        return False
+    if l4[5] < 0:
+        return False  # scapy dissects the payload further: let it decide
+    return not _PRI_RE.match(record.original[l4[5] :])
+
+
 def is_text_message(message: str) -> bool:
     """True when ``message`` reads as text: at least 85% printable ASCII
     (tabs and line breaks included, trailing NULs ignored)."""
@@ -422,7 +442,9 @@ def analyze_syslog(
     message_cache: set[str] = set()
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
@@ -430,6 +452,11 @@ def analyze_syslog(
             src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
+
+            if type(pkt) is LitePacket:
+                if _lite_not_syslog(pkt):
+                    continue
+                pkt = pkt.materialize()
 
             proto = None
             sport = 0

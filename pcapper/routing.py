@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, is_public_ip, memoize_analysis, safe_float
 
@@ -961,6 +962,31 @@ def _parse_hsrp(payload: bytes) -> dict[str, object]:
     }
 
 
+def _lite_not_routing(record: LitePacket) -> bool:
+    """True when the loop below provably records nothing for the record,
+    read from its bytes: an IPv4/IPv6 packet whose protocol number is none it
+    counts, with its only TCP/UDP header off the routing ports, or (IPv4) no
+    TCP/UDP layer and no ICMP redirect. Nothing scapy could dissect sits
+    below such a header (no ICMP, LLC or Ethernet layer), and an Ethernet
+    type that led to IP is not IS-IS's. Non-IP frames (IS-IS), ARP, IPv6
+    without TCP/UDP and whatever the parser cannot read are dissected."""
+    l4 = record.lite_l4()
+    l3 = record.headers()[1]
+    if l4 is UNSUPPORTED or l3 is None or l3 is UNSUPPORTED or l3[0] == 1:
+        return False
+    data, off = record.original, l3[1]
+    proto = data[off - 3] if l3[0] == 4 else data[off - 2]  # IPv4 proto / IPv6 nh
+    if proto in ROUTING_IP_PROTOS or proto in _ROUTING_IGP_PROTOS:
+        return False
+    if l4 is None:
+        # The ICMP type byte sits right after the 20-byte IPv4 header.
+        return l3[0] == 4 and not (proto == 1 and data[off + 8 : off + 9] == b"\x05")
+    sport, dport = l4[1], l4[2]
+    if l4[0]:
+        return not (dport in ROUTING_PORTS or (sport in ROUTING_PORTS and dport >= 1024))
+    return not (sport in ROUTING_PORTS or dport in ROUTING_PORTS)
+
+
 @memoize_analysis
 def analyze_routing(
     path: Path,
@@ -1112,8 +1138,17 @@ def analyze_routing(
             session["details"] = detail
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             total_packets += 1
+            if type(pkt) is LitePacket:
+                # Routing traffic is told by IP protocol numbers, ports, ICMP
+                # redirects and non-IP frames: an ordinary TCP/UDP/ICMP record
+                # is decided from its bytes and never dissected.
+                if _lite_not_routing(pkt):
+                    continue
+                pkt = pkt.materialize()
             ts = safe_float(getattr(pkt, "time", None))
 
             src_ip, dst_ip = extract_packet_endpoints(pkt)

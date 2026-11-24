@@ -11,6 +11,7 @@ from typing import Optional
 from .certificates import CertificateInfo, analyze_certificates, is_weak_pubkey
 from .dns import _vt_lookup_domains, vt_lookup_candidate
 from .http import analyze_http
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import iter_packets
 from .progress import run_with_busy_status
 from .tls_fingerprints import (
@@ -1178,10 +1179,31 @@ def analyze_tls(
 
     skipped_packets = 0
     first_skip_error: str | None = None
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    for pkt in iter_packets(
+        path, packets=packets, meta=meta, show_status=show_status, lite=True
+    ):
         total_packets += 1
         if TCP is None:
             continue
+        if type(pkt) is LitePacket:
+            # Only a TCP segment whose payload scapy dissects further or
+            # opens like a TLS/SSLv2 record goes further: decided from the
+            # record's bytes, the rest is never dissected.
+            l4 = pkt.lite_l4()
+            if l4 is None:
+                continue  # no TCP layer
+            if l4 is not UNSUPPORTED:
+                if not l4[0]:
+                    continue  # UDP: getlayer(TCP) finds nothing
+                if l4[5] >= 0:
+                    # No TLS layer; bytes(tcp.payload) is the payload and any
+                    # padding behind it.
+                    payload = pkt.original[l4[7] :]
+                    if not _looks_like_tls_record(payload) and not _looks_like_ssl2_record(
+                        payload
+                    ):
+                        continue
+            pkt = pkt.materialize()
         tcp_layer = pkt.getlayer(TCP)  # type: ignore[arg-type]
         if tcp_layer is None:
             continue

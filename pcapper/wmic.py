@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import domain_user_pairs, extract_packet_endpoints, memoize_analysis, safe_float
 
@@ -31,6 +32,14 @@ WMI_PORTS = {135, 445, 5985, 5986}
 WMI_HINT_RE = re.compile(
     r"(\bwmic\b|\bwmiexec\b|win32_|cim_|root\\cimv2|root\\subscription|wbem|iwbem)",
     re.IGNORECASE,
+)
+# Every WMI_HINT_RE alternative contains one of these words. The strings it is
+# matched against are printable-ASCII runs of the payload, as bytes or as
+# UTF-16LE (each character followed by a NUL), so a payload that holds none of
+# them, either way and in any case, matches nothing.
+_WMI_HINT_WORDS = (b"wmi", b"win32_", b"cim_", b"root\\", b"wbem")
+_WMI_HINT_NEEDLES = _WMI_HINT_WORDS + tuple(
+    b"\x00".join(word[i : i + 1] for i in range(len(word))) for word in _WMI_HINT_WORDS
 )
 
 WMIC_COMMAND_RE = re.compile(r"\bwmic\b[^\r\n]{0,240}", re.IGNORECASE)
@@ -262,6 +271,25 @@ def _extract_utf16le_strings(
     return extract_utf16le_strings(data, min_len, max_len, aligned=False)
 
 
+def _lite_not_wmic(record: LitePacket) -> bool:
+    """True when the scapy path certainly drops the record, read from its
+    bytes: no TCP layer, or a payload that holds no WMI hint word (empty
+    included). The payload is ``bytes(Raw)``, or ``bytes(tcp.payload)``
+    without a Raw layer: both are everything from the payload's start,
+    Ethernet padding included."""
+    l4 = record.lite_l4()
+    if l4 is None:
+        return True
+    if l4 is UNSUPPORTED:
+        return False
+    if not l4[0]:
+        return True  # UDP only
+    if l4[5] < 0:
+        return False  # scapy dissects the payload further: let it decide
+    payload = record.original[l4[5] :].lower()
+    return not any(needle in payload for needle in _WMI_HINT_NEEDLES)
+
+
 def _direction(
     src_ip: str, dst_ip: str, sport: int, dport: int
 ) -> tuple[str, str, int, int]:
@@ -377,10 +405,17 @@ def analyze_wmic(
     node_targets: dict[str, set[str]] = defaultdict(set)
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
+
+            if type(pkt) is LitePacket:
+                if _lite_not_wmic(pkt):
+                    continue
+                pkt = pkt.materialize()
 
             if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
                 continue

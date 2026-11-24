@@ -19,6 +19,7 @@ from urllib.parse import urlparse
 
 from .device_detection import append_device_fingerprints, device_fingerprints_from_text
 from .dns import vt_lookup_candidate
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import (
     counter_inc,
@@ -642,7 +643,12 @@ def analyze_http(
     hostname_query: str | None = None,
     port_filter: int | None = None,
     search_query: str | None = None,
+    discover_files: bool = True,
 ) -> HttpSummary:
+    """``discover_files=False`` skips the file analysis that replaces the
+    file transfers seen packet by packet with the reassembled ones (and the
+    suspicious-file and masquerading evidence drawn from them): for callers
+    that read only the requests and URLs."""
     errors: list[str] = []
     if IP is None and IPv6 is None:
         errors.append("Scapy IP layers unavailable; install scapy for HTTP analysis.")
@@ -796,7 +802,8 @@ def analyze_http(
     first_skip_error: str | None = None
 
     for pkt_index, pkt in enumerate(
-        iter_packets(path, packets=packets, meta=meta, show_status=show_status), start=1
+        iter_packets(path, packets=packets, meta=meta, show_status=show_status, lite=True),
+        start=1,
     ):
         total_packets += 1
         pkt_len = packet_length(pkt)
@@ -804,6 +811,22 @@ def analyze_http(
 
         if TCP is None or Raw is None:
             continue
+        if type(pkt) is LitePacket:
+            # Only a TCP segment whose payload opens like HTTP goes further:
+            # decided from the record's bytes, the rest is never dissected.
+            l4 = pkt.lite_l4()
+            if l4 is None:
+                continue  # no TCP layer
+            if l4 is not UNSUPPORTED:
+                if not l4[0]:
+                    continue  # UDP: getlayer(TCP) finds nothing
+                if l4[5] >= 0 and (
+                    l4[6] <= l4[5]  # empty segment: no Raw layer
+                    # bytes(Raw)[:64]: the payload, then any padding behind it
+                    or not _HTTP_START_RE.match(pkt.original[l4[5] : l4[5] + 64])
+                ):
+                    continue
+            pkt = pkt.materialize()
         tcp_layer = pkt.getlayer(TCP)  # type: ignore[arg-type]
         if tcp_layer is None:
             continue
@@ -1562,8 +1585,10 @@ def analyze_http(
     try:
         from .files import analyze_files
 
-        dpkt_summary = analyze_files(
-            path, show_status=False, packets=packets, meta=meta
+        dpkt_summary = (
+            analyze_files(path, show_status=False, packets=packets, meta=meta)
+            if discover_files
+            else None
         )
     except Exception as exc:
         dpkt_summary = None

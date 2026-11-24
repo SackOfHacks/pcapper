@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 from .dns import analyze_dns
 from .ldap_ber import iter_ldap_messages
 from .files import analyze_files
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .progress import run_with_busy_status
 from .utils import counter_inc, decode_payload, extract_packet_endpoints, memoize_analysis, safe_float, set_add_cap
@@ -49,6 +50,29 @@ def _ldap_roles(
     if sport in LDAP_PORTS and dport >= _EPHEMERAL_MIN:
         return dst_ip, src_ip, sport
     return None
+
+
+# A TCP payload opening like one of these is read as an HTTP request, on any port.
+_HTTP_REQUEST_STARTS = (b"GET ", b"POST ", b"HEAD ", b"PUT ", b"DELETE ")
+
+
+def _lite_not_ldap(record: LitePacket, src_ip: str, dst_ip: str) -> bool:
+    """True when the packet loop certainly does nothing with the record, read
+    from its bytes: no TCP/UDP layer, or one off the LDAP ports -- UDP, or
+    TCP whose payload (``bytes(tcp.payload)``: from the start of the payload
+    scapy leaves as Raw on into any Ethernet padding) does not open an HTTP
+    request. Anything else is decided by the scapy path."""
+    l4 = record.lite_l4()
+    if l4 is None:
+        return True
+    if l4 is UNSUPPORTED or _ldap_roles(src_ip, dst_ip, l4[1], l4[2]) is not None:
+        return False
+    if not l4[0]:
+        return True
+    if l4[5] < 0:
+        return False  # scapy dissects the payload further: let it decide
+    return not record.original.startswith(_HTTP_REQUEST_STARTS, l4[7])
+
 
 LDAP_DNS_HINTS = ("_ldap._tcp", "_gc._tcp", "_msdcs")
 
@@ -330,13 +354,18 @@ def analyze_ldap(
         if last_seen is None or ts > last_seen:
             last_seen = ts
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status, lite=True):
         total_packets += 1
         ts = safe_float(getattr(pkt, "time", None))
         src_ip, dst_ip = extract_packet_endpoints(pkt)
 
         if not src_ip or not dst_ip:
             continue
+
+        if type(pkt) is LitePacket:
+            if _lite_not_ldap(pkt, src_ip, dst_ip):
+                continue
+            pkt = pkt.materialize()
 
         if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
             tcp_layer = pkt[TCP]  # type: ignore[index]
@@ -362,9 +391,7 @@ def analyze_ldap(
                     counter_inc(public_endpoints, dst_ip)
 
             payload = bytes(getattr(tcp_layer, "payload", b""))
-            if payload and payload.startswith(
-                (b"GET ", b"POST ", b"HEAD ", b"PUT ", b"DELETE ")
-            ):
+            if payload and payload.startswith(_HTTP_REQUEST_STARTS):
                 url, ua, method = _parse_http_request(payload)
                 if url:
                     counter_inc(urls, url)

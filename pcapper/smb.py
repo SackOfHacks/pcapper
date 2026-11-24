@@ -15,6 +15,7 @@ except ImportError:
     TCP = Raw = None
     Packet = object
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import (
     counter_inc,
@@ -1719,8 +1720,29 @@ def analyze_smb(
     skipped_packets = 0
     first_skip_error: Optional[str] = None
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    for pkt in iter_packets(
+        path, packets=packets, meta=meta, show_status=show_status, lite=True
+    ):
         total_packets += 1
+        if type(pkt) is LitePacket:
+            # Only TCP segments on the SMB ports, or whose payload looks like
+            # SMB, go further: decided from the record's bytes.
+            l4 = pkt.lite_l4()
+            if l4 is None:
+                continue  # no TCP layer
+            if l4 is not UNSUPPORTED:
+                if not l4[0]:
+                    continue  # UDP: getlayer(TCP) finds nothing
+                if (
+                    l4[5] >= 0
+                    and l4[1] not in (445, 139)
+                    and l4[2] not in (445, 139)
+                    # bytes(Raw), or bytes(tcp.payload) without one: the
+                    # payload and the padding behind it (empty: not SMB)
+                    and not _looks_like_smb(pkt.original[l4[5] :])
+                ):
+                    continue
+            pkt = pkt.materialize()
         tcp_layer = pkt.getlayer(TCP)
         if tcp_layer is None:
             continue

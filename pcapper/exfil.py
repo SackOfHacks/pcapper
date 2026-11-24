@@ -9,6 +9,7 @@ from typing import Optional
 from .dns import analyze_dns
 from .files import analyze_files
 from .http import analyze_http
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import iter_packets
 from .progress import run_with_busy_status
 from .utils import (
@@ -261,7 +262,9 @@ def analyze_exfil(
     skipped_packets = 0
     first_skip_error: str | None = None
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    # Read from disk, records come lite: what is read of a TCP/UDP packet (most
+    # of a large capture) is in its bytes; the rest is dissected.
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status, lite=True):
         total_packets += 1
         pkt_len = packet_length(pkt)
         total_bytes += pkt_len
@@ -275,6 +278,103 @@ def analyze_exfil(
             # Private -> public is the exfil direction every check below keys on;
             # decide it once (both helpers are cached).
             outbound = bool(src_ip and dst_ip and is_private_ip(src_ip) and is_public_ip(dst_ip))
+
+            if type(pkt) is LitePacket:
+                # The record's only TCP/UDP header gives the ports. Dissected:
+                # what the parser cannot answer, a packet with neither header
+                # leaving the network (the ICMP check), a UDP payload scapy
+                # dissects (the DNS check) and a TCP one the WebSocket check
+                # reads. A Raw payload holds no DNS layer.
+                l4 = pkt.lite_l4()
+                want_payload = outbound and len(websocket_handshakes) < _MAX_WEBSOCKET_HANDSHAKES
+                if (
+                    l4 is UNSUPPORTED
+                    or (l4 is None and outbound)
+                    or (l4 is not None and l4[5] < 0 and (not l4[0] or want_payload))
+                ):
+                    pkt = pkt.materialize()
+                else:
+                    # The scapy path below, step for step, on the record's bytes.
+                    tcp_seen = False
+                    if l4 is not None:
+                        proto = "TCP" if l4[0] else "UDP"
+                        src_port = l4[1]
+                        dst_port = l4[2]
+                        tcp_seen = l4[0]
+                    if tcp_seen and want_payload:
+                        # bytes(tcp_layer.payload): the record from the payload's
+                        # start on (Ethernet padding included)
+                        payload = pkt.original[l4[7] :]
+                        if payload:
+                            marker = payload[:2048].decode("latin-1", errors="ignore").lower()
+                            if "upgrade: websocket" in marker or "sec-websocket-key" in marker:
+                                websocket_handshakes.append(
+                                    {
+                                        "src": src_ip,
+                                        "dst": dst_ip,
+                                        "dst_port": dst_port,
+                                        "bytes": pkt_len,
+                                        "marker": "upgrade"
+                                        if "upgrade: websocket" in marker
+                                        else "sec-websocket-key",
+                                    }
+                                )
+
+                    if outbound:
+                        if src_port == 123 or dst_port == 123:
+                            ntp_outbound_packets += 1
+                            ntp_outbound_bytes += pkt_len
+                            ntp_dst_counts[dst_ip] += pkt_len
+
+                    if src_ip and dst_ip and ts is not None:
+                        if first_seen is None or ts < first_seen:
+                            first_seen = ts
+                        if last_seen is None or ts > last_seen:
+                            last_seen = ts
+
+                    if not src_ip or not dst_ip:
+                        continue
+
+                    if outbound:
+                        flow_key = (src_ip, dst_ip, proto, dst_port)
+                        outbound_bytes += pkt_len
+                        outbound_flow_bytes[flow_key] += pkt_len
+                        outbound_flow_packets[flow_key] += 1
+                        if ts is not None:
+                            if flow_key not in outbound_flow_first:
+                                outbound_flow_first[flow_key] = ts
+                            outbound_flow_last[flow_key] = ts
+                        external_dsts[dst_ip] += pkt_len
+                        if dst_port is not None and dst_port > 0:
+                            outbound_port_bytes[(proto, dst_port)] += pkt_len
+
+                    if is_private_ip(src_ip) and is_private_ip(dst_ip):
+                        flow_key = (src_ip, dst_ip, proto, dst_port)
+                        internal_flow_bytes[flow_key] += pkt_len
+                        internal_flow_packets[flow_key] += 1
+                        if ts is not None:
+                            if flow_key not in internal_flow_first:
+                                internal_flow_first[flow_key] = ts
+                            internal_flow_last[flow_key] = ts
+
+                    ot_port = None
+                    if src_port in OT_PORTS:
+                        ot_port = src_port
+                    elif dst_port in OT_PORTS:
+                        ot_port = dst_port
+                    if ot_port:
+                        flow_key = (src_ip, dst_ip, proto, ot_port)
+                        ot_flow_bytes[flow_key] += pkt_len
+                        ot_flow_packets[flow_key] += 1
+                        if ts is not None:
+                            if flow_key not in ot_flow_first:
+                                ot_flow_first[flow_key] = ts
+                            ot_flow_last[flow_key] = ts
+
+                    if dst_port in REMOTE_MGMT_PORTS or src_port in REMOTE_MGMT_PORTS:
+                        flow_key = (src_ip, dst_ip, proto, dst_port or src_port)
+                        remote_mgmt_bytes[flow_key] += pkt_len
+                    continue
 
             tcp_layer = pkt.getlayer(TCP) if TCP is not None else None
             udp_layer = None

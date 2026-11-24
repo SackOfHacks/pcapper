@@ -14,6 +14,7 @@ try:
 except ImportError:
     TCP = UDP = Raw = None
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 from .utils import is_public_ip as _is_public_ip
@@ -393,6 +394,26 @@ def _extract_http_ntlm(payload: bytes) -> Optional[bytes]:
     return None
 
 
+def _lite_not_ntlm(record: LitePacket) -> bool:
+    """True when the packet loop certainly finds no NTLM message in the
+    record, read from its bytes. Both things it looks for spell "ntlm" in
+    some case -- the NTLMSSP signature, and the scheme of an HTTP auth header
+    (``_extract_http_ntlm``) -- so a payload without it holds neither. The
+    payload searched is ``bytes(transport.payload)``: from the start of the
+    payload scapy leaves as Raw on into any Ethernet padding. An ARP frame
+    has nothing to search (no TCP/UDP, and scapy makes what follows the ARP
+    header Padding, never Raw). Anything else -- a payload scapy dissects
+    further, another frame with no TCP/UDP whose Raw layer only scapy can
+    place -- is decided by the scapy path."""
+    l4 = record.lite_l4()
+    if l4 is None:
+        l3 = record.headers()[1]
+        return l3 is not None and l3 is not UNSUPPORTED and l3[0] == 1
+    if l4 is UNSUPPORTED or l4[5] < 0:
+        return False
+    return b"ntlm" not in record.original[l4[7] :].lower()
+
+
 def _parse_http_status(payload: bytes) -> Optional[str]:
     if not payload.startswith(b"HTTP/"):
         return None
@@ -546,9 +567,15 @@ def analyze_ntlm(
     last_time = None
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             total_packets += 1
             ts = safe_float(getattr(pkt, "time", 0))
+            if type(pkt) is LitePacket:
+                if _lite_not_ntlm(pkt):
+                    continue
+                pkt = pkt.materialize()
 
             # Look for the NTLMSSP signature in the L4 payload. Using the TCP/UDP
             # payload (not just pkt[Raw]) is essential: when NTLM rides a carrier

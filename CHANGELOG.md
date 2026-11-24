@@ -4,6 +4,49 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## 3.0.2 — 2026-11-24
+
+### Scan-heavy captures: `--creds` and the analyses it starts dissect only what they read
+
+`pcapper maccdc2010_00000_20100310205651.pcap --creds -v` (10M packets, 925 MB) took 38.7 minutes. 92% of that capture's packets are TCP segments without a payload (scan traffic), and every one was dissected with scapy (about 120 µs each on this machine) by analyses that drop it on the next line: creds, the HTTP analysis it calls for request URLs, telnet, and -- under HTTP -- the file, NFS and AIM analyses. The machine's memory was never the limit.
+
+- **creds, HTTP, telnet, NFS and AIM read lightweight records** (as the OT analyses do). Ports, endpoints and a `Raw` payload come from the record's bytes. A record each analysis would drop is dropped without scapy: no TCP/UDP layer, an empty segment, off its ports, or a payload that does not open like its protocol. Every other record is dissected and takes the unchanged path. creds reads the payload and the Ethernet padding behind it, as `bytes(pkt[Raw])` gives them; telnet checks its option bytes on that longer view, so it keeps any segment the padding-stripped payload could start with.
+- **creds no longer starts the file analysis.** It calls HTTP only for request URLs, and that call now skips HTTP's file discovery (`analyze_http(..., discover_files=False)`). In a profile of creds over 250,000 packets, file discovery took 31 of 54 s.
+- **creds skips payloads that are NUL bytes only**, the padding behind 6.2M of the capture's 10M packets. Scanned, they give no hit, no error and no SMTP AUTH LOGIN state change. This was checked over every port pair the scan tells apart (117 ports, TCP and UDP, 1–64 bytes, 1.75M payloads) and with padding at every position of an AUTH LOGIN exchange.
+- **A run whose analyses all read lightweight records streams a scan-heavy capture from disk** instead of loading every packet with scapy first, even when it fits in memory. On a 250,000-packet `--creds` run that load took about 70% of the time. (Which captures count as scan-heavy: see the next section.)
+- **Automatic `--jobs` spreads plans of two analyses or more** (was four). In one process, analyses share one interpreter lock. `--creds` of 1M packets: 38 s in one process, 24.5 s in three; of 250,000, 6.7 s and 5.8 s.
+
+| `--creds -v`, maccdc2010 | Before | Now |
+|---|---|---|
+| 250,000 packets, in memory (default) | 47.6 s | 5.8 s |
+| 250,000 packets, from disk | 40.2 s | 5.7 s |
+| 1M packets (from disk) | 191 s | 24.5 s |
+| 10M packets, full capture | 2,321 s (38.7 min) | 384 s (6.4 min) |
+
+With `-v`, the large-capture notice no longer reads as a forecast of the run for such a plan: "Dissecting it once would take ~17 min on this machine (~118 µs/packet); this run's analyses dissect only the packets they look at." Scapy's dissection warnings (`Unknown cipher suite … from ClientMasterKey`) now print in a different order, once per process that dissects the packet. `--creds -v` no longer prints the cryptography deprecation warnings that the file analysis's certificate parsing raised.
+
+Reports are byte-identical to before. Checked over 113 captures (IT, OT, malware, VLAN, IPv6, Linux cooked, pcapng) × `--creds`, `--http`, `--telnet`, `--nfs`, `--aim`, `--files`, `--creds --http`, `--dns --http` and `--threats`, in memory and from disk (2,034 comparisons); 168 OT captures from 68 datasets × five OT flag combinations that now stream instead of loading (840); and the full capture. `tests/test_lite_it_paths.py` pins each analysis from disk against the same analysis over scapy packets, on edge-case frames (non-zero padding, VLAN, IPv6, IP options, telnet options on another port, NFS over TCP and UDP, AIM on 443, SNMP, ICMP with a payload, STP over LLC/SNAP). Deliberately breaking the creds or telnet fast path fails it.
+
+### `--threats` and `--overview`: every analysis reads lightweight records
+
+The same treatment for every analysis `--threats` and `--overview` start that still had scapy dissect every packet: 43 of them -- the capture summary and protocol hierarchy, scans, TCP and UDP statistics, IPs, hosts and services, beaconing, exfiltration, routing, ICMP, ARP, DNS, DHCP, NetBIOS, LDAP, Kerberos, NTLM, SNMP, syslog, SMB, RDP, WinRM, WMI, PowerShell, DCE/RPC, VNC, remote access, TLS, certificates, QUIC, encrypted DNS, VPN, SSH, FTP, e-mail, malware, obfuscation, carving, CTF, VoIP, host names and the threats loop itself. Neither run dissects every packet of a capture any more.
+
+- **Each skips a packet only where its original code provably does nothing with it** (no TCP/UDP layer, off its ports, no payload, a payload without the bytes it looks for -- checked on the same bytes, Ethernet padding included where the original reads it), and dissects every other packet into its unchanged scapy code. The analyses that count every packet (summary, protocol hierarchy, scans, TCP/UDP, IPs, beaconing, exfiltration, services, threats, host names) read the fields they count -- addresses, MACs, ports, TCP flags and sequence numbers, IP lengths, TTLs, VLAN ids, layer names -- from the header bytes for plain Ethernet/IP/TCP/UDP packets, and leave the rest to scapy. Where a skip rests on a claim about payloads (a NUL-only payload holds no host name, no credential), the claim was checked exhaustively over every port the analysis tells apart.
+- **A TCP segment scapy cannot parse is left to scapy.** scapy keeps a segment whose TCP-AO option (kind 29) has a one-byte value as Raw -- the packet has no TCP layer -- and the lightweight parser now says so (it answered as for a TCP header before, in every lightweight analysis).
+- **Streamed or loaded, by what the capture holds.** When every analysis reads lightweight records, a capture of 8 MiB or more whose first 256 KiB of records are 60% or more payload-less packets (a scan) is streamed even when it fits in memory; a capture whose packets mostly carry data is loaded, as before -- streaming it dissected its packets once per `--jobs` worker, and in one process handed every record to a hundred analyses (a 3,400-packet Dridex capture's `--overview`: 27.3 s streamed, 8.6 s loaded). `PCAPPER_LITE_STREAM=1` always streams such a run, `=0` never does.
+
+| maccdc2010, default (automatic `--jobs`) | Before | Now |
+|---|---|---|
+| 250,000 packets, `--overview` | 63.1 s | 17.2 s |
+| 250,000 packets, `--threats` | 59.8 s | 14.6 s |
+| 1M packets, `--overview` | 265.2 s | 73.4 s |
+| 1M packets, `--threats` | 258.1 s | 65.0 s |
+| 10M packets (full capture), `--overview` | 69.6 min | 19.0 min |
+
+Captures whose packets mostly carry data run as before: NM_2015-08-23 (20k packets) `--overview` 10.5 s / 10.5 s, `--threats` 9.4 s / 9.5 s; wannacry-20170516 `--overview` 7.3 s / 7.1 s; a Dridex infection capture `--overview` 8.7 s / 8.7 s. An OT capture of 379k Modbus packets (cic-modbus-2023, 80% of its first records payload-less) is streamed: `--overview` about 12 minutes before, 10.5 now.
+
+Reports are byte-identical to before. Checked old tree against new, byte for byte: 41 flag sets (every analysis changed, `-v`) over 113 IT/OT/malware captures, plus captures picked for each protocol from a port index of 1,600 corpus captures and the 250,000-packet scan, in memory and from disk -- 10,388 comparisons; `--threats -v` and `--overview -v` over the same captures and OT flag combinations over 56 OT captures, both modes -- 792; every flag again in memory under the final stream-or-load rule -- 4,859; and `--overview` of the full capture. Each analysis has a test comparing it from disk with the same analysis over scapy packets on edge-case frames (`tests/test_lite_*.py`), and the tests were checked to fail when a skip is deliberately broken.
+
 ## 3.0.1 — 2026-11-23
 
 ### `--jobs` uses the machine

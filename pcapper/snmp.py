@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .device_detection import device_fingerprints_from_text
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import iter_packets
 from .utils import (
     beacon_score,
@@ -458,10 +459,20 @@ def analyze_snmp(
             seen_device_artifacts.add(key)
             _artifact("device", detail, src, dst)
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status, lite=True):
         total_packets += 1
         pkt_len = packet_length(pkt)
         total_bytes += pkt_len
+
+        if type(pkt) is LitePacket:
+            # Only SNMP-port traffic goes further: the ports come from the
+            # record's only TCP/UDP header, the rest is never dissected.
+            l4 = pkt.lite_l4()
+            if l4 is None:
+                continue
+            if l4 is not UNSUPPORTED and l4[1] not in SNMP_PORTS and l4[2] not in SNMP_PORTS:
+                continue
+            pkt = pkt.materialize()
 
         transport = pkt.getlayer(UDP) if UDP is not None else None
         proto = "UDP"

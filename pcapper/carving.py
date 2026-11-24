@@ -6,6 +6,7 @@ from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .reassembly import Reassembly, reassemble
 from .utils import (
@@ -162,6 +163,27 @@ def _reassemble(segments: list[tuple[int, bytes]], max_bytes: int) -> Reassembly
     with an authoritative SHA-256.
     """
     return reassemble(segments, max_bytes, fill_gaps=True)
+
+
+def _lite_segment(record: LitePacket) -> object:
+    """What the carving loop reads from a lite record, from its bytes:
+    ``(sport, dport, seq, load)`` of its TCP segment; None when the loop finds
+    nothing to carve in it (no TCP layer, or a segment without a ``Raw``
+    payload: the Ethernet padding behind an empty one is scapy's ``Padding``,
+    which ``getlayer(Raw)`` does not match); UNSUPPORTED when only scapy can
+    tell."""
+    l4 = record.lite_l4()
+    if l4 is None:
+        return None
+    if l4 is UNSUPPORTED:
+        return UNSUPPORTED
+    if not l4[0]:
+        return None  # UDP only: getlayer(TCP) finds nothing
+    if l4[5] < 0:
+        return UNSUPPORTED  # scapy dissects the payload further: let it answer
+    if l4[6] <= l4[5]:
+        return None  # an empty segment: no Raw layer
+    return (l4[1], l4[2], l4[3], record.original[l4[5] : l4[6]])
 
 
 def _sanitize_name(value: str) -> str:
@@ -329,35 +351,57 @@ def analyze_carving(
     errors: list[str] = []
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
-            tcp = pkt.getlayer(TCP)  # type: ignore[arg-type]
-            if tcp is None:
-                continue
-            src_ip, dst_ip = extract_packet_endpoints(pkt)
-            if not src_ip or not dst_ip:
-                continue
+        # Read from disk, records come lite: a segment's ports, sequence
+        # number and payload are read from its bytes, and a record with
+        # nothing to carve is never dissected.
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
+            segment = None
+            if type(pkt) is LitePacket:
+                segment = _lite_segment(pkt)
+                if segment is None:
+                    continue
+                if segment is UNSUPPORTED:
+                    segment = None
+                    pkt = pkt.materialize()
+            if segment is not None:
+                src_ip, dst_ip = extract_packet_endpoints(pkt)
+                if not src_ip or not dst_ip:
+                    continue
+                sport, dport, seq, payload = segment
+                if sport == 0 or dport == 0:
+                    continue
+            else:
+                tcp = pkt.getlayer(TCP)  # type: ignore[arg-type]
+                if tcp is None:
+                    continue
+                src_ip, dst_ip = extract_packet_endpoints(pkt)
+                if not src_ip or not dst_ip:
+                    continue
 
-            sport = int(getattr(tcp, "sport", 0) or 0)
-            dport = int(getattr(tcp, "dport", 0) or 0)
-            if sport == 0 or dport == 0:
-                continue
+                sport = int(getattr(tcp, "sport", 0) or 0)
+                dport = int(getattr(tcp, "dport", 0) or 0)
+                if sport == 0 or dport == 0:
+                    continue
 
-            # Only the Raw layer is application data. A segment without one
-            # is a pure ACK/control packet; falling back to bytes(tcp.payload)
-            # pulled scapy's Ethernet Padding into the stream and carved it.
-            raw = tcp.getlayer(Raw) if Raw is not None else None
-            if raw is None:
-                continue
-            try:
-                payload = bytes(raw.load)
-            except Exception:
-                continue
-            if not payload:
-                continue
+                # Only the Raw layer is application data. A segment without one
+                # is a pure ACK/control packet; falling back to bytes(tcp.payload)
+                # pulled scapy's Ethernet Padding into the stream and carved it.
+                raw = tcp.getlayer(Raw) if Raw is not None else None
+                if raw is None:
+                    continue
+                try:
+                    payload = bytes(raw.load)
+                except Exception:
+                    continue
+                if not payload:
+                    continue
 
             stream_key = _canonical_key(src_ip, dst_ip, sport, dport)
             stream_stats[stream_key] += 1
-            seq = int(getattr(tcp, "seq", 0) or 0)
+            if segment is None:
+                seq = int(getattr(tcp, "seq", 0) or 0)
             if (src_ip, sport, dst_ip, dport) == stream_key:
                 current = segments_ab_bytes[stream_key]
                 if current < stream_max_bytes:

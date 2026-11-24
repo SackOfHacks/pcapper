@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .quic import _looks_like_quic
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float
@@ -112,6 +113,31 @@ def _resolver_roles(
     return None
 
 
+def _lite_not_encrypted_dns(record: LitePacket, src_ip: str, dst_ip: str) -> bool:
+    """True when the loop of :func:`analyze_encrypted_dns` records nothing
+    for ``record`` (whose endpoints it already has), read from its bytes: no
+    TCP/UDP layer, a TCP segment without a ``Raw`` layer or whose load is
+    neither DoT on 853 nor a DoH request, a UDP datagram that is not QUIC on
+    853. A payload scapy dissects further is left to scapy."""
+    l4 = record.lite_l4()
+    if l4 is None:
+        return True
+    if l4 is UNSUPPORTED or l4[5] < 0:
+        return False
+    is_tcp, sport, dport, pstart, pend = l4[0], l4[1], l4[2], l4[5], l4[6]
+    data = record.original
+    if is_tcp:
+        if pend <= pstart:
+            return True  # pkt.getlayer(Raw) is None: Padding is not Raw
+        load = data[pstart:pend]
+        if _resolver_roles(src_ip, dst_ip, sport, dport, DOT_PORT) is not None:
+            return not _is_tls_record(load)
+        return not _is_doh_request(load)
+    # bytes(udp.payload): the payload and any padding behind it
+    roles = _resolver_roles(src_ip, dst_ip, sport, dport, DOQ_PORT)
+    return roles is None or not _looks_like_quic(data[l4[7] :])
+
+
 @memoize_analysis
 def analyze_encrypted_dns(
     path: Path,
@@ -142,11 +168,17 @@ def analyze_encrypted_dns(
             if last_seen is None or ts > last_seen:
                 last_seen = ts
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    for pkt in iter_packets(
+        path, packets=packets, meta=meta, show_status=show_status, lite=True
+    ):
         total_packets += 1
         src_ip, dst_ip = extract_packet_endpoints(pkt)
         if not src_ip or not dst_ip:
             continue
+        if type(pkt) is LitePacket:
+            if _lite_not_encrypted_dns(pkt, src_ip, dst_ip):
+                continue
+            pkt = pkt.materialize()
 
         tcp = pkt.getlayer(TCP) if TCP is not None else None  # type: ignore[arg-type]
         if tcp is not None:

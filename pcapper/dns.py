@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable, Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .progress import build_statusbar
 from .utils import (
@@ -718,7 +719,15 @@ def analyze_dns(
     skipped_packets = 0
     first_skip_error: str | None = None
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status, lite=True):
+        if type(pkt) is LitePacket:
+            # scapy builds DNS and LLMNR layers only under TCP/UDP, on the
+            # ports it binds them to: a record with no TCP/UDP layer, or whose
+            # only one carries a Raw payload (or none), holds neither.
+            l4 = pkt.lite_l4()
+            if l4 is None or (l4 is not UNSUPPORTED and l4[5] >= 0):
+                continue
+            pkt = pkt.materialize()
         dns_layer = dns_message(pkt)  # DNS, or LLMNR (a separate scapy layer)
         if dns_layer is None:
             continue

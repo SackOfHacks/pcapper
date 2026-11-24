@@ -10,6 +10,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import domain_user_pairs, extract_packet_endpoints, memoize_analysis, safe_float
 
@@ -137,6 +138,21 @@ SUSPICIOUS_PATTERNS = [
 # Whether any string matches any of the patterns, in one search per string
 # (eight per string was 5.3M searches in a --threats run).
 _SUSPICIOUS_ANY = re.compile("|".join(f"(?:{p.pattern})" for p, _label in SUSPICIOUS_PATTERNS), re.IGNORECASE)
+
+# Off the PowerShell ports a packet scores 2 (and so is counted) only when a
+# string matches POWERSHELL_HINT_RE, or PS_WINRM_RE and _SUSPICIOUS_ANY both
+# (PS_COMMAND_RE matches only where POWERSHELL_HINT_RE does). Every alternative
+# of those two patterns contains one of these words, and the strings are
+# printable-ASCII runs of the payload, as bytes or as UTF-16LE (each character
+# followed by a NUL): a payload that holds none of them, either way and in any
+# case, scores at most 1.
+_PS_SCORE_WORDS = (
+    b"power", b"pwsh", b"system.management.automation",
+    b"winrm", b"wsman", b"wsmv", b"schemas",
+)
+_PS_SCORE_NEEDLES = _PS_SCORE_WORDS + tuple(
+    b"\x00".join(word[i : i + 1] for i in range(len(word))) for word in _PS_SCORE_WORDS
+)
 
 
 @dataclass(frozen=True)
@@ -286,6 +302,31 @@ def _extract_utf16le_strings(
     return extract_utf16le_strings(data, min_len, max_len)
 
 
+def _lite_not_powershell(record: LitePacket) -> bool:
+    """True when the scapy path certainly drops the record without counting
+    it, read from its bytes: no TCP layer, an empty payload, or a segment off
+    the PowerShell ports whose payload holds none of the words a score of 2
+    needs. The payload is ``bytes(Raw)``, or ``bytes(tcp.payload)`` without a
+    Raw layer: both are everything from the payload's start, Ethernet padding
+    included."""
+    l4 = record.lite_l4()
+    if l4 is None:
+        return True
+    if l4 is UNSUPPORTED:
+        return False
+    if not l4[0]:
+        return True  # UDP only
+    if l4[5] < 0:
+        return False  # scapy dissects the payload further: let it decide
+    payload = record.original[l4[5] :]
+    if not payload:
+        return True
+    if l4[1] in POWERSHELL_PORTS or l4[2] in POWERSHELL_PORTS:
+        return False
+    payload = payload.lower()
+    return not any(needle in payload for needle in _PS_SCORE_NEEDLES)
+
+
 def _direction(
     src_ip: str, dst_ip: str, sport: int, dport: int
 ) -> tuple[str, str, int, int]:
@@ -417,10 +458,17 @@ def analyze_powershell(
     client_targets: dict[str, set[str]] = defaultdict(set)
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
+
+            if type(pkt) is LitePacket:
+                if _lite_not_powershell(pkt):
+                    continue
+                pkt = pkt.materialize()
 
             if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
                 continue

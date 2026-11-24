@@ -8,6 +8,7 @@ from typing import Optional
 
 from .files import analyze_files
 from .http import analyze_http
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import iter_packets
 from .progress import run_with_busy_status
 from .services import analyze_services
@@ -252,6 +253,43 @@ def _build_udp_enrichment(detections: list[dict[str, object]]) -> dict[str, obje
         "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
     }
 
+
+def _udp_fields(udp_layer: object) -> tuple[int, int, int]:
+    """``(sport, dport, payload_len)`` of a dissected packet's UDP layer."""
+    sport = int(getattr(udp_layer, "sport", 0))
+    dport = int(getattr(udp_layer, "dport", 0))
+    # Use the UDP header length field (datagram len - 8B header) rather
+    # than len(bytes(udp.payload)): scapy folds Ethernet padding into the
+    # payload on sub-60-byte frames, which inflated byte counts and made
+    # the empty-payload (payload_len==0) check never match.
+    payload_len = 0
+    try:
+        udp_len = int(getattr(udp_layer, "len", 0) or 0)
+        if udp_len >= 8:
+            payload_len = udp_len - 8
+        else:
+            payload_len = len(bytes(udp_layer.payload))
+    except Exception:
+        payload_len = 0
+    return sport, dport, payload_len
+
+
+def _lite_udp_fields(
+    record: LitePacket, l4: object
+) -> Optional[tuple[int, int, int]]:
+    """``_udp_fields`` of a record whose only transport layer is UDP with a
+    ``Raw`` payload (or none, so no DNS layer either), read from its bytes;
+    None when only scapy can answer (dissect it).
+    """
+    if l4 is UNSUPPORTED or l4[5] < 0:
+        return None  # scapy dissects the payload further (DNS, NTP ...)
+    data = record.original
+    udp_len = (data[l4[7] - 4] << 8) | data[l4[7] - 3]  # UDP header: body - 8
+    if udp_len < 8:
+        return None  # payload length taken from the payload layer: ask scapy
+    return (l4[1], l4[2], udp_len - 8)
+
+
 @memoize_analysis
 def analyze_udp(
     path: Path,
@@ -358,13 +396,27 @@ def analyze_udp(
     first_skip_error: str | None = None
     skipped_flows = 0
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    # From disk, lite records: a UDP datagram with a Raw payload is read
+    # from its bytes (_lite_udp_fields) and never dissected.
+    for pkt in iter_packets(
+        path, packets=packets, meta=meta, show_status=show_status, lite=True
+    ):
         total_packets += 1
         pkt_len = packet_length(pkt)
         total_bytes += pkt_len
-        udp_layer = pkt.getlayer(UDP) if UDP is not None else None
-        if udp_layer is None:
-            continue
+        fields = None
+        udp_layer = None
+        if type(pkt) is LitePacket:
+            l4 = pkt.lite_l4()
+            if l4 is None or (l4 is not UNSUPPORTED and l4[0]):
+                continue  # no UDP layer anywhere: getlayer(UDP) is None
+            fields = _lite_udp_fields(pkt, l4)
+            if fields is None:
+                pkt = pkt.materialize()
+        if fields is None:
+            udp_layer = pkt.getlayer(UDP) if UDP is not None else None
+            if udp_layer is None:
+                continue
         try:
             ts = safe_float(getattr(pkt, "time", None))
             src_ip, dst_ip = extract_packet_endpoints(pkt)
@@ -377,8 +429,9 @@ def analyze_udp(
                     first_seen = ts
                 if last_seen is None or ts > last_seen:
                     last_seen = ts
-            sport = int(getattr(udp_layer, "sport", 0))
-            dport = int(getattr(udp_layer, "dport", 0))
+            sport, dport, payload_len = (
+                fields if fields is not None else _udp_fields(udp_layer)
+            )
             convo_key = (src_ip or "-", dst_ip or "-", sport, dport)
             if convo_key not in conversations and len(conversations) >= MAX_UDP_FLOWS:
                 skipped_flows += 1
@@ -419,19 +472,6 @@ def analyze_udp(
                 if convo["last_seen"] is None or ts > convo["last_seen"]:
                     convo["last_seen"] = ts
 
-            # Use the UDP header length field (datagram len - 8B header) rather
-            # than len(bytes(udp.payload)): scapy folds Ethernet padding into the
-            # payload on sub-60-byte frames, which inflated byte counts and made
-            # the empty-payload (payload_len==0) check never match.
-            payload_len = 0
-            try:
-                udp_len = int(getattr(udp_layer, "len", 0) or 0)
-                if udp_len >= 8:
-                    payload_len = udp_len - 8
-                else:
-                    payload_len = len(bytes(udp_layer.payload))
-            except Exception:
-                payload_len = 0
             udp_payload_bytes += payload_len
             packet_size_hist[_bucketize(pkt_len)] += 1
             payload_size_hist[_bucketize(payload_len)] += 1
@@ -470,7 +510,12 @@ def analyze_udp(
                     server_port = sport
                     amp_flows[(client, server, server_port)]["server"] += payload_len
 
-            dns_layer = udp_layer.getlayer(DNS) if DNS is not None else None
+            # A lite record here has a Raw payload or none: no DNS layer.
+            dns_layer = (
+                udp_layer.getlayer(DNS)
+                if DNS is not None and udp_layer is not None
+                else None
+            )
             if dns_layer is not None and getattr(dns_layer, "qr", 0) == 0:
                 questions = dns_questions(dns_layer)
                 qname = questions[0][0] if questions else None

@@ -9,14 +9,16 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 try:
+    from scapy.fields import FlagValue
     from scapy.layers.dns import DNS
     from scapy.layers.inet import ICMP, IP, TCP, UDP
     from scapy.layers.inet6 import IPv6
     from scapy.layers.l2 import ARP, Ether
     from scapy.packet import Raw
 except ImportError:
-    IP = TCP = UDP = Ether = IPv6 = ARP = ICMP = DNS = Raw = None
+    IP = TCP = UDP = Ether = IPv6 = ARP = ICMP = DNS = Raw = FlagValue = None
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .openvpn import openvpn_tcp_session_start, openvpn_udp_control_opcodes
 from .utils import extract_packet_endpoints, memoize_analysis, packet_length, safe_float
@@ -671,6 +673,56 @@ def _tcp_payload_bytes(ip_layer: object, tcp_layer: object) -> bytes:
     return payload[:length]
 
 
+# The names scapy's TCP flags field hands its FlagValue: a lite record's flags
+# int becomes the value ``tcp.flags`` gives (tests/test_lite_services.py).
+_TCP_FLAG_NAMES = (
+    next(fld.names for fld in TCP.fields_desc if fld.name == "flags") if TCP is not None else None
+)
+
+
+def _lite_l4(record: LitePacket) -> object:
+    """How the loop below reads a lite record: None when it has no TCP/UDP
+    layer (nothing is recorded for it); its only TCP/UDP header when that
+    carries a ``Raw`` payload or none, so every field the loop reads comes
+    from the bytes; UNSUPPORTED when scapy must dissect it -- a payload scapy
+    dissects further, what the parser cannot read, and ICMPv6, whose ND
+    options can carry a whole packet scapy finds TCP/UDP/IP layers in."""
+    l4 = record.lite_l4()
+    if l4 is None:
+        l3 = record.headers()[1]
+        if l3 is not None and l3 is not UNSUPPORTED and l3[0] == 6:
+            if record.original[l3[1] - 2] == 58:  # next header: ICMPv6
+                return UNSUPPORTED
+        return None
+    if l4 is UNSUPPORTED or l4[5] < 0:
+        return UNSUPPORTED
+    return l4
+
+
+def _lite_tcp_payload(record: LitePacket, l4: tuple) -> bytes:
+    """``_tcp_payload_bytes`` of a TCP record from ``_lite_l4``, from its
+    bytes: ``bytes(tcp.payload)`` is everything from the payload's start (the
+    Ethernet padding included), cut to the length the headers give. scapy's
+    IHL is 5 there (the parser reads IPv4 without options only), and a
+    payload layer below holds no ``plen``/``ihl`` field for its walk to find."""
+    data = record.original
+    kind, off = record.headers()[1]  # off: the source address
+    body = l4[7]
+    if kind == 4:
+        start = off - 12
+        tcp_hlen = body - (start + 20)
+        total = (data[start + 2] << 8) | data[start + 3]
+        if total > 0:
+            return data[body : body + max(0, total - 20 - tcp_hlen)]
+    else:
+        start = off - 8
+        tcp_hlen = body - (start + 40)
+        plen = (data[start + 4] << 8) | data[start + 5]
+        if plen > 0:
+            return data[body : body + max(0, plen - tcp_hlen)]
+    return data[body:]
+
+
 def _canonical_tcp_pair(
     src_ip: str,
     src_port: int,
@@ -764,12 +816,30 @@ def analyze_services(
     seen_tcp_flows: Dict[Tuple[str, int, str, int], Dict[str, object]] = {}
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        # Read from disk, records come lite: every TCP/UDP packet is counted,
+        # but a plain TCP/UDP record (most of a scan-heavy capture) is read
+        # from its bytes and one without a TCP/UDP layer is never dissected.
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
+            # The record's only TCP/UDP header when its bytes answer every
+            # field read below; None when scapy answers (a packet held in
+            # memory, or a record dissected here).
+            l4 = None
+            if type(pkt) is LitePacket:
+                l4 = _lite_l4(pkt)
+                if l4 is None:
+                    continue  # no TCP/UDP layer: nothing below records it
+                if l4 is UNSUPPORTED:
+                    l4 = None
+                    pkt = pkt.materialize()
             ts = safe_float(getattr(pkt, "time", 0))
             src, dst = extract_packet_endpoints(pkt, include_arp=False)
             if not src or not dst:
                 continue
-            if IP in pkt:
+            if l4 is not None:
+                pass  # under the IPv4/IPv6 header the record's bytes hold
+            elif IP in pkt:
                 ip_layer = pkt[IP]
             elif IPv6 in pkt:
                 ip_layer = pkt[IPv6]
@@ -779,11 +849,15 @@ def analyze_services(
             pkt_len = packet_length(pkt)
 
             # TCP
-            if TCP in pkt:
-                tcp = pkt[TCP]
-                sport = int(getattr(tcp, "sport", 0) or 0)
-                dport = int(getattr(tcp, "dport", 0) or 0)
-                flags = tcp.flags
+            if l4[0] if l4 is not None else TCP in pkt:
+                if l4 is not None:
+                    sport, dport = l4[1], l4[2]
+                    flags = FlagValue(l4[4], _TCP_FLAG_NAMES)
+                else:
+                    tcp = pkt[TCP]
+                    sport = int(getattr(tcp, "sport", 0) or 0)
+                    dport = int(getattr(tcp, "dport", 0) or 0)
+                    flags = tcp.flags
 
                 flow_key = (src, dst, sport, dport)
                 reverse_key = (dst, src, dport, sport)
@@ -809,7 +883,11 @@ def analyze_services(
                 else:
                     flow_stats["packets_ba"] = int(flow_stats["packets_ba"]) + 1
                     flow_stats["bytes_ba"] = int(flow_stats["bytes_ba"]) + pkt_len
-                payload = _tcp_payload_bytes(ip_layer, tcp)
+                payload = (
+                    _lite_tcp_payload(pkt, l4)
+                    if l4 is not None
+                    else _tcp_payload_bytes(ip_layer, tcp)
+                )
                 payload_len = len(payload)
                 if src_is_left:
                     flow_stats["payload_bytes_ab"] = (
@@ -911,14 +989,19 @@ def analyze_services(
             # is a service" misclassifies the querying client as an NTP server.
             # Use the protocol payload to recover direction: NTP's mode field is
             # 3 for a client request and 4/5 for a server/broadcast response.
-            elif UDP in pkt:
-                udp = pkt[UDP]
-                sport = udp.sport
-                dport = udp.dport
-                try:
-                    udp_payload = bytes(udp.payload)
-                except Exception:
-                    udp_payload = b""
+            elif l4 is not None or UDP in pkt:
+                if l4 is not None:
+                    sport, dport = l4[1], l4[2]
+                    # bytes(udp.payload): the payload and any padding behind it
+                    udp_payload = pkt.original[l4[7] :]
+                else:
+                    udp = pkt[UDP]
+                    sport = udp.sport
+                    dport = udp.dport
+                    try:
+                        udp_payload = bytes(udp.payload)
+                    except Exception:
+                        udp_payload = b""
                 udp_openvpn = (
                     sport in {1194, 4433} or dport in {1194, 4433}
                 ) and bool(openvpn_udp_control_opcodes(udp_payload))

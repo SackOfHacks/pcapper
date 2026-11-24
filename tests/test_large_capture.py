@@ -578,6 +578,13 @@ def test_large_capture_note(tmp_path: Path, monkeypatch: pytest.MonkeyPatch, cap
     cli._note_large_capture(path, jobs=8, multi_analyzer=True)
     err = capsys.readouterr().err
     assert "processes" not in err and "Too large" not in err
+    # One dissection's time is what the run costs -- unless its analyses all
+    # read lightweight records, which dissect only the packets they look at.
+    assert "Dissecting it once takes" in err
+    cli._note_large_capture(path, jobs=1, multi_analyzer=True, lite_only=True)
+    err = capsys.readouterr().err
+    assert "Dissecting it once would take" in err
+    assert "this run's analyses dissect only the packets they look at." in err
 
 
 def test_jobs_default_is_automatic(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:

@@ -7,18 +7,41 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .capture_parts import capture_size
+from .lite import _ETHER_NEXT, _VLAN_NEXT, UNSUPPORTED, LitePacket, _ether_next, _vlan_next
 from .pcap_cache import PcapMeta, capture_hashes, iter_packets, load_capture_meta
 
 try:
     from scapy.layers.inet import IP, TCP, UDP  # type: ignore
     from scapy.layers.inet6 import IPv6  # type: ignore
-    from scapy.layers.l2 import Dot1Q, Ether  # type: ignore
+    from scapy.layers.l2 import Dot1AD, Dot1Q, Ether  # type: ignore
     from scapy.packet import Raw  # type: ignore
 except Exception:  # pragma: no cover
-    Dot1Q = None  # type: ignore
+    Dot1Q = Dot1AD = None  # type: ignore
     TCP = UDP = None  # type: ignore
     IP = IPv6 = Raw = None  # type: ignore
     Ether = None  # type: ignore
+
+try:
+    from scapy.config import conf  # type: ignore
+    from scapy.layers.inet6 import IPv46  # type: ignore
+    from scapy.layers.l2 import CookedLinux, CookedLinuxV2, Loopback, LoopbackOpenBSD  # type: ignore
+
+    # Link types besides Ethernet the lite parser reads past: the class
+    # scapy's reader builds for a record, the length of that header, and the
+    # layer it is (raw IP: none -- IPv46 picks IP or IPv6 by the version).
+    _LINK_LAYERS: dict = {
+        0: (Loopback, 4, Loopback),
+        108: (LoopbackOpenBSD, 4, LoopbackOpenBSD),
+        113: (CookedLinux, 16, CookedLinux),
+        276: (CookedLinuxV2, 20, CookedLinuxV2),
+        12: (IPv46, 0, None),
+        101: (IPv46, 0, None),
+        228: (IP, 0, None),
+        229: (IPv6, 0, None),
+    }
+except Exception:  # pragma: no cover - older scapy: Ethernet records only
+    conf = CookedLinuxV2 = None  # type: ignore
+    _LINK_LAYERS = {}
 
 from .models import InterfaceStat, PcapSummary
 from .openvpn import is_openvpn_tcp_control, is_openvpn_udp_control
@@ -84,6 +107,107 @@ def _ethertype_protocol_name(pkt) -> str | None:
     if ethertype is None:
         return None
     return ETHERTYPE_PROTOCOLS.get(ethertype)
+
+
+# --- Lite records -------------------------------------------------------------
+# Read from disk, most packets of a large capture are plain TCP/UDP: for those
+# the layers scapy would build follow from the header bytes, and the summary
+# is taken from the record without dissecting it.
+
+
+def _lite_layer_chain(record: LitePacket) -> Optional[tuple]:
+    """``(classes, l4, l3_offset)`` when scapy provably dissects ``record`` as
+    a link layer (Ether and any 802.1Q or 802.1ad tags, a Linux cooked or BSD
+    loopback header, or none for raw IP) / IPv4 without options or IPv6
+    without extension headers / its only TCP or UDP layer, then nothing but a
+    ``Raw`` payload (present iff ``l4[6] > l4[5]``) and ``Padding``:
+    ``classes`` are the layer classes up to the transport, ``l4`` is
+    ``record.lite_l4()`` and ``l3_offset`` where the IP header starts. None
+    when only scapy can tell.
+
+    The classes come from the lookups the lite parser made to reach the same
+    headers, and must land where it found the IP source address."""
+    if Ether is None:
+        return None
+    l4 = record.lite_l4()
+    if l4 is None or l4 is UNSUPPORTED or l4[5] < 0:
+        return None
+    l3 = record.headers()[1]
+    data = record.original
+    linktype = record.linktype
+    if linktype == 1:
+        etype = (data[12] << 8) | data[13]
+        cls = _ETHER_NEXT.get(etype) or _ether_next(etype)
+        classes = [Ether]
+        off = 14
+        while cls is Dot1Q or cls is Dot1AD:
+            if len(data) < off + 4:
+                return None
+            classes.append(cls)
+            vtype = (data[off + 2] << 8) | data[off + 3]
+            key = vtype | (0x10000 if cls is Dot1AD else 0)
+            cls = _VLAN_NEXT.get(key) or _vlan_next(cls, vtype, key)
+            off += 4
+    else:
+        link = _LINK_LAYERS.get(linktype)
+        if link is None or conf.l2types.num2layer.get(linktype) is not link[0]:
+            return None
+        classes = [] if link[2] is None else [link[2]]
+        off = link[1]
+        # The lite parser reads IP/IPv6 only where that class sits.
+        kind = l3[0] if type(l3) is tuple else None
+        cls = IP if kind == 4 else IPv6 if kind == 6 else None
+    if cls is IP:
+        if l3 != (4, off + 12):
+            return None
+    elif cls is IPv6:
+        if l3 != (6, off + 8):
+            return None
+    else:
+        return None
+    classes.append(cls)
+    classes.append(TCP if l4[0] else UDP)
+    return classes, l4, off
+
+
+def _lite_port_protocol_name(data: bytes, l4: tuple) -> str | None:
+    """_port_protocol_name() of a record whose only transport layer carries a
+    Raw payload or none: ``bytes(transport.payload)`` is everything from the
+    payload's start (the payload, then any padding)."""
+    sport, dport = l4[1], l4[2]
+    payload = data[l4[7] :]
+    if l4[0]:
+        if is_openvpn_tcp_control(payload):
+            return "OpenVPN"
+        if (sport in {443, 8443} or dport in {443, 8443}) and not payload:
+            return None
+        return COMMON_PORTS.get(sport) or COMMON_PORTS.get(dport)
+    if (sport in {1194, 4433} or dport in {1194, 4433}) and is_openvpn_udp_control(payload):
+        return "OpenVPN"
+    return COMMON_PORTS.get(sport) or COMMON_PORTS.get(dport)
+
+
+def _lite_first_vlan(data: bytes, classes: list) -> int:
+    """The VLAN id of the first 802.1Q tag (scapy's exact-class
+    ``pkt[Dot1Q]``: an 802.1ad tag is not one), 0 without one."""
+    for index, cls in enumerate(classes):
+        if cls is Dot1Q:
+            off = 10 + 4 * index  # tag ``index`` follows the Ethernet header
+            return ((data[off] << 8) | data[off + 1]) & 0x0FFF
+    return 0
+
+
+def _lite_iface_key(record: LitePacket, classes: list) -> object:
+    """analyze_pcap's interface key for a record with a lite layer chain:
+    sniffed_on, else the one field of those layers the interface lookups of
+    _get_iface_key() find (a Linux cooked v2 header's ifindex), else
+    "unknown"."""
+    iface = record.sniffed_on
+    if iface:
+        return str(iface)
+    if classes[0] is CookedLinuxV2:
+        return int.from_bytes(record.original[4:8], "big")  # IntField: unsigned
+    return "unknown"
 
 
 def _getattr_or_none(pkt, name: str) -> object:
@@ -236,7 +360,7 @@ def analyze_pcap(
         defaultdict(set)
     )
     for pkt in iter_packets(
-        path, packets=packets, meta=capture_meta, show_status=show_status
+        path, packets=packets, meta=capture_meta, show_status=show_status, lite=True
     ):
         packet_count += 1
         if packet_wirelen(pkt) > packet_length(pkt):
@@ -256,6 +380,48 @@ def analyze_pcap(
                 start_ts = ts_value
             if end_ts is None or ts_value > end_ts:
                 end_ts = ts_value
+
+        if type(pkt) is LitePacket:
+            chain = _lite_layer_chain(pkt)
+            if chain is not None:
+                # What the scapy path below records for this packet, read from
+                # the record (tests/test_lite_summary.py).
+                classes, l4, _l3_offset = chain
+                data = pkt.original
+                iface_key = _lite_iface_key(pkt, classes)
+                iface_counts[iface_key] += 1
+                src_ip, dst_ip = extract_packet_endpoints(pkt)
+                vlan_id = _lite_first_vlan(data, classes)
+                if vlan_id > 0:
+                    iface_vlans[iface_key].add(vlan_id)
+                port_proto = _lite_port_protocol_name(data, l4)
+                # The Ethernet type, or without an Ethernet layer the same two
+                # bytes of the record (extract_ethertype's fallback).
+                ethertype_proto = ETHERTYPE_PROTOCOLS.get((data[12] << 8) | data[13])
+                layer_names = set(cls.__name__ for cls in classes)
+                if port_proto:
+                    layer_names.discard("TCP")
+                    layer_names.discard("UDP")
+                for name in layer_names:
+                    protocol_counts[name] += 1
+                if port_proto and port_proto not in layer_names:
+                    protocol_counts[port_proto] += 1
+                if ethertype_proto and ethertype_proto not in layer_names:
+                    protocol_counts[ethertype_proto] += 1
+                if l4[0]:
+                    tcp_packets += 1
+                    payload_len = l4[6] - l4[5]  # len(Raw.load); no Raw when 0
+                    if src_ip and dst_ip and payload_len > 0:
+                        key = (src_ip, dst_ip, l4[1], l4[2])
+                        sig = (l4[3], payload_len)
+                        if sig in seen_seq[key]:
+                            retransmissions += 1
+                        else:
+                            seen_seq[key].add(sig)
+                        if len(seen_seq[key]) > 20000:
+                            seen_seq[key].clear()
+                continue
+            pkt = pkt.materialize()
 
         iface_key = _get_iface_key(pkt)
         if iface_key is None:

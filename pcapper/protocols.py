@@ -8,14 +8,17 @@ from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
 
 try:
+    from scapy.fields import FlagValue
     from scapy.layers.dns import DNS
     from scapy.layers.inet import ICMP, IP, TCP, UDP
     from scapy.layers.inet6 import IPv6
     from scapy.layers.l2 import ARP, Ether
     from scapy.packet import Packet, Raw
 except ImportError:
-    IP = TCP = UDP = Ether = IPv6 = ARP = ICMP = DNS = Raw = None
+    IP = TCP = UDP = Ether = IPv6 = ARP = ICMP = DNS = Raw = FlagValue = None
 
+from .analyzer import _lite_layer_chain
+from .lite import LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import memoize_analysis, packet_length, safe_float
 
@@ -438,6 +441,32 @@ KNOWN_PORTS.update(INDUSTRIAL_PORTS)
 
 OSCILLATION_REPEAT_CAP = 3
 
+# ``layer.name`` of a dissected layer of each class (lite records).
+_LAYER_NAMES: Dict[type, str] = {}
+# Per 3-bit IP flags value: (bool(ip.flags), "mf" in str(ip.flags).lower()),
+# taken from scapy's own FlagValue for the IP flags field.
+_IP_FLAG_ANSWERS: Optional[Tuple[Tuple[bool, bool], ...]] = None
+
+
+def _layer_name(cls: type) -> str:
+    name = _LAYER_NAMES.get(cls)
+    if name is None:
+        name = _LAYER_NAMES[cls] = cls().name or cls.__name__  # type: ignore[attr-defined]
+    return name
+
+
+def _ip_flag_answers() -> Tuple[Tuple[bool, bool], ...]:
+    global _IP_FLAG_ANSWERS
+    answers = _IP_FLAG_ANSWERS
+    if answers is None:
+        names = next(f for f in IP.fields_desc if f.name == "flags").names
+        answers = tuple(
+            (bool(flags), str(flags).lower().find("mf") >= 0)
+            for flags in (FlagValue(value, names) for value in range(8))
+        )
+        _IP_FLAG_ANSWERS = answers
+    return answers
+
 
 def _get_proto_name(
     pkt: Packet,
@@ -547,7 +576,9 @@ def analyze_protocols(
     errors = []
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             pkt_idx += 1
             ts = safe_float(getattr(pkt, "time", 0))
             if start_ts is None:
@@ -555,6 +586,147 @@ def analyze_protocols(
             end_ts = ts
 
             pkt_len = packet_length(pkt)
+            if type(pkt) is LitePacket:
+                chain = _lite_layer_chain(pkt)
+                # A TCP payload goes through the credential checks below:
+                # that packet is dissected. Everything else this loop records
+                # for a plain TCP/UDP record is read from its bytes.
+                if chain is not None and (not chain[1][0] or chain[1][6] <= chain[1][5]):
+                    classes, l4, l3 = chain
+                    data = pkt.original
+                    ether = classes[0] is Ether
+                    is_tcp, sport, dport = l4[0], l4[1], l4[2]
+                    ipv4 = classes[-2] is IP
+                    known = KNOWN_PORTS.get(sport) or KNOWN_PORTS.get(dport)
+                    transport = "TCP" if is_tcp else "UDP"
+                    if not ipv4:
+                        port_protocol_counts[known or transport] += 1
+                    elif data[l3 + 9] == (6 if is_tcp else 17):  # IP proto
+                        port_protocol_counts[known or transport] += 1
+                    elif data[l3 + 9] == 1:
+                        port_protocol_counts["ICMP"] += 1
+                    else:
+                        port_protocol_counts["IP"] += 1
+                    label = ether and ETHERTYPE_PROTOCOLS.get((data[12] << 8) | data[13])
+                    if label:
+                        ethertype_protocol_counts[label] += 1
+
+                    current_node = hierarchy
+                    current_node.packets += 1
+                    current_node.bytes += pkt_len
+                    prev_effective_layer = None
+                    effective_path_layers = []
+                    oscillation_repeats = 0
+                    l4_node = None
+                    for cls in classes:  # then only Raw and Padding, not counted
+                        lname = _layer_name(cls)
+                        if lname in {"802.1Q", "Dot1Q"}:
+                            vlan_parent = current_node
+                            if vlan_parent.name != "Ethernet":
+                                vlan_parent = hierarchy.sub_protocols.get(
+                                    "Ethernet", vlan_parent
+                                )
+                            if lname not in vlan_parent.sub_protocols:
+                                vlan_parent.sub_protocols[lname] = ProtocolStat(lname)
+                            vlan_node = vlan_parent.sub_protocols[lname]
+                            vlan_node.packets += 1
+                            vlan_node.bytes += pkt_len
+                            continue
+                        if lname == prev_effective_layer:
+                            continue
+                        if (
+                            len(effective_path_layers) >= 3
+                            and effective_path_layers[-3] == effective_path_layers[-1]
+                            and effective_path_layers[-2] == lname
+                            and effective_path_layers[-3] != effective_path_layers[-2]
+                        ):
+                            oscillation_repeats += 1
+                            if oscillation_repeats >= OSCILLATION_REPEAT_CAP:
+                                break
+                        else:
+                            oscillation_repeats = 0
+                        if lname not in current_node.sub_protocols:
+                            current_node.sub_protocols[lname] = ProtocolStat(lname)
+                        current_node = current_node.sub_protocols[lname]
+                        current_node.packets += 1
+                        current_node.bytes += pkt_len
+                        if lname in {"TCP", "UDP"}:
+                            l4_node = current_node
+                        prev_effective_layer = lname
+                        effective_path_layers.append(lname)
+                    if l4_node is not None and known and known not in effective_path_layers:
+                        child = l4_node.sub_protocols.get(known)
+                        if child is None:
+                            child = ProtocolStat(known)
+                            l4_node.sub_protocols[known] = child
+                        child.packets += 1
+                        child.bytes += pkt_len
+
+                    src, dst = pkt.lite_endpoints()
+                    proto = known or transport
+                    ports = set()
+                    ports.add(sport)
+                    ports.add(dport)
+                    if ether and data[:6] == b"\xff\xff\xff\xff\xff\xff":
+                        broadcast_frames += 1
+                    if src and dst:
+                        e_src = eps[src]
+                        e_src.address = src
+                        e_src.packets_sent += 1
+                        e_src.bytes_sent += pkt_len
+                        e_src.protocols.add(proto)
+
+                        e_dst = eps[dst]
+                        e_dst.address = dst
+                        e_dst.packets_recv += 1
+                        e_dst.bytes_recv += pkt_len
+                        e_dst.protocols.add(proto)
+
+                        key = tuple(sorted([src, dst])) + (proto,)
+                        if key not in convs:
+                            convs[key] = Conversation(
+                                src=src,
+                                dst=dst,
+                                protocol=proto,
+                                packets=0,
+                                bytes=0,
+                                start_ts=ts,
+                                end_ts=ts,
+                                ports=set(),
+                            )
+                        c = convs[key]
+                        c.packets += 1
+                        c.bytes += pkt_len
+                        c.end_ts = ts
+                        c.ports.update(ports)
+
+                    if ipv4:
+                        flags_frag = (data[l3 + 6] << 8) | data[l3 + 7]
+                        frag = flags_frag & 0x1FFF
+                        flags_set, more_fragments = _ip_flag_answers()[flags_frag >> 13]
+                        if (frag or flags_set) and (frag > 0 or more_fragments):
+                            ip_fragments += 1
+                    if is_tcp:
+                        bits = l4[4]  # int(tcp.flags)
+                        syn = bool(bits & 0x02)
+                        ack = bool(bits & 0x10)
+                        fin = bool(bits & 0x01)
+                        rst = bool(bits & 0x04)
+                        psh = bool(bits & 0x08)
+                        urg = bool(bits & 0x20)
+                        if syn and not ack and src:
+                            tcp_syn_sources[src] += 1
+                            tcp_syn_ports[src].add(dport)
+                        if rst and src:
+                            tcp_rst_sources[src] += 1
+                        if not (syn or ack or fin or rst or psh or urg) and src:
+                            tcp_null_scan[src] += 1
+                        if fin and not (syn or ack or rst) and src:
+                            tcp_fin_scan[src] += 1
+                        if fin and psh and urg and src:
+                            tcp_xmas_scan[src] += 1
+                    continue
+                pkt = pkt.materialize()
             # Resolve each layer at most once per packet; scapy's
             # haslayer/__contains__/__getitem__ each re-walk the chain.
             ether_layer = pkt.getlayer(Ether)

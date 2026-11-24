@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlparse
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float, shannon_entropy
 
@@ -329,6 +330,18 @@ def _is_valid_ipv4(value: str) -> bool:
         if item < 0 or item > 255:
             return False
     return True
+
+
+def _lite_view(record: LitePacket) -> Optional[tuple[str, int, int, bytes]]:
+    """``(proto, sport, dport, load)`` the scan reads from a lite record whose
+    only TCP/UDP layer carries a ``Raw`` payload or nothing, from its bytes:
+    ``load`` is ``pkt[Raw].load`` (padding-stripped), empty without a Raw
+    layer. None when only scapy can tell (no TCP/UDP layer: an ICMP or other
+    payload may still be Raw)."""
+    l4 = record.lite_l4()
+    if l4 is None or l4 is UNSUPPORTED or l4[5] < 0:
+        return None
+    return ("TCP" if l4[0] else "UDP", l4[1], l4[2], record.original[l4[5] : l4[6]])
 
 
 def _service_port(src_port: Optional[int], dst_port: Optional[int]) -> Optional[int]:
@@ -944,34 +957,50 @@ def analyze_obfuscation(
 
     pkt_index = 0
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        # Read from disk, records come lite: only a Raw payload of MIN_PAYLOAD
+        # bytes or more is scanned, so most records are decided (and the rest
+        # mostly read) from their bytes without being dissected.
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             pkt_index += 1
             total_packets += 1
+
+            view = None
+            if type(pkt) is LitePacket:
+                view = _lite_view(pkt)
+                if view is not None and len(view[3]) < MIN_PAYLOAD:
+                    continue  # no Raw layer, or one too short to scan
 
             src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
 
-            proto = "IP"
-            src_port = None
-            dst_port = None
-            if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
-                proto = "TCP"
-                src_port = int(getattr(pkt[TCP], "sport", 0) or 0)  # type: ignore[index]
-                dst_port = int(getattr(pkt[TCP], "dport", 0) or 0)  # type: ignore[index]
-            elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
-                proto = "UDP"
-                src_port = int(getattr(pkt[UDP], "sport", 0) or 0)  # type: ignore[index]
-                dst_port = int(getattr(pkt[UDP], "dport", 0) or 0)  # type: ignore[index]
+            if view is not None:
+                proto, src_port, dst_port, payload = view
+            else:
+                if type(pkt) is LitePacket:
+                    pkt = pkt.materialize()
+                proto = "IP"
+                src_port = None
+                dst_port = None
+                if TCP is not None and pkt.haslayer(TCP):  # type: ignore[truthy-bool]
+                    proto = "TCP"
+                    src_port = int(getattr(pkt[TCP], "sport", 0) or 0)  # type: ignore[index]
+                    dst_port = int(getattr(pkt[TCP], "dport", 0) or 0)  # type: ignore[index]
+                elif UDP is not None and pkt.haslayer(UDP):  # type: ignore[truthy-bool]
+                    proto = "UDP"
+                    src_port = int(getattr(pkt[UDP], "sport", 0) or 0)  # type: ignore[index]
+                    dst_port = int(getattr(pkt[UDP], "dport", 0) or 0)  # type: ignore[index]
 
-            payload = b""
-            if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
-                try:
-                    payload = bytes(pkt[Raw].load)  # type: ignore[index]
-                except Exception:
-                    payload = b""
-            if not payload or len(payload) < MIN_PAYLOAD:
-                continue
+                payload = b""
+                if Raw is not None and pkt.haslayer(Raw):  # type: ignore[truthy-bool]
+                    try:
+                        payload = bytes(pkt[Raw].load)  # type: ignore[index]
+                    except Exception:
+                        payload = b""
+                if not payload or len(payload) < MIN_PAYLOAD:
+                    continue
 
             sample = payload[:SCAN_BYTES]
             total_payload_bytes += len(payload)

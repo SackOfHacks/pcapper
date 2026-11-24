@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qsl, unquote_plus, urlsplit
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .services import COMMON_PORTS
 from .utils import (
@@ -369,7 +370,19 @@ def _service_name(sport: Optional[int], dport: Optional[int], proto: str) -> str
 
 
 def _transport_and_payload(pkt: Packet) -> tuple[Optional[int], Optional[int], str, bytes]:
-    """(sport, dport, transport label, payload bytes) resolved with one walk each."""
+    """(sport, dport, transport label, payload bytes) resolved with one walk each.
+
+    A lite record whose only transport layer carries a ``Raw`` payload answers
+    from its bytes: ``bytes(pkt[Raw])`` is the payload and the Ethernet padding
+    scapy hangs behind it, i.e. everything from the payload's start (and with
+    no payload, ``bytes(transport.payload)`` is that padding). Anything else is
+    dissected by scapy.
+    """
+    if type(pkt) is LitePacket:
+        l4 = pkt.lite_l4()
+        if l4 is not UNSUPPORTED and l4 is not None and l4[5] >= 0:
+            return l4[1], l4[2], ("TCP" if l4[0] else "UDP"), pkt.original[l4[5] :]
+        pkt = pkt.materialize()
     transport = pkt.getlayer(TCP) if TCP is not None else None
     proto = "TCP"
     if transport is None and UDP is not None:
@@ -391,6 +404,15 @@ def _transport_and_payload(pkt: Packet) -> tuple[Optional[int], Optional[int], s
     except Exception:
         payload = b""
     return sport, dport, proto, payload
+
+
+def _padding_only(payload: bytes) -> bool:
+    """A payload of NUL bytes only: the Ethernet padding scapy hangs behind an
+    empty segment (``bytes(transport.payload)``), the payload of most packets
+    in a scan-heavy capture. Scanning it finds nothing and changes no state
+    (checked for every port the scan tells apart, TCP and UDP, 1-64 bytes,
+    and inside an SMTP AUTH LOGIN exchange: tests/test_lite_it_paths.py)."""
+    return not payload.strip(b"\x00")
 
 
 def _build_context(text: str, needle: str, max_len: int = 80) -> str:
@@ -2107,11 +2129,14 @@ def analyze_creds(
         str, tuple[int, Optional[float], str, str, Optional[int], Optional[int]]
     ] = {}
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    # Read from disk, records come lite: most packets of a large capture carry
+    # no payload, and only those that do (or that the lite parser cannot read)
+    # are worth dissecting.
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status, lite=True):
         total_packets += 1
         try:
             src_port, dst_port, proto, payload = _transport_and_payload(pkt)
-            if not payload:
+            if not payload or _padding_only(payload):
                 continue
 
             src_ip, dst_ip = _get_ip_pair(pkt)  # type: ignore[arg-type]
@@ -2306,7 +2331,10 @@ def analyze_creds(
     try:
         from .http import analyze_http  # local import to avoid heavyweight import path
 
-        http_summary = analyze_http(path, show_status=False, packets=packets, meta=meta)
+        # Only the request URLs are read here: no file analysis behind them.
+        http_summary = analyze_http(
+            path, show_status=False, packets=packets, meta=meta, discover_files=False
+        )
         seen_hit_keys: set[tuple[str, Optional[str], Optional[str], str]] = {
             (str(hit.kind), hit.username, hit.secret, str(hit.evidence)) for hit in hits
         }

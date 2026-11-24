@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .device_detection import device_fingerprints_from_text
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import iter_packets
 from .utils import (
     memoize_analysis,
@@ -553,6 +554,33 @@ def _protocol_from_ports_or_text(sport: int, dport: int, text: str) -> str:
     if "USER " in upper or "PASS " in upper or "+OK" in upper or "-ERR" in upper:
         return "POP3"
     return "MAIL-OTHER"
+
+
+def _lite_not_email(record: LitePacket) -> bool:
+    """True when the record is certainly not mail, read from its bytes: no
+    TCP layer, no payload at all, or a segment off the mail ports whose text
+    neither reads like mail nor like webmail. The text is the payload and any
+    padding behind it, as ``bytes(tcp.payload)`` gives it to the scapy path;
+    a check that raises leaves the record to that path."""
+    l4 = record.lite_l4()
+    if l4 is None:
+        return True
+    if l4 is UNSUPPORTED:
+        return False
+    if not l4[0]:
+        return True  # UDP only: getlayer(TCP) finds nothing
+    if l4[5] < 0:
+        return False  # scapy dissects the payload further: let it decide
+    payload = record.original[l4[7] :]
+    if not payload:
+        return True
+    if l4[1] in MAIL_PORTS or l4[2] in MAIL_PORTS:
+        return False
+    try:
+        text = _readable_text(payload)
+        return _detect_webmail_context(text) is None and not _looks_like_mail_text(text)
+    except Exception:  # noqa: BLE001
+        return False
 
 
 def _is_client_to_server(sport: int, dport: int, text: str) -> bool:
@@ -1764,11 +1792,16 @@ def analyze_email(
     skipped_packets = 0
     first_skip_error: Optional[str] = None
     for pkt_no, pkt in enumerate(
-        iter_packets(path, packets=packets, meta=meta, show_status=show_status), start=1
+        iter_packets(path, packets=packets, meta=meta, show_status=show_status, lite=True),
+        start=1,
     ):
         total_packets += 1
         pkt_len = packet_length(pkt)
         total_bytes += pkt_len
+        if type(pkt) is LitePacket:
+            if _lite_not_email(pkt):
+                continue
+            pkt = pkt.materialize()
         tcp_layer = pkt.getlayer(TCP) if TCP is not None else None
         if tcp_layer is None:
             continue
