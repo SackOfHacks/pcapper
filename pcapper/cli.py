@@ -946,6 +946,50 @@ def _memory_file_override(path: Path, multi_analyzer: bool) -> int | None:
     return None
 
 
+# A plan whose analyses all read lightweight records streams a capture that
+# fits in memory only when most of its packets are payload-less (a scan):
+# then they need no dissection at all, where loading would dissect every one
+# (maccdc2010, 250k packets: 17.5 s streamed, 62.7 s in memory). When most
+# carry data they are dissected either way -- once per --jobs worker when
+# streamed -- and in one process the shared pass hands every record to a
+# hundred analyses: loading is faster (a 3,400-packet Dridex capture's
+# --overview: 27.3 s streamed, 8.6 s in memory). Below
+# _LITE_STREAM_MIN_BYTES the capture is loaded without looking; above it the
+# first 256 KiB of records are read to decide (a small fraction of it).
+# PCAPPER_LITE_STREAM=1 always streams such a plan, =0 never does.
+_LITE_STREAM_MIN_BYTES = 8 * 1024 * 1024
+_LITE_STREAM_MIN_QUIET = 0.6
+_LITE_STREAM_DECISIONS: dict[tuple, bool] = {}
+
+
+def _streams_lite_plan(path: Path, multi_analyzer: bool) -> bool:
+    """Whether a plan whose analyses all read lightweight records streams
+    ``path`` instead of loading it into memory (see _LITE_STREAM_MIN_QUIET)."""
+    forced = os.environ.get("PCAPPER_LITE_STREAM", "").strip().lower()
+    if forced in {"1", "true", "yes", "on"}:
+        return True
+    if forced in {"0", "false", "no", "off"}:
+        return False
+    if not memory_admissible(path, max_file_override=_memory_file_override(path, multi_analyzer)):
+        return True  # streamed anyway: too large to hold
+    try:
+        size = capture_size(path)
+        key = (str(path), size, Path(path).stat().st_mtime_ns)
+    except OSError:
+        return False
+    decision = _LITE_STREAM_DECISIONS.get(key)
+    if decision is None:
+        if size < _LITE_STREAM_MIN_BYTES:
+            decision = False
+        else:
+            from .rawcap import head_quiet_share
+
+            share = head_quiet_share(path)
+            decision = share is not None and share >= _LITE_STREAM_MIN_QUIET
+        _LITE_STREAM_DECISIONS[key] = decision
+    return decision
+
+
 def _resolve_jobs(value: int | None) -> int | None:
     """--jobs as given: None (not given) chooses per capture, 0 one per CPU."""
     if value is None:
@@ -954,10 +998,17 @@ def _resolve_jobs(value: int | None) -> int | None:
 
 
 def _note_large_capture(
-    path: Path, *, jobs: int | None = None, split: int = 1, multi_analyzer: bool
+    path: Path,
+    *,
+    jobs: int | None = None,
+    split: int = 1,
+    multi_analyzer: bool,
+    lite_only: bool = False,
 ) -> None:
     """Large-capture guidance on stderr: how long one read takes here, whether
-    the capture stays in memory, and how to make it faster."""
+    the capture stays in memory, and how to make it faster. ``lite_only``: the
+    run's analyses all read lightweight records, so it never dissects the
+    whole capture."""
     try:
         threshold = int(os.environ.get("PCAPPER_LARGE_CAPTURE_PACKETS", _LARGE_CAPTURE_PACKETS))
     except ValueError:
@@ -982,6 +1033,11 @@ def _note_large_capture(
             + (f", {_human_duration(estimate * per_packet / split)} per --split window" if split > 1 else "")
             + "."
         )
+        if lite_only:
+            timing = (
+                timing.replace(" takes ", " would take ", 1)[:-1]
+                + "; this run's analyses dissect only the packets they look at."
+            )
     memory = ""
     if multi_analyzer and not fits_in_memory(path):
         memory = (
@@ -3343,27 +3399,33 @@ def _analyze_paths(
             ),
         )
 
-    plan_shapes: dict[str, tuple[int, bool]] = {}
+    plan_shapes: dict[str, tuple[int, bool, bool]] = {}
     # What an analysis costs (bar weights; --jobs balances workers by it).
     progress.set_analysis_weigher(_analysis_cost)
 
-    def _plan_shape(path: Path, roots: list[tuple[object, tuple, dict]]) -> tuple[int, bool]:
-        """How many analyses ``roots`` start (each once) and whether any of
-        them reports the capture's hashes -- from the shared pass's dry run.
+    def _plan_shape(path: Path, roots: list[tuple[object, tuple, dict]]) -> tuple[int, bool, bool]:
+        """How many analyses ``roots`` start (each once), whether any of
+        them reports the capture's hashes, and whether every one that reads
+        the capture reads lite records -- from the shared pass's dry run.
         It sees an empty packet view, so the answer depends on the roots
         (fixed for the run) only: one dry run per run, not per capture."""
         if not roots:
-            return 0, False
+            return 0, False, False
         signature = repr([(getattr(f, "__qualname__", f), a, sorted(k.items())) for f, a, k in roots])
         cached = plan_shapes.get(signature)
         if cached is not None:
             return cached
         requests = pcap_cache._HASH_PLAN_REQUESTS
+        lite_only = False
         try:
-            planned = len(sharedpass.dry_run_keys(path, roots))
+            plan = sharedpass.discover(path, roots)
+            planned = len(plan.keys)
+            lite_only = any(read == "lite" for read in plan.reads) and all(
+                read != "packets" for read in plan.reads
+            )
         except Exception:  # noqa: BLE001 - no plan: each analysis reads as before
             planned = 0
-        shape = (planned, pcap_cache._HASH_PLAN_REQUESTS != requests)
+        shape = (planned, pcap_cache._HASH_PLAN_REQUESTS != requests, lite_only)
         plan_shapes[signature] = shape
         return shape
 
@@ -3475,7 +3537,20 @@ def _analyze_paths(
     for idx, path in enumerate(paths, start=1):
         progress.capture_begin(path, index=idx, total=len(paths))
         if _window is None:
-            _note_large_capture(path, split=split, multi_analyzer=use_packets)
+            note_lite_only = False
+            if progress.detail_enabled() and not _has_packet_filters(bpf, time_start, time_end):
+                # The plan's dry run (cached for the run) says whether the
+                # analyses read lightweight records only, and so whether the
+                # capture is streamed without dissecting it whole.
+                note_roots = _run_plan_roots(ordered_steps)
+                if render_base_summary:
+                    note_roots.insert(0, (analyze_pcap, (), {}))
+                note_lite_only = _plan_shape(path, note_roots)[2] and _streams_lite_plan(
+                    path, use_packets
+                )
+            _note_large_capture(
+                path, split=split, multi_analyzer=use_packets, lite_only=note_lite_only
+            )
             if split > 1:
                 windows = _split_windows(
                     path,
@@ -3522,7 +3597,7 @@ def _analyze_paths(
             plan_roots = _run_plan_roots(ordered_steps)
             if render_base_summary:
                 plan_roots.insert(0, (analyze_pcap, (), {}))
-        planned, hashes_wanted = _plan_shape(path, plan_roots)
+        planned, hashes_wanted, lite_only = _plan_shape(path, plan_roots)
         multi = multi or planned >= 2
         if hashes_wanted or render_base_summary or case_dir or (show_suricata and "suricata" in ordered_steps):
             pcap_cache.want_hashes(path)
@@ -3553,7 +3628,12 @@ def _analyze_paths(
             )
             if ip_scope_requested and timeline_ip:
                 ip_scope_enabled_for_path = True
-        elif multi:
+        elif multi and not (lite_only and _streams_lite_plan(path, multi)):
+            # Analyses that all read lite records dissect only the packets
+            # they need from disk: on a scan-heavy capture holding every
+            # packet dissected in memory costs more than the rest of the run
+            # (about 70% of a 250,000-packet --creds run was that load), see
+            # _streams_lite_plan.
             packets, meta = load_packets_if_allowed(
                 path,
                 show_status=show_status,

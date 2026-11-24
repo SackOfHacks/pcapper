@@ -9,6 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .openvpn import iter_openvpn_tcp_control_payloads
 from .utils import x509_names
@@ -181,6 +182,41 @@ def _contains_tls_record(payload: bytes) -> bool:
         if _is_tls_record_start(payload[idx:]):
             return True
     return False
+
+
+def _lite_no_certificate(
+    record: LitePacket, openvpn_tls_buffers: dict[tuple[str, str, int, int], bytearray]
+) -> bool:
+    """True when the loop of :func:`analyze_certificates` reaches its
+    ``continue`` for ``record`` without counting it, read from its bytes: no
+    TLS layer (scapy binds TLS under TCP only), and a TCP payload that neither
+    starts a TLS record nor carries one in an OpenVPN control frame, on a flow
+    with no OpenVPN TLS bytes buffered. A payload scapy dissects further is
+    left to scapy."""
+    l4 = record.lite_l4()
+    if l4 is None:
+        return True  # no TCP layer, hence no TLS layer either
+    if l4 is UNSUPPORTED or l4[5] < 0:
+        return False
+    if not l4[0]:
+        return True  # UDP with a Raw payload: no TCP, no TLS layer
+    # bytes(tcp.getlayer(Raw)), or bytes(tcp.payload) without one: the
+    # payload and any padding behind it.
+    payload = record.original[l4[7] :]
+    if _is_tls_record_start(payload):
+        return False
+    if payload and any(
+        _contains_tls_record(item.data)
+        for item in iter_openvpn_tcp_control_payloads(payload)
+        if item.data
+    ):
+        return False
+    if openvpn_tls_buffers:
+        src_ip, dst_ip = extract_packet_endpoints(record)
+        flow_key = (src_ip or "0.0.0.0", dst_ip or "0.0.0.0", l4[1], l4[2])
+        if openvpn_tls_buffers.get(flow_key):
+            return False
+    return True
 
 
 @memoize_analysis
@@ -816,11 +852,19 @@ def analyze_certificates(
         )
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             packet_time = safe_float(getattr(pkt, "time", None))
             seen_at[0] = (datetime.fromtimestamp(packet_time, timezone.utc)
                           if packet_time is not None and packet_time > 0 else now_utc)
             total_packets += 1
+            if type(pkt) is LitePacket:
+                # Only records that may carry a certificate (or count as TLS)
+                # are dissected; the rest is decided from their bytes.
+                if TCP is not None and _lite_no_certificate(pkt, openvpn_tls_buffers):
+                    continue
+                pkt = pkt.materialize()
             tcp_layer = pkt.getlayer(TCP) if TCP is not None else None
             tls_layer = pkt.getlayer(TLS) if TLS is not None else None
             payload: bytes | None = None

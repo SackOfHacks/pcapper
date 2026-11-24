@@ -7,6 +7,7 @@ from typing import Optional
 
 from .dns import analyze_dns
 from .http import analyze_http
+from .lite import UNSUPPORTED, LitePacket
 from .openvpn import is_openvpn_tcp_control
 from .pcap_cache import PcapMeta, iter_packets
 from .services import COMMON_PORTS
@@ -240,6 +241,46 @@ def _flow_key(
     return (src_ip, dst_ip, "IP", None, None)
 
 
+def _lite_flow(
+    record: LitePacket,
+) -> Optional[tuple[str, str, bool, int, int, int, int, int]]:
+    """``(src_ip, dst_ip, is_tcp, sport, dport, flags, seg_len, body)`` of a
+    record whose only transport layer is a TCP or UDP header right behind its
+    IPv4/IPv6 header, read from its bytes; None when scapy must answer.
+
+    ``flags`` is the 9-bit TCP flags value (``tcp_flags_int`` of scapy's);
+    ``seg_len`` is :func:`tcp_segment_length`'s header arithmetic (IP total
+    length, or IPv6 payload length, less the headers: ``end - body``). An
+    IPv4 total length of 0 leaves it to ``len(payload)`` and a segment whose
+    data scapy dissects (TLS ...) has its payload read: both are dissected.
+    UDP needs the ports alone.
+    """
+    l4 = record.lite_l4()
+    if l4 is None or l4 is UNSUPPORTED:
+        return None
+    src_ip, dst_ip = extract_packet_endpoints(record)
+    if not src_ip or not dst_ip:
+        return None  # _flow_key would fall back to the Ethernet addresses
+    if not l4[0]:
+        return (src_ip, dst_ip, False, l4[1], l4[2], 0, 0, 0)
+    data = record.original
+    kind, offset = record.headers()[1]
+    if kind == 4:  # offset: the source address; the header starts 12 before
+        ip = offset - 12
+        total = (data[ip + 2] << 8) | data[ip + 3]
+        if not total:
+            return None
+        end = ip + total
+    else:  # IPv6: the header starts 8 before; its payload 40 after
+        ip = offset - 8
+        end = ip + 40 + ((data[ip + 4] << 8) | data[ip + 5])
+    body = l4[7]
+    seg_len = end - body if end > body else 0
+    if seg_len and l4[5] < 0:
+        return None
+    return (src_ip, dst_ip, True, l4[1], l4[2], l4[4], seg_len, body)
+
+
 def _normalize_pair(src_ip: str, dst_ip: str) -> tuple[str, str]:
     """(client, server): the private side first when the pair crosses to the internet."""
     if is_private_ip(src_ip) and is_public_ip(dst_ip):
@@ -432,8 +473,12 @@ def analyze_beacons(
         if len(packet_ids[session_key]) < MAX_BEACON_PACKET_SAMPLES:
             packet_ids[session_key].append(pkt_index)
 
+    # Read from disk, records come lite: a plain TCP or UDP packet (most of a
+    # large capture) is accounted from its bytes and one sent to a broadcast
+    # or multicast address skipped; anything else is dissected.
     for pkt_index, pkt in enumerate(
-        iter_packets(path, packets=packets, meta=meta, show_status=show_status), start=1
+        iter_packets(path, packets=packets, meta=meta, show_status=show_status, lite=True),
+        start=1,
     ):
         total_packets += 1
         ts = safe_float(getattr(pkt, "time", None))
@@ -443,6 +488,60 @@ def analyze_beacons(
             # packet_length() reads len(pkt.original) (~50x faster than len(pkt),
             # which re-serializes the packet) - matters in this per-packet loop.
             pkt_len = packet_length(pkt)
+            if type(pkt) is LitePacket:
+                # _flow_key gives no key to a packet whose IP destination is
+                # broadcast/multicast, whatever it carries: nothing is recorded.
+                src_ip, dst_ip = extract_packet_endpoints(pkt)
+                if src_ip and dst_ip and is_valid_ip(dst_ip) and not is_unicast_host_ip(dst_ip):
+                    continue
+                flow = _lite_flow(pkt)
+                if flow is None:
+                    pkt = pkt.materialize()
+                else:
+                    # The scapy path below, step for step, on the values
+                    # _lite_flow read from the record's bytes.
+                    src_ip, dst_ip, is_tcp, sport, dport, flag_int, seg_len, body = flow
+                    if not is_tcp:
+                        # _flow_key keeps the lower port of a datagram only.
+                        client_ip, server_ip = _normalize_pair(src_ip, dst_ip)
+                        session_key = (client_ip, server_ip, "UDP", min(sport, dport))
+                        _sample(udp_session_times, udp_session_sizes, udp_session_packets,
+                                session_key, ts, pkt_len, pkt_index)
+                        continue
+                    is_syn = (flag_int & 0x02) != 0 and (flag_int & 0x10) == 0
+                    is_synack = (flag_int & 0x12) == 0x12
+                    server_port = min(sport, dport)
+                    client_port = max(sport, dport)
+                    client_ip, server_ip = _normalize_pair(src_ip, dst_ip)
+                    conn_key = (client_ip, server_ip, "TCP", server_port, client_port)
+
+                    if conn_key not in conn_first_ts:
+                        if len(conn_first_ts) >= MAX_TRACKED_CONNECTIONS:
+                            untracked_connections += 1
+                            continue
+                        conn_first_ts[conn_key] = ts
+                        conn_first_idx[conn_key] = pkt_index
+                    conn_bytes[conn_key] += pkt_len
+                    if seg_len:
+                        conn_data_bytes[conn_key] += seg_len
+                        # bytes(tcp_layer.payload)[:seg_len]: the record from
+                        # the payload's start on (Ethernet padding included)
+                        tcp_payload = pkt.original[body : body + seg_len]
+                        if tcp_payload and is_openvpn_tcp_control(tcp_payload):
+                            openvpn_conn_keys.add(conn_key)
+                        if sport == client_port and sport != dport:
+                            req_times = conn_request_times[conn_key]
+                            if len(req_times) < MAX_SESSION_SAMPLES:
+                                req_times.append(ts)
+                                conn_request_sizes[conn_key].append(seg_len)
+                            if len(conn_request_packets[conn_key]) < MAX_BEACON_PACKET_SAMPLES:
+                                conn_request_packets[conn_key].append(pkt_index)
+                    if is_synack:
+                        conn_established.add(conn_key)
+                    if is_syn:
+                        conn_syn_ts[conn_key] = ts
+                        conn_syn_idx[conn_key] = pkt_index
+                    continue
             # Resolve each layer once; _flow_key and the branches below share them
             # (this loop used to walk the layer chain up to ten times per packet).
             ether = pkt.getlayer(Ether) if Ether is not None else None

@@ -11,6 +11,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import urlsplit
 
+from .lite import UNSUPPORTED, LitePacket
 from .openvpn import is_openvpn_tcp_control, tcp_flow_id
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import dns_message, get_packet_ports, memoize_analysis, safe_float
@@ -363,6 +364,55 @@ def _extract_ip_pair(ip_layer, ipv6_layer, arp_layer) -> tuple[str, str]:
         except Exception:
             return "0.0.0.0", "0.0.0.0"
     return "0.0.0.0", "0.0.0.0"
+
+
+# Bounds of the per-analysis memos of the lite path (cleared when full).
+_LITE_MEMO_MAX = 4096
+_LITE_LEARNT_MAX = 65536
+
+
+def _lite_quiet_packet(record: LitePacket, ether_memo: dict):  # type: ignore[no-untyped-def]
+    """``(src_ip, dst_ip, sport, dport, ether)`` of a record no extractor finds
+    anything in -- read from its bytes -- or None (dissect it).
+
+    Such a record's only TCP/UDP layer carries a ``Raw`` payload or none, and
+    the payload :func:`_extract_payload` reads -- the load, else everything
+    behind the transport header (Ethernet padding) -- is empty or NUL bytes
+    only: every extractor gives nothing for it, on any port, and changes no
+    state (tests/test_lite_hostname.py). Scapy builds no DHCP, DNS, NBNS or
+    TLS layer under a ``Raw`` payload. CDP alone reads the frame itself (for
+    an empty payload) and could find a name in its headers only in a frame
+    sent to CDP's multicast MAC: those are dissected. ``ether`` is
+    ``lite_first_ether()``: the outer Ethernet layer's type and MACs (scapy's
+    ``Ether.src``/``.dst`` text), None without one. ``ether_memo`` keeps
+    those answers for one analysis (one pass, one set of scapy bindings)."""
+    l4 = record.lite_l4()
+    if l4 is None or l4 is UNSUPPORTED or l4[5] < 0:
+        return None
+    data = record.original
+    start, end = l4[5], l4[6]
+    payload = data[start:end] if end > start else data[l4[7]:]
+    if payload and payload.strip(b"\x00"):
+        return None
+    if record.linktype == 1:
+        # An Ethernet record's answer depends on its first 14 bytes only,
+        # and formatting two MACs costs more than the rest of this check.
+        head = data[:14]
+        ether = ether_memo.get(head)
+        if ether is None:
+            if len(ether_memo) >= _LITE_MEMO_MAX:
+                ether_memo.clear()
+            ether = ether_memo[head] = record.lite_first_ether()
+    else:
+        ether = record.lite_first_ether()
+    if ether is UNSUPPORTED:
+        return None
+    if ether is not None and (ether[0] == LLDP_ETHERTYPE or ether[2] == CDP_MULTICAST_MAC):
+        return None
+    endpoints = record.lite_endpoints()
+    if endpoints is UNSUPPORTED or endpoints[0] is None:
+        return None
+    return endpoints[0], endpoints[1], l4[1], l4[2], ether
 
 
 def _extract_payload(raw_layer, tcp_layer, udp_layer) -> bytes:
@@ -2352,12 +2402,47 @@ def analyze_hostname(
         _target_reverse_ptr(target_ip).lower() if target_filter_enabled else ""
     )
 
+    # Lite records answered from their bytes: Ethernet headers seen, and the
+    # (IPs, MACs) whose IP<->MAC entries were recorded.
+    lite_ethers: dict[bytes, object] = {}
+    lite_learnt: set[tuple[str, str, str, str]] = set()
+
     try:
+        # Read from disk, records come lite: a scan-heavy capture is mostly
+        # empty segments, and only the IP<->MAC map below learns from them.
         for pkt in iter_packets(
-            path, packets=packets, meta=meta, show_status=show_status
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
         ):
             summary.total_packets += 1
             packet_index = summary.total_packets
+
+            if type(pkt) is LitePacket:
+                quiet = _lite_quiet_packet(pkt, lite_ethers)
+                if quiet is not None:
+                    # What the code below does with such a packet: the
+                    # Ethernet MACs of its IP pair, the port filter, and the
+                    # target filter's tally (no extractor finds anything).
+                    src_ip, dst_ip, sport, dport, ether = quiet
+                    pair = (src_ip, dst_ip, ether[1], ether[2]) if ether is not None else None
+                    if pair is not None and pair not in lite_learnt:
+                        # Set additions: the same four again change nothing.
+                        if len(lite_learnt) >= _LITE_LEARNT_MAX:
+                            lite_learnt.clear()
+                        lite_learnt.add(pair)
+                        try:
+                            src_mac, dst_mac = ether[1], ether[2]
+                            _remember_ip_mac(ip_to_macs, src_ip, src_mac)
+                            _remember_ip_mac(ip_to_macs, dst_ip, dst_mac)
+                            _remember_mac_ip(mac_to_ips, src_mac, src_ip)
+                            _remember_mac_ip(mac_to_ips, dst_mac, dst_ip)
+                        except Exception:
+                            pass
+                    if port_filter_enabled and sport != port_filter and dport != port_filter:
+                        continue
+                    if target_filter_enabled and (src_ip == target_ip or dst_ip == target_ip):
+                        summary.relevant_packets += 1
+                    continue
+                pkt = pkt.materialize()
 
             ts = safe_float(getattr(pkt, "time", None))
             # Dissect each commonly needed layer once per packet and share

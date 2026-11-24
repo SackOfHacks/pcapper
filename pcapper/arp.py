@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import iter_packets
 from .utils import is_private_ip as _is_private_ipv4, memoize_analysis, safe_float
 
@@ -164,6 +165,21 @@ def _extract_trailer_strings(arp_layer: object) -> list[str]:
         if cleaned:
             tokens.append(cleaned[:96])
     return tokens
+
+
+def _lite_no_arp(record: LitePacket) -> bool:
+    """True when the record has no ARP layer, read from its headers: an
+    IPv4/IPv6 packet or a non-IP frame the parser read to its end, with
+    nothing scapy could dissect below it. ARP, ICMPv6 (an ND option can carry
+    a whole packet) and what the parser cannot read are dissected."""
+    l3 = record.headers()[1]
+    if l3 is UNSUPPORTED or record.lite_l4() is UNSUPPORTED:
+        return False
+    if l3 is None:
+        return True
+    if l3[0] == 1:
+        return False
+    return l3[0] == 4 or record.original[l3[1] - 2] != 58  # IPv6 next header
 
 
 def _extract_filenames(strings: list[str]) -> set[str]:
@@ -396,8 +412,16 @@ def analyze_arp(
         files.update(_extract_filenames(strings))
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             summary.total_packets += 1
+            if type(pkt) is LitePacket:
+                # Only ARP frames are read: a record whose headers show no
+                # ARP layer is never dissected.
+                if _lite_no_arp(pkt):
+                    continue
+                pkt = pkt.materialize()
             try:
                 _process(pkt)
             except Exception as exc:  # noqa: BLE001 — one malformed frame must not end the pass

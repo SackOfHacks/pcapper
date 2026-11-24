@@ -6,6 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length, tcp_segment_length, extract_ascii_strings as _extract_ascii_strings
 from .utils import is_public_ip as _is_public_ip
@@ -267,6 +268,29 @@ def _scan_plaintext(
             artifacts.append(item)
 
 
+def _lite_not_winrm(record: LitePacket) -> bool:
+    """True when the scapy path certainly drops the record, read from its
+    bytes: no TCP layer, or a segment off the WinRM ports whose first 64
+    payload bytes name no WSMAN/WinRM. The scapy path searches a prefix of
+    those bytes (``bytes(Raw)`` cut to the IP/TCP length, else
+    ``bytes(tcp.payload)``: both start at the payload), and the pattern found
+    in a prefix is found in the whole."""
+    l4 = record.lite_l4()
+    if l4 is None:
+        return True
+    if l4 is UNSUPPORTED:
+        return False
+    if not l4[0]:
+        return True  # UDP only
+    sport, dport = l4[1], l4[2]
+    if dport in WINRM_PORTS or (sport in WINRM_PORTS and dport >= _EPHEMERAL_MIN):
+        return False
+    if l4[5] < 0:
+        return False  # scapy dissects the payload further: let it decide
+    head = record.original[l4[5] : l4[5] + 64]
+    return not WSMAN_RE.search(head.decode("latin-1", errors="ignore"))
+
+
 def _direction(
     src_ip: str, dst_ip: str, sport: int, dport: int
 ) -> tuple[str, str, int, int]:
@@ -368,10 +392,17 @@ def analyze_winrm(
     session_cap_reached = False
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
+
+            if type(pkt) is LitePacket:
+                if _lite_not_winrm(pkt):
+                    continue
+                pkt = pkt.materialize()
 
             if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
                 continue

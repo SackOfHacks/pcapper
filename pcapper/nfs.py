@@ -13,6 +13,7 @@ try:
 except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import (
     counter_inc,
@@ -313,8 +314,19 @@ def analyze_nfs(
         return cli
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             total_packets += 1
+            if type(pkt) is LitePacket:
+                # Only NFS-port traffic is looked at; the ports come from the
+                # record's only TCP/UDP header, the rest is never dissected.
+                l4 = pkt.lite_l4()
+                if l4 is None:
+                    continue
+                if l4 is not UNSUPPORTED and l4[1] != NFS_PORT and l4[2] != NFS_PORT:
+                    continue
+                pkt = pkt.materialize()
             if TCP in pkt or UDP in pkt:
                 sport = (
                     getattr(pkt[TCP], "sport", None)

@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import memoize_analysis, ranked_slice, safe_float, shannon_entropy
 
@@ -46,6 +47,22 @@ def _icmpv6_layer(ip6_layer: object) -> object | None:
             return None
         layer = getattr(layer, "payload", None)
     return None
+
+
+def _lite_not_icmp(record: LitePacket) -> bool:
+    """True when the record holds no ICMP/ICMPv6 message, read from its
+    headers: an IPv4 header whose protocol is not ICMP, an IPv6 one whose
+    next header is TCP, UDP or none, ARP, or a non-IP frame -- each read to
+    its end, with no IP/IPv6 layer scapy could dissect below it. ICMP,
+    ICMPv6 and what the parser cannot read are dissected."""
+    l3 = record.headers()[1]
+    if l3 is UNSUPPORTED or record.lite_l4() is UNSUPPORTED:
+        return False
+    if l3 is None or l3[0] == 1:
+        return True
+    if l3[0] == 4:
+        return record.original[l3[1] - 3] != _IP_PROTO_ICMP
+    return record.original[l3[1] - 2] != _IPV6_NH_ICMPV6
 
 
 def _preview_text(data: bytes) -> str:
@@ -287,7 +304,15 @@ def analyze_icmp(
     files_discovered: set[str] = set()
     observed_users: Counter[str] = Counter()
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    for pkt in iter_packets(
+        path, packets=packets, meta=meta, show_status=show_status, lite=True
+    ):
+        if type(pkt) is LitePacket:
+            # Only ICMP/ICMPv6 records are read; the rest are told apart by
+            # their protocol fields and never dissected.
+            if _lite_not_icmp(pkt):
+                continue
+            pkt = pkt.materialize()
         src: Optional[str] = None
         dst: Optional[str] = None
         ts = safe_float(getattr(pkt, "time", None))

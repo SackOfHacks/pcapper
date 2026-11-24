@@ -737,6 +737,30 @@ def _parse_ipv6(data: bytes, off: int, n: int) -> tuple:
     return ((6, off + 8), l4)
 
 
+def _ao_breaks_scapy(data: bytes, pos: int, end: int) -> bool:
+    """True when scapy's TCP option parser raises on the options
+    ``data[pos:end]``: a TCP-AO option (kind 29) whose value is one byte long
+    (announced length 3, or cut short by the end of the options) makes
+    ``TCPAOValue`` fail, and scapy then keeps the whole TCP segment as a Raw
+    payload of the IP layer -- the packet has no TCP layer at all. Walks the
+    options exactly as ``TCPOptionsField.m2i`` does; no other option can
+    raise there (the others are unpacked only when their size matches)."""
+    while pos < end:
+        kind = data[pos]
+        if kind == 0:  # EOL
+            return False
+        if kind == 1:  # NOP
+            pos += 1
+            continue
+        olen = data[pos + 1] if pos + 1 < end else 0
+        if olen < 2:
+            olen = 2
+        if kind == 29 and min(pos + olen, end) - (pos + 2) == 1:
+            return True
+        pos += olen
+    return False
+
+
 def _parse_tcp(data: bytes, start: int, end: int, need_terminal: bool) -> object:
     """``need_terminal``: the caller's endpoints (IPv6) are only right when no
     IPv4 header can be dissected out of the payload."""
@@ -749,6 +773,8 @@ def _parse_tcp(data: bytes, start: int, end: int, need_terminal: bool) -> object
     body = start + doff * 4
     if body > end:
         return UNSUPPORTED
+    if body > start + 20 and data.find(b"\x1d", start + 20, body) >= 0 and _ao_breaks_scapy(data, start + 20, body):
+        return UNSUPPORTED  # scapy keeps this segment as Raw: no TCP layer
     ports = _TCP_PORTS
     if ports is not None and sport not in ports and dport not in ports:
         app = _RAW

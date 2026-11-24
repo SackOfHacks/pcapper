@@ -192,8 +192,9 @@ def test_disk_run_reads_the_capture_once(
 def test_single_step_with_nested_analyses_is_kept_in_memory(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """--http alone starts the file analysis too: the capture is loaded once
-    and both read it from memory, not from disk each."""
+    """--domain alone starts DNS, TLS, HTTP and the file analysis too, and the
+    domain analysis reads scapy packets: the capture is loaded once and every
+    one reads it from memory, not from disk each."""
     path = _mixed(tmp_path)
     opened: list[int] = []
     real_init = LiteStream.__init__
@@ -211,16 +212,83 @@ def test_single_step_with_nested_analyses_is_kept_in_memory(
 
     monkeypatch.setattr(LiteStream, "__init__", _counting_init)
     monkeypatch.setattr(pcap_cache, "load_packets", _counting_load)
-    _run(path, ["--http"], monkeypatch)
+    _run(path, ["--domain"], monkeypatch)
     assert loads == [1]
     assert opened == []
+
+
+def test_lite_only_plan_streams_instead_of_loading(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """--http and --creds start only analyses that read lite records (HTTP,
+    files, NFS, AIM, telnet). Streamed (PCAPPER_LITE_STREAM=1), one shared
+    read from disk dissects just the packets they ask for instead of loading
+    every packet with scapy; a small capture is loaded as before."""
+    path = _mixed(tmp_path)
+    opened: list[int] = []
+    real_init = LiteStream.__init__
+
+    def _counting_init(self, *args, **kwargs):  # type: ignore[no-untyped-def]
+        opened.append(1)
+        real_init(self, *args, **kwargs)
+
+    loads: list[int] = []
+    real_load = pcap_cache.load_packets
+
+    def _counting_load(*args, **kwargs):  # type: ignore[no-untyped-def]
+        loads.append(1)
+        return real_load(*args, **kwargs)
+
+    monkeypatch.setattr(LiteStream, "__init__", _counting_init)
+    monkeypatch.setattr(pcap_cache, "load_packets", _counting_load)
+    for flags in (["--http"], ["--creds"]):
+        opened.clear()
+        loads.clear()
+        _run(path, flags, monkeypatch, PCAPPER_LITE_STREAM="1")
+        assert loads == [], flags
+        assert len(opened) == 1, flags
+        monkeypatch.delenv("PCAPPER_LITE_STREAM")
+        opened.clear()
+        _run(path, flags, monkeypatch)  # small: loaded, no look at its head
+        assert loads == [1], flags
+        assert opened == [], flags
+
+
+def test_lite_only_plans_stream_scans_and_load_payloads(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Above the size floor the head decides: a capture of payload-less
+    segments (a scan) is streamed, one whose packets carry data is loaded."""
+    from scapy.all import UDP
+
+    scan = tmp_path / "scan.pcap"
+    wrpcap(str(scan), [Ether() / IP(src="10.0.0.1", dst=f"10.0.{i // 250}.{i % 250 + 1}") / TCP(sport=40000, dport=i, flags="S") for i in range(1, 2000)])
+    data = tmp_path / "data.pcap"
+    wrpcap(str(data), [Ether() / IP(src="10.0.0.1", dst="10.0.0.2") / UDP(sport=5000, dport=6000) / Raw(b"x" * 400) for _ in range(400)])
+    monkeypatch.setattr(cli, "_LITE_STREAM_MIN_BYTES", 1024)
+    cli._LITE_STREAM_DECISIONS.clear()
+    assert cli._streams_lite_plan(scan, True) is True
+    assert cli._streams_lite_plan(data, True) is False
+    monkeypatch.setattr(cli, "_LITE_STREAM_MIN_BYTES", 1 << 40)
+    cli._LITE_STREAM_DECISIONS.clear()
+    assert cli._streams_lite_plan(scan, True) is False  # below the floor: loaded without looking
+    monkeypatch.setenv("PCAPPER_LITE_STREAM", "1")
+    assert cli._streams_lite_plan(data, True) is True
+    monkeypatch.setenv("PCAPPER_LITE_STREAM", "0")
+    monkeypatch.setattr(cli, "_LITE_STREAM_MIN_BYTES", 1024)
+    cli._LITE_STREAM_DECISIONS.clear()
+    assert cli._streams_lite_plan(scan, True) is False
+    cli._LITE_STREAM_DECISIONS.clear()
 
 
 def test_in_memory_jobs_give_the_same_report(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     if not sharedpass.parallel_available():
         pytest.skip("needs fork()")
     path = _mixed(tmp_path)
-    single = _run(path, ["--overview", "--jobs", "1"], monkeypatch)
+    # --compromised: ~100 analyses, a few of which read scapy packets, so the
+    # capture is held in memory (--overview's all read lightweight records
+    # and stream it instead).
+    single = _run(path, ["--compromised", "--jobs", "1"], monkeypatch)
     returned: list[tuple[bool, int]] = []
     real_groups = sharedpass._run_groups
 
@@ -230,7 +298,7 @@ def test_in_memory_jobs_give_the_same_report(tmp_path: Path, monkeypatch: pytest
         return count
 
     monkeypatch.setattr(sharedpass, "_run_groups", _counting_groups)
-    parallel = _run(path, ["--overview", "--jobs", "4"], monkeypatch)
+    parallel = _run(path, ["--compromised", "--jobs", "4"], monkeypatch)
     assert parallel == single
     assert returned and all(in_memory for in_memory, _count in returned)
     assert sum(count for _in_memory, count in returned) > 10  # the analyses really ran in workers
@@ -245,7 +313,8 @@ def test_jobs_for_a_capture_in_memory(tmp_path: Path, monkeypatch: pytest.Monkey
         sharedpass.set_jobs(None)
         monkeypatch.setattr(pcap_cache, "_available_memory", lambda: 10**15)
         assert sharedpass.jobs_for(path, analyses=50) == sharedpass.auto_jobs()
-        assert sharedpass.jobs_for(path, analyses=3) == 1  # too few to spread
+        assert sharedpass.jobs_for(path, analyses=3) == min(3, sharedpass.auto_jobs())
+        assert sharedpass.jobs_for(path, analyses=1) == 1  # nothing to spread
         # Each worker may copy the packets' memory: no more than half of
         # what is available holds.
         per_worker = 1_000_000 * pcap_cache.PACKET_MEMORY_BYTES

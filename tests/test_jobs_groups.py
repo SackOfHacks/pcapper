@@ -140,14 +140,21 @@ def test_lite_analyses_gather_where_nothing_is_dissected() -> None:
 def test_the_plan_knows_what_each_analysis_reads(tmp_path: Path) -> None:
     path = tmp_path / "mixed.pcap"
     shutil.copy(DATA / "mixed.pcap", path)
+    from pcapper.compromised import analyze_compromised
+    from pcapper.overview import analyze_overview
     from pcapper.threats import analyze_threats
 
-    plan = sharedpass.discover(path, [(analyze_threats, (), {})])
+    plan = sharedpass.discover(path, [(analyze_compromised, (), {})])
     assert len(plan.reads) == len(plan)
     reads = dict(zip((call[0].__module__.rsplit(".", 1)[-1] for call in plan.calls), plan.reads))
-    assert reads["http"] == "packets"
-    assert "lite" in plan.reads  # OT protocol analyses read lite records
+    assert reads["domain"] == reads["hosts"] == "packets"
+    assert reads["http"] == reads["creds"] == reads["dns"] == "lite"
     assert pcap_cache._READ_NOTE is None  # only while planning
+    # Every analysis --threats and --overview start reads lightweight records:
+    # neither run dissects every packet of a capture.
+    for root in (analyze_threats, analyze_overview):
+        reads = sharedpass.discover(path, [(root, (), {})]).reads
+        assert reads and "packets" not in reads and "lite" in reads
 
 
 def test_packets_built_from_disk_records_keep_their_layer_lookups(tmp_path: Path) -> None:

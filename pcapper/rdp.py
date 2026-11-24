@@ -7,6 +7,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float, packet_length, extract_ascii_strings as _extract_ascii_strings
 from .utils import beacon_score as _beaconing_score
@@ -623,6 +624,37 @@ def _find_decrypted_payload(
     return None, None
 
 
+def _lite_not_rdp(
+    record: LitePacket,
+    meta: object | None,
+    pkt_index: int,
+    decrypted_payloads: dict[int, bytes] | None,
+) -> bool:
+    """True when the scapy path certainly drops the record, read from its
+    bytes: no TCP/UDP layer, or a segment/datagram off the RDP ports whose
+    payload prefix holds no RDP cookie or RDPUDP tag and that has no decrypted
+    payload. The payload is ``bytes(Raw)`` (or, without a Raw layer,
+    ``bytes(transport.payload)``): both are everything from the payload's
+    start, Ethernet padding included."""
+    l4 = record.lite_l4()
+    if l4 is None:
+        return True
+    if l4 is UNSUPPORTED:
+        return False
+    sport, dport = l4[1], l4[2]
+    rdp_ports = RDP_TCP_PORTS if l4[0] else RDP_UDP_PORTS
+    if dport in rdp_ports or (sport in rdp_ports and dport >= _EPHEMERAL_MIN):
+        return False
+    if l4[5] < 0:
+        return False  # scapy dissects the payload further: let it decide
+    payload_prefix = record.original[l4[5] : l4[5] + 128]
+    if b"Cookie: mstshash=" in payload_prefix or b"RDPUDP" in payload_prefix:
+        return False
+    # A packet read from a capture never carries ``pcapper_rdp_decrypted``
+    # (asking the record would dissect it): the other sources decide.
+    return not _find_decrypted_payload(None, meta, pkt_index, decrypted_payloads)[0]
+
+
 def _parse_rdp_decrypted_identity(
     payload: bytes,
 ) -> tuple[Optional[str], Optional[str], Optional[str]]:
@@ -784,7 +816,9 @@ def analyze_rdp(
     auth_evidence_cap_reached = False
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             pkt_index += 1
             total_packets += 1
             pkt_len = packet_length(pkt)
@@ -793,6 +827,11 @@ def analyze_rdp(
             src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
+
+            if type(pkt) is LitePacket:
+                if _lite_not_rdp(pkt, meta, pkt_index, decrypted_payloads):
+                    continue
+                pkt = pkt.materialize()
 
             is_udp = UDP is not None and pkt.haslayer(UDP)  # type: ignore[truthy-bool]
             is_tcp = TCP is not None and pkt.haslayer(TCP)  # type: ignore[truthy-bool]

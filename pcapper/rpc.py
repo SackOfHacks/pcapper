@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Iterable, Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import (
     extract_ascii_strings,
@@ -408,6 +409,19 @@ def _find_rpc_pdu(payload: bytes | None) -> tuple[Optional[str], int]:
     return None, 0
 
 
+def _lite_not_rpc(record: LitePacket) -> bool:
+    """True when the scapy path certainly drops the record, read from its
+    bytes: no TCP/UDP layer, or a payload that is empty or holds no DCE/RPC
+    PDU. The payload is ``bytes(transport.payload)``: everything from the
+    payload's start, Ethernet padding included."""
+    l4 = record.lite_l4()
+    if l4 is None:
+        return True
+    if l4 is UNSUPPORTED or l4[5] < 0:
+        return False  # only scapy can tell (or build the payload)
+    return not _find_rpc_pdu(record.original[l4[7] :])[0]
+
+
 def _decode_uuid_le(data: bytes) -> Optional[str]:
     if len(data) < 16:
         return None
@@ -652,7 +666,9 @@ def analyze_rpc(
     bind_failures: Counter[str] = Counter()
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
@@ -667,6 +683,11 @@ def analyze_rpc(
 
             if not src_ip or not dst_ip:
                 continue
+
+            if type(pkt) is LitePacket:
+                if _lite_not_rpc(pkt):
+                    continue
+                pkt = pkt.materialize()
 
             proto = None
             sport = None

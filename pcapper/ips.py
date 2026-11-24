@@ -14,6 +14,7 @@ from functools import lru_cache
 from pathlib import Path
 from typing import Iterable, Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .tls_fingerprints import (
     _extract_alpn,
@@ -1205,8 +1206,141 @@ def analyze_ips(
     skipped_packets = 0
     first_skip_error: str | None = None
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    # Read from disk, records come lite: a TCP/UDP packet (most of a large
+    # capture) is accounted from its bytes, anything else is dissected.
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status, lite=True):
         try:
+            if type(pkt) is LitePacket:
+                l3 = pkt.headers()[1]
+                if l3 is None:
+                    continue  # no IP, IPv6 or ARP layer: skipped below as well
+                # The record's only TCP/UDP header right behind its IPv4/IPv6
+                # one answers; a TCP payload scapy dissects may hold the TLS
+                # layers looked for below, so it is dissected (a Raw one, or
+                # none, holds none).
+                l4 = pkt.lite_l4()
+                ether = pkt.lite_first_ether()
+                if (
+                    l4 is None
+                    or l4 is UNSUPPORTED
+                    or (l4[0] and l4[5] < 0)
+                    or ether is UNSUPPORTED
+                ):
+                    pkt = pkt.materialize()
+                else:
+                    # The scapy path below, step for step, on the record's bytes.
+                    src_ip, dst_ip = pkt.lite_endpoints()
+                    family_set = ipv4_set if l3[0] == 4 else ipv6_set
+                    if src_ip:
+                        set_add_cap(family_set, src_ip, max_size=MAX_UNIQUE_IPS)
+                    if dst_ip:
+                        set_add_cap(family_set, dst_ip, max_size=MAX_UNIQUE_IPS)
+                    if not src_ip or not dst_ip:
+                        continue
+
+                    if ether is not None:  # (type, src, dst, payload offset)
+                        _record_mac(src_ip, ether[1])
+                        _record_mac(dst_ip, ether[2])
+
+                    total_packets += 1
+                    pkt_len = packet_length(pkt)
+                    total_bytes += pkt_len
+
+                    is_tcp, sport, dport = l4[0], l4[1], l4[2]
+                    protocol = "TCP" if is_tcp else "UDP"
+                    counter_inc(protocol_counts, protocol)
+
+                    set_add_cap(unique_ips, src_ip, max_size=MAX_UNIQUE_IPS)
+                    set_add_cap(unique_ips, dst_ip, max_size=MAX_UNIQUE_IPS)
+                    set_add_cap(src_ips, src_ip, max_size=MAX_UNIQUE_IPS)
+                    set_add_cap(dst_ips, dst_ip, max_size=MAX_UNIQUE_IPS)
+
+                    counter_inc(src_counts, src_ip)
+                    counter_inc(dst_counts, dst_ip)
+
+                    for category in _classify_ip(src_ip):
+                        counter_inc(ip_category_counts, category)
+                    for category in _classify_ip(dst_ip):
+                        counter_inc(ip_category_counts, category)
+
+                    ts = safe_float(getattr(pkt, "time", None))
+                    if ts is not None:
+                        if first_seen is None or ts < first_seen:
+                            first_seen = ts
+                        if last_seen is None or ts > last_seen:
+                            last_seen = ts
+
+                    conv_key = (src_ip, dst_ip, protocol)
+                    conv = None
+                    if (
+                        conv_key not in conversations
+                        and len(conversations) >= MAX_CONVERSATIONS
+                    ):
+                        skipped_conversations += 1
+                        conv = None
+                    else:
+                        conv = conversations[conv_key]
+                        conv["packets"] = int(conv["packets"]) + 1
+                        conv["bytes"] = int(conv["bytes"]) + pkt_len
+
+                    if conv is not None and ts is not None:
+                        if conv["first_seen"] is None or ts < conv["first_seen"]:  # type: ignore[operator]
+                            conv["first_seen"] = ts
+                        if conv["last_seen"] is None or ts > conv["last_seen"]:  # type: ignore[operator]
+                            conv["last_seen"] = ts
+
+                    # Ports are ints here, never None.
+                    if conv is not None:
+                        set_add_cap(conv["ports"], sport, max_size=MAX_SET_VALUES)
+                        set_add_cap(conv["ports"], dport, max_size=MAX_SET_VALUES)
+                    if is_tcp:
+                        flags = l4[4]  # tcp_flags_int() of scapy's flags value
+                        flow_key = (src_ip, dst_ip, sport, dport)
+                        reverse_key = (dst_ip, src_ip, dport, sport)
+                        if _tcp_is_syn(flags):
+                            syn_seen.add(flow_key)
+                        elif _tcp_is_synack(flags):
+                            if reverse_key in syn_seen:
+                                syn_ack_seen.add(reverse_key)
+                        elif _tcp_is_final_handshake_ack(flags):
+                            if flow_key in syn_seen and flow_key in syn_ack_seen:
+                                handshake_complete.add(flow_key)
+
+                        if flow_key in handshake_complete:
+                            confirmed_tcp_service_ports[dst_ip].add(dport)
+                        elif reverse_key in handshake_complete:
+                            confirmed_tcp_service_ports[src_ip].add(sport)
+                    # Client-initiated flows only (see the TCP note below).
+                    if sport >= 1024:
+                        setdict_add(src_to_ports, src_ip, dport, max_values=MAX_SET_VALUES)
+                        setdict_add(src_to_dsts, src_ip, dst_ip, max_values=MAX_SET_VALUES)
+                    setdict_add(dst_to_ports, dst_ip, dport, max_values=MAX_SET_VALUES)
+                    setdict_add(dst_to_srcs, dst_ip, src_ip, max_values=MAX_SET_VALUES)
+
+                    for ip_text, direction in ((src_ip, "sent"), (dst_ip, "recv")):
+                        if ip_text not in endpoints and len(endpoints) >= MAX_ENDPOINTS:
+                            skipped_endpoints += 1
+                            continue
+                        entry = endpoints[ip_text]
+                        if direction == "sent":
+                            entry["packets_sent"] = int(entry["packets_sent"]) + 1
+                            entry["bytes_sent"] = int(entry["bytes_sent"]) + pkt_len
+                        else:
+                            entry["packets_recv"] = int(entry["packets_recv"]) + 1
+                            entry["bytes_recv"] = int(entry["bytes_recv"]) + pkt_len
+
+                        set_add_cap(entry["protocols"], protocol, max_size=MAX_SET_VALUES)
+                        peer = dst_ip if ip_text == src_ip else src_ip
+                        set_add_cap(entry["peers"], peer, max_size=MAX_SET_VALUES)
+                        port = sport if ip_text == src_ip else dport
+                        set_add_cap(entry["ports"], port, max_size=MAX_SET_VALUES)
+
+                        if ts is not None:
+                            if entry["first_seen"] is None or ts < entry["first_seen"]:  # type: ignore[operator]
+                                entry["first_seen"] = ts
+                            if entry["last_seen"] is None or ts > entry["last_seen"]:  # type: ignore[operator]
+                                entry["last_seen"] = ts
+                    continue
             is_arp = False
             ip_layer = pkt.getlayer(IP) if IP is not None else None
             if ip_layer is not None:

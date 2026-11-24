@@ -53,6 +53,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import (
     extract_packet_endpoints,
@@ -611,6 +612,33 @@ def _transport_payload(pkt: object, layer: object) -> bytes:
     except Exception:
         pass
     return b""
+
+
+def _lite_view(record: LitePacket) -> object:
+    """``(is_udp, sport, dport, payload)`` the loop reads from a lite record
+    whose only TCP/UDP layer carries a ``Raw`` payload or nothing, from its
+    bytes, ``payload`` as :func:`_transport_payload` gives it: what the Raw
+    layer was dissected from (padding-stripped) or, behind an empty TCP
+    segment, the ``Padding`` layer scapy hangs there -- the Ethernet padding,
+    scanned like any payload. None when the record has no TCP or UDP layer;
+    UNSUPPORTED when only scapy can tell."""
+    l4 = record.lite_l4()
+    if l4 is None:
+        return None
+    if l4 is UNSUPPORTED or l4[5] < 0:
+        return UNSUPPORTED
+    data = record.original
+    if l4[6] > l4[5]:
+        payload = data[l4[5] : l4[6]]
+    elif l4[0]:
+        payload = data[l4[6] :]  # the IP padding: one Padding layer, or none
+    elif len(data) > l4[6]:
+        # An empty datagram with bytes behind it: its UDP and IP lengths may
+        # split them into two Padding layers, only the first of which counts.
+        return UNSUPPORTED
+    else:
+        payload = b""
+    return (not l4[0], l4[1], l4[2], payload)
 
 
 # --- SIP parsing ------------------------------------------------------------
@@ -1378,26 +1406,44 @@ def analyze_voip(
         )
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        # Read from disk, records come lite: media and every empty segment are
+        # read from their bytes; only what scapy dissects further (or what the
+        # lite parser cannot read) is dissected.
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             totals["total_packets"] += 1
             ts = safe_float(getattr(pkt, "time", None))
             _touch(ts)
 
-            is_udp = UDP is not None and pkt.haslayer(UDP)
-            is_tcp = TCP is not None and pkt.haslayer(TCP)
-            if not is_udp and not is_tcp:
-                continue
+            view = None
+            if type(pkt) is LitePacket:
+                view = _lite_view(pkt)
+                if view is None:
+                    continue  # no TCP or UDP layer
+                if view is UNSUPPORTED:
+                    view = None
+                    pkt = pkt.materialize()
+            if view is not None:
+                is_udp, sport, dport, payload = view
+                is_tcp = not is_udp
+            else:
+                is_udp = UDP is not None and pkt.haslayer(UDP)
+                is_tcp = TCP is not None and pkt.haslayer(TCP)
+                if not is_udp and not is_tcp:
+                    continue
 
-            layer = pkt[UDP] if is_udp else pkt[TCP]
-            sport = int(getattr(layer, "sport", 0) or 0)
-            dport = int(getattr(layer, "dport", 0) or 0)
+                layer = pkt[UDP] if is_udp else pkt[TCP]
+                sport = int(getattr(layer, "sport", 0) or 0)
+                dport = int(getattr(layer, "dport", 0) or 0)
             src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
             if target_ip and target_ip not in (src_ip, dst_ip):
                 continue
 
-            payload = _transport_payload(pkt, layer)
+            if view is None:
+                payload = _transport_payload(pkt, layer)
             if not payload:
                 continue
 

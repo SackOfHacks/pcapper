@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .openvpn import OPENVPN_OPCODES, openvpn_tcp_control_opcodes, openvpn_udp_control_opcodes
 from .utils import x509_names
@@ -170,6 +171,45 @@ def _infer_client_server(
     if sport is not None:
         return dst_ip, src_ip, sport
     return src_ip, dst_ip, None
+
+
+def _lite_not_vpn(record: LitePacket) -> bool:
+    """True when the loop of :func:`analyze_vpn` records nothing for
+    ``record`` (whose endpoints it already has), read from its bytes: the IP
+    protocol is not a tunnel one, and there is no TCP/UDP layer or its ports
+    and payload match no VPN. A payload scapy dissects further is left to
+    scapy."""
+    l3 = record.headers()[1]
+    l4 = record.lite_l4()
+    if l3 is UNSUPPORTED or l4 is UNSUPPORTED:
+        return False
+    # _packet_ip_proto: the first IPv4 layer's protocol (IPv4 header at
+    # offset-12, protocol 9 bytes in). An IPv6 record parsed here has no IPv4
+    # layer and a next header of TCP, UDP, ICMPv6 or none.
+    if l3 is not None and l3[0] == 4 and record.original[l3[1] - 3] in VPN_IP_PROTOCOLS:
+        return False
+    if l4 is None:
+        return True  # neither TCP nor UDP
+    if l4[5] < 0:
+        return False
+    sport, dport = l4[1], l4[2]
+    # bytes(transport.payload): the payload and any padding behind it
+    payload = record.original[l4[7] :]
+    if l4[0]:
+        opcodes = openvpn_tcp_control_opcodes(payload)
+        port_match = _vpn_port_match(sport, dport)
+        if port_match and 443 in {sport, dport} and not (opcodes or _looks_like_sstp(payload)):
+            return True
+        return not (port_match or opcodes)
+    opcodes = (
+        openvpn_udp_control_opcodes(payload)
+        if sport in {1194, 4433, 443} or dport in {1194, 4433, 443}
+        else []
+    )
+    udp_port_match = _vpn_port_match(sport, dport)
+    if 443 in {sport, dport} and not opcodes:
+        udp_port_match = False
+    return not (udp_port_match or opcodes)
 
 
 def _record_artifact_correlation(
@@ -373,13 +413,19 @@ def analyze_vpn(
             last_seen = ts
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             total_packets += 1
             ts = safe_float(getattr(pkt, "time", None))
 
             src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
+            if type(pkt) is LitePacket:
+                if TCP is not None and UDP is not None and _lite_not_vpn(pkt):
+                    continue
+                pkt = pkt.materialize()
 
             ip_proto = _packet_ip_proto(pkt)
             if ip_proto in VPN_IP_PROTOCOLS:

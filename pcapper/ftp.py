@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import (
     counter_inc,
@@ -553,6 +554,46 @@ def _tcp_payload_bytes(ip_layer: object, tcp_layer: object) -> bytes:
     return raw[:length]
 
 
+def _lite_no_tcp_payload(record: LitePacket) -> bool:
+    """True when ``analyze_ftp`` drops ``record`` before reading a payload,
+    read from its bytes: no TCP layer, or a segment whose ``Raw`` load is
+    empty. Then :func:`_tcp_payload_bytes` is empty too: ``bytes(tcp.payload)``
+    is nothing but padding and the IP length leaves no data (or there are no
+    bytes at all), so the scapy path's ``if not payload: continue`` drops it."""
+    l4 = record.lite_l4()
+    if l4 is None:
+        return True
+    if l4 is UNSUPPORTED:
+        return False
+    if not l4[0]:
+        return True  # UDP only: getlayer(TCP) finds nothing
+    return 0 <= l4[5] == l4[6]
+
+
+def _lite_macs(
+    record: LitePacket, src_ip: str, dst_ip: str
+) -> Optional[tuple[tuple[str, str], ...]]:
+    """The (IP, MAC) pairs ``_record_mac`` adds for ``record``, read from its
+    bytes: the first Ethernet layer's source and destination MAC beside the
+    first IPv4 layer's addresses (``src_ip``/``dst_ip``, which
+    extract_packet_endpoints read from that IPv4 header). None when only
+    scapy can tell."""
+    try:
+        ether = record.lite_first_ether()
+    except Exception:  # noqa: BLE001 - any surprise means "ask scapy"
+        return None
+    if ether is UNSUPPORTED:
+        return None
+    if ether is None:
+        return ()  # Ether not in pkt
+    l3 = record.headers()[1]
+    if l3 is UNSUPPORTED:
+        return None
+    if l3 is None or l3[0] != 4:
+        return ()  # IP not in pkt: an IPv6 or ARP record parsed here has none below
+    return ((src_ip, ether[1]), (dst_ip, ether[2]))
+
+
 def _confirms_ftp(is_response: bool, response: Optional[tuple[str, str, str]], command: str) -> bool:
     """Is this line FTP-specific enough to confirm a flow on a non-FTP port?"""
     if is_response and response is not None:
@@ -1080,7 +1121,9 @@ def analyze_ftp(
             last_seen = ts
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
@@ -1089,6 +1132,16 @@ def analyze_ftp(
             src_ip, dst_ip = extract_packet_endpoints(pkt)
             if not src_ip or not dst_ip:
                 continue
+
+            if type(pkt) is LitePacket:
+                # A record without a TCP payload is dropped from its bytes,
+                # after the MAC bookkeeping _record_mac does for every packet.
+                macs = _lite_macs(pkt, src_ip, dst_ip)
+                if macs is not None and _lite_no_tcp_payload(pkt):
+                    for ip_value, mac in macs:
+                        setdict_add(mac_addresses, ip_value, mac, max_values=MAX_FTP_UNIQUE)
+                    continue
+                pkt = pkt.materialize()
 
             _record_mac(pkt)
 

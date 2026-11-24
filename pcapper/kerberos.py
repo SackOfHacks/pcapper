@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 
@@ -939,11 +940,22 @@ def analyze_kerberos(
     asrep_without_preauth: Counter[str] = Counter()
     asrep_roastable_accounts: set[str] = set()
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status, lite=True):
         total_packets += 1
         src_ip, dst_ip = extract_packet_endpoints(pkt)
         if not src_ip or not dst_ip:
             continue
+
+        if type(pkt) is LitePacket:
+            # Only Kerberos-port traffic goes further. The ports are those of
+            # the record's first TCP header (TCP is looked at first, whatever
+            # scapy builds behind it), else of its only UDP header.
+            l4 = pkt.lite_ports()
+            if l4 is None:
+                continue
+            if l4 is not UNSUPPORTED and _kerberos_roles(src_ip, dst_ip, l4[1], l4[2]) is None:
+                continue
+            pkt = pkt.materialize()
 
         payload = b""
         proto = None

@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_packet_endpoints, memoize_analysis, safe_float
 from .utils import env_int
@@ -119,8 +120,23 @@ def analyze_quic(
     last_seen: Optional[float] = None
     flow_cap_reached = False
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    for pkt in iter_packets(
+        path, packets=packets, meta=meta, show_status=show_status, lite=True
+    ):
         total_packets += 1
+        if type(pkt) is LitePacket:
+            # Only UDP on a QUIC port whose payload opens like QUIC goes
+            # further: decided from the record's only UDP header and bytes.
+            l4 = pkt.lite_l4()
+            if l4 is None:
+                continue  # no UDP layer
+            if l4 is not UNSUPPORTED:
+                if l4[0] or (l4[1] not in QUIC_PORTS and l4[2] not in QUIC_PORTS):
+                    continue  # TCP only, or off the QUIC ports
+                # bytes(udp.payload): the payload and any padding behind it
+                if l4[5] >= 0 and not _looks_like_quic(pkt.original[l4[7] :]):
+                    continue
+            pkt = pkt.materialize()
         udp = pkt.getlayer(UDP)  # type: ignore[arg-type]
         if udp is None:
             continue

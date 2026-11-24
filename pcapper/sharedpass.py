@@ -916,7 +916,10 @@ def _worth_processes(packets: Optional[int], analyses: Optional[int]) -> bool:
         return False
     if analyses is None:
         return packets >= AUTO_JOBS_MIN_PACKETS
-    return analyses >= 4 and packets * analyses >= AUTO_JOBS_MIN_WORK
+    # Two analyses already gain: in one process they share one interpreter
+    # lock. --creds (creds, HTTP, telnet) of 1M maccdc2010 packets from disk:
+    # 38 s in one process, 24.5 s in three; of 250k, 6.7 s and 5.8 s.
+    return analyses >= 2 and packets * analyses >= AUTO_JOBS_MIN_WORK
 
 
 def jobs_for(path: Path, *, analyses: Optional[int] = None) -> int:

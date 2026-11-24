@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import dns_questions, extract_packet_endpoints, fan_out, memoize_analysis, safe_float
 from .utils import is_public_ip as _is_public_ip
@@ -121,6 +122,22 @@ def _extract_payload(pkt) -> bytes:
         except Exception:
             return b""
     return b""
+
+
+def _lite_view(record: LitePacket) -> Optional[tuple[str, bytes]]:
+    """``(_proto_label, _extract_payload)`` of a lite record whose only TCP/UDP
+    layer carries a ``Raw`` payload or nothing, from its bytes: the Raw load
+    (padding-stripped), or without a Raw layer ``bytes(transport.payload)``,
+    i.e. the Ethernet padding behind an empty segment -- scanned like any
+    payload, and it runs into the flow's tail. Such a record has no DNS layer.
+    None when only scapy can tell."""
+    l4 = record.lite_l4()
+    if l4 is None or l4 is UNSUPPORTED or l4[5] < 0:
+        return None
+    label = f"{'TCP' if l4[0] else 'UDP'}/{l4[2]}"
+    if l4[6] > l4[5]:
+        return label, record.original[l4[5] : l4[6]]
+    return label, record.original[l4[7] :]
 
 
 # ``key=value`` with a real value (not just base64 ``=`` padding).
@@ -389,8 +406,11 @@ def analyze_ctf(
                     f"pkt={packet_number} {_pattern_name(pattern)} via {decode_chain}"
                 )
 
+    # Read from disk, records come lite: the protocol label and payload of
+    # most are read from their bytes instead of a dissection.
     for pkt_index, pkt in enumerate(
-        iter_packets(path, packets=packets, meta=meta, show_status=show_status), start=1
+        iter_packets(path, packets=packets, meta=meta, show_status=show_status, lite=True),
+        start=1,
     ):
         total_packets += 1
         ts = safe_float(getattr(pkt, "time", None))
@@ -404,9 +424,15 @@ def analyze_ctf(
         if not src_ip or not dst_ip:
             continue
 
-        protocol = _proto_label(pkt)
+        view = _lite_view(pkt) if type(pkt) is LitePacket else None
+        if view is not None:
+            protocol, payload = view
+        else:
+            if type(pkt) is LitePacket:
+                pkt = pkt.materialize()
+            protocol = _proto_label(pkt)
 
-        payload = _extract_payload(pkt)
+            payload = _extract_payload(pkt)
         if not payload:
             continue
         text = payload.decode("latin-1", errors="ignore")
@@ -546,7 +572,8 @@ def analyze_ctf(
                     )
         flow_text_tail[flow_key] = combined[-256:]
 
-        if DNS is not None and pkt.haslayer(DNS):  # type: ignore[truthy-bool]
+        # A lite view's record has no DNS layer.
+        if view is None and DNS is not None and pkt.haslayer(DNS):  # type: ignore[truthy-bool]
             try:
                 dns_layer = pkt[DNS]  # type: ignore[index]
                 for qname, _qtype in dns_questions(dns_layer):

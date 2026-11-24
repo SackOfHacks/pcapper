@@ -21,6 +21,7 @@ try:
 except ImportError:  # pragma: no cover - scapy optional at runtime
     IP = IPv6 = TCP = UDP = Raw = None
 
+from .lite import UNSUPPORTED, LitePacket
 from .ot_ports import OT_PORT_PROTOCOLS
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import (
@@ -152,11 +153,40 @@ def analyze_remote_access(
         return state
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             ts = safe_float(getattr(pkt, "time", None)) or 0.0
             src, dst = extract_packet_endpoints(pkt)
             if not src or not dst or src == dst:
                 continue
+
+            if type(pkt) is LitePacket:
+                # Only traffic to an OT port, a SYN or SYN-ACK of a remote-
+                # access port, or an ACK of a handshake being tracked changes
+                # anything: decided from the record's only TCP/UDP header and
+                # the handshake table, the rest is never dissected.
+                l4 = pkt.lite_l4()
+                if l4 is None:
+                    continue  # no TCP/UDP layer
+                if l4 is not UNSUPPORTED and l4[2] not in OT_PORT_PROTOCOLS:
+                    if not l4[0]:
+                        continue  # UDP: only the OT ports count
+                    sport, dport, flags = l4[1], l4[2], l4[4]
+                    is_syn = bool(flags & _SYN)
+                    is_ack = bool(flags & _ACK)
+                    if not (
+                        (is_syn and not is_ack and dport in REMOTE_ACCESS_PORTS)
+                        or (is_syn and is_ack and sport in REMOTE_ACCESS_PORTS)
+                        or (
+                            is_ack
+                            and not is_syn
+                            and dport in REMOTE_ACCESS_PORTS
+                            and (src, dst, sport, dport) in hs
+                        )
+                    ):
+                        continue
+                pkt = pkt.materialize()
 
             has_tcp = TCP is not None and pkt.haslayer(TCP)
             has_udp = UDP is not None and pkt.haslayer(UDP)

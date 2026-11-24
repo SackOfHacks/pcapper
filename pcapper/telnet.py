@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Optional
 
 from .device_detection import device_fingerprints_from_text
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import extract_ascii_strings as _extract_ascii_strings
 from .utils import (
@@ -324,6 +325,28 @@ def _tcp_payload_bytes(pkt: object, tcp: object) -> bytes:
     return raw if length is None else raw[:length]
 
 
+def _lite_not_telnet(record: LitePacket) -> bool:
+    """True when the record is certainly not telnet, read from its bytes: no
+    TCP layer, or a segment off the telnet ports whose payload does not open
+    with a WILL/DO. The payload checked runs on into any Ethernet padding, so
+    it starts with the option only if the padding-stripped one might: a
+    record kept here is decided by the scapy path."""
+    l4 = record.lite_l4()
+    if l4 is None:
+        return True
+    if l4 is UNSUPPORTED:
+        return False
+    if not l4[0]:
+        return True  # UDP only
+    sport, dport = l4[1], l4[2]
+    if dport in TELNET_PORTS or (sport in TELNET_PORTS and dport >= _EPHEMERAL_MIN):
+        return False
+    if l4[5] < 0:
+        return False  # scapy dissects the payload further: let it decide
+    head = record.original[l4[5] : l4[5] + 2]
+    return head != b"\xff\xfb" and head != b"\xff\xfd"
+
+
 def _direction(
     src_ip: str, dst_ip: str, sport: int, dport: int
 ) -> tuple[str, str, int, int]:
@@ -422,10 +445,17 @@ def analyze_telnet(
     transcript_limit_reported = False
 
     try:
-        for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+        for pkt in iter_packets(
+            path, packets=packets, meta=meta, show_status=show_status, lite=True
+        ):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
+
+            if type(pkt) is LitePacket:
+                if _lite_not_telnet(pkt):
+                    continue
+                pkt = pkt.materialize()
 
             if TCP is None or not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
                 continue

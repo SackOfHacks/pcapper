@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 
 from .device_detection import device_fingerprints_from_text
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import (
     extract_packet_endpoints,
@@ -102,6 +103,9 @@ _CLIENT_MSG_TYPES.update(
         "RELAY-FORWv6",
     }
 )
+# The UDP ports the packet loop looks at (DHCP, then DHCPv6): a lite record
+# with neither port on either side is never dissected.
+_LITE_DHCP_PORTS = frozenset((67, 68, 546, 547))
 
 
 @dataclass
@@ -609,8 +613,19 @@ def analyze_dhcp(
     skipped_packets = 0
     first_skip_error: str | None = None
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status, lite=True):
         summary.total_packets += 1
+        if type(pkt) is LitePacket:
+            # Only UDP on a DHCP or DHCPv6 port goes further: decided from the
+            # record's only TCP/UDP header, the rest is never dissected.
+            l4 = pkt.lite_l4()
+            if l4 is None:
+                continue
+            if l4 is not UNSUPPORTED and (
+                l4[0] or (l4[1] not in _LITE_DHCP_PORTS and l4[2] not in _LITE_DHCP_PORTS)
+            ):
+                continue
+            pkt = pkt.materialize()
         udp_layer = pkt.getlayer(UDP)
         if udp_layer is None:
             continue

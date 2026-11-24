@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Iterable, Optional
 from urllib.parse import parse_qsl
 
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import decode_payload, extract_packet_endpoints, memoize_analysis, packet_length, safe_float
 
@@ -225,10 +226,29 @@ def analyze_aim(
     non_standard_ports: Counter[int] = Counter()
 
     try:
-        for idx, pkt in enumerate(iter_packets(path, packets=packets, meta=meta, show_status=show_status), start=1):
+        for idx, pkt in enumerate(
+            iter_packets(path, packets=packets, meta=meta, show_status=show_status, lite=True),
+            start=1,
+        ):
             total_packets += 1
             pkt_len = packet_length(pkt)
             total_bytes += pkt_len
+            if type(pkt) is LitePacket:
+                # Only AIM ports, and TLS ports AIM may be tunnelled over, are
+                # looked at: decided from the record's only TCP header.
+                l4 = pkt.lite_l4()
+                if l4 is None:
+                    continue
+                if l4 is not UNSUPPORTED:
+                    sport, dport = l4[1], l4[2]
+                    if not l4[0] or not (
+                        dport in AIM_PORTS
+                        or (sport in AIM_PORTS and dport >= 1024)
+                        or sport in TLS_TUNNEL_PORTS
+                        or dport in TLS_TUNNEL_PORTS
+                    ):
+                        continue
+                pkt = pkt.materialize()
             ts = safe_float(getattr(pkt, "time", None))
 
             if not pkt.haslayer(TCP):  # type: ignore[truthy-bool]
