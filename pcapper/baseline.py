@@ -18,9 +18,11 @@ as not in the baseline, never as drift.
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 import re
+from collections import defaultdict
 from collections import Counter
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -68,6 +70,29 @@ MAX_BASELINE_REGISTERS = 20_000
 # Remote-access, file-transfer and admin protocols: on an OT host they are
 # the classic lateral-movement or misuse cue.
 REMOTE_ADMIN_PORTS = {21, 22, 23, 69, 135, 139, 445, 3389, 5800, 5900, 5985, 5986}
+# A rate this many times the baseline on an OT conversation reads as flooding.
+FLOOD_FACTOR = 10.0
+
+# ATT&CK for ICS techniques a deviation is evidence of (only where the
+# deviation itself is that behaviour, not merely compatible with it).
+ATTACK_ROGUE_MASTER = "T0848 Rogue Master"
+ATTACK_UNAUTH_COMMAND = "T0855 Unauthorized Command Message"
+ATTACK_MODIFY_PARAMETER = "T0836 Modify Parameter"
+ATTACK_AITM = "T0830 Adversary-in-the-Middle"
+ATTACK_REMOTE_SERVICES = "T0886 Remote Services"
+ATTACK_MANIPULATION = "T0831 Manipulation of Control; T0832 Manipulation of View"
+ATTACK_SPOOF_REPORTING = "T0856 Spoof Reporting Message"
+ATTACK_DOS = "T0814 Denial of Service"
+ATTACK_BRUTE_IO = "T0806 Brute Force I/O"
+
+# pcapper flags that dissect a protocol a deviation names: the next step.
+PROTOCOL_FLAGS = {
+    "Modbus": "--modbus", "DNP3": "--dnp3", "IEC-104": "--iec104", "S7": "--s7", "ENIP": "--enip", "CIP": "--cip",
+    "BACnet": "--bacnet", "MMS": "--mms", "OPC UA": "--opc", "OPC-UA": "--opc", "PROFINET": "--profinet",
+    "PROFINET RT": "--profinet", "MQTT": "--mqtt", "MQTT-TLS": "--mqtt", "CoAP": "--coap", "FINS": "--fins",
+    "MELSEC": "--melsec", "CODESYS": "--codesys", "IEC 61850 GOOSE": "--goose", "IEC 61850 SV": "--sv",
+    "RDP": "--rdp", "SMB": "--smb", "SSH": "--ssh", "Telnet": "--telnet", "FTP": "--ftp", "VNC": "--vnc",
+}
 
 
 @dataclass(frozen=True)
@@ -155,6 +180,8 @@ class BaselineDelta:
     mac_changes: list[dict[str, object]] = field(default_factory=list)
     register_changes: list[dict[str, object]] = field(default_factory=list)
     deviations: list[dict[str, object]] = field(default_factory=list)
+    # Deviations correlated into what happened, per actor: see correlate_incidents.
+    incidents: list[dict[str, object]] = field(default_factory=list)
 
     @property
     def has_changes(self) -> bool:
@@ -192,6 +219,7 @@ def _merge_ot_commands(
     command_session_times: dict[str, tuple[float | None, float | None]] = {}
     control_targets: dict[str, Counter[str]] = {}
     pair_commands: Counter[tuple[str, str, str, str, bool]] = Counter()
+    pair_command_times: dict[tuple, tuple[float, float]] = {}
     detections: list[dict[str, object]] = []
     errors: list[str] = []
     fast_mode = False
@@ -203,6 +231,11 @@ def _merge_ot_commands(
         destinations.update(getattr(summary, "destinations", Counter()))
         command_sessions.update(getattr(summary, "command_sessions", Counter()))
         pair_commands.update(getattr(summary, "pair_commands", Counter()) or Counter())
+        for key, (first, last) in (getattr(summary, "pair_command_times", None) or {}).items():
+            if first is None or last is None:
+                continue
+            seen = pair_command_times.get(key)
+            pair_command_times[key] = (first, last) if seen is None else (min(seen[0], first), max(seen[1], last))
         for key, value in (getattr(summary, "command_session_times", {}) or {}).items():
             first, last = value
             prev_first, prev_last = command_session_times.get(key, (first, last))
@@ -235,6 +268,7 @@ def _merge_ot_commands(
         detections=detections,
         errors=sorted({err for err in errors if err}),
         pair_commands=pair_commands,
+        pair_command_times=pair_command_times,
     )
 
 
@@ -340,11 +374,18 @@ def _profile_sections(
         })
 
     mac_counts: dict[str, Counter[str]] = {}
+    mac_times: dict[tuple[str, str], tuple[float, float]] = {}
     for prof in profiles:
         for ip, macs in prof.ip_macs.items():
             mac_counts.setdefault(ip, Counter()).update(macs)
+        for key, (first, last) in (getattr(prof, "ip_mac_times", None) or {}).items():
+            seen = mac_times.get(key)
+            mac_times[key] = (first, last) if seen is None else (min(seen[0], first), max(seen[1], last))
     ip_macs = {
-        ip: [{"mac": mac, "vendor": _vendor(mac), "frames": int(count)} for mac, count in sorted(counter.items())]
+        ip: [{"mac": mac, "vendor": _vendor(mac), "frames": int(count),
+              "first_seen": mac_times.get((ip, mac), (None, None))[0],
+              "last_seen": mac_times.get((ip, mac), (None, None))[1]}
+             for mac, count in sorted(counter.items())]
         for ip, counter in sorted(mac_counts.items())
         if is_unicast_host_ip(ip)
     }
@@ -352,23 +393,31 @@ def _profile_sections(
 
 
 def _register_section(modbus_summaries: list, notes: list[str]) -> list[dict[str, object]]:
-    """Modbus register value ranges merged across captures, busiest kept."""
-    merged: dict[tuple, list[int]] = {}
+    """Modbus register value ranges merged across captures, busiest kept,
+    with the time each extreme value was first seen."""
+    merged: dict[tuple, list] = {}
     for summary in modbus_summaries:
-        for key, (low, high, count) in (getattr(summary, "register_ranges", None) or {}).items():
+        for key, entry_in in (getattr(summary, "register_ranges", None) or {}).items():
+            low, high, count = entry_in[0], entry_in[1], entry_in[2]
+            low_ts = entry_in[3] if len(entry_in) > 3 else 0.0
+            high_ts = entry_in[4] if len(entry_in) > 4 else 0.0
             entry = merged.get(key)
             if entry is None:
-                merged[key] = [low, high, count]
-            else:
-                entry[0], entry[1], entry[2] = min(entry[0], low), max(entry[1], high), entry[2] + count
+                merged[key] = [low, high, count, low_ts, high_ts]
+                continue
+            if low < entry[0] or (low == entry[0] and low_ts and (not entry[3] or low_ts < entry[3])):
+                entry[0], entry[3] = low, low_ts
+            if high > entry[1] or (high == entry[1] and high_ts and (not entry[4] or high_ts < entry[4])):
+                entry[1], entry[4] = high, high_ts
+            entry[2] += count
     ranked = sorted(merged.items(), key=lambda kv: (-kv[1][2], kv[0]))
     if len(ranked) > MAX_BASELINE_REGISTERS:
         notes.append(f"Register values: the {MAX_BASELINE_REGISTERS:,} busiest of {len(ranked):,} registers kept.")
         ranked = ranked[:MAX_BASELINE_REGISTERS]
     return [
         {"protocol": "Modbus", "server": server, "unit": unit, "type": reg_type, "address": address,
-         "min": low, "max": high, "samples": count}
-        for (server, unit, reg_type, address), (low, high, count) in sorted(ranked, key=lambda kv: kv[0])
+         "min": low, "max": high, "samples": count, "min_first_seen": low_ts or None, "max_first_seen": high_ts or None}
+        for (server, unit, reg_type, address), (low, high, count, low_ts, high_ts) in sorted(ranked, key=lambda kv: kv[0])
     ]
 
 
@@ -450,11 +499,15 @@ def build_baseline(
             str(proto): {str(target): int(count) for target, count in targets.items()}
             for proto, targets in (ot_summary.control_targets or {}).items()
         }
-        for (proto, src, dst, command, is_write), count in sorted(
+        times = getattr(ot_summary, "pair_command_times", None) or {}
+        for key, count in sorted(
             (ot_summary.pair_commands or {}).items(), key=lambda kv: (kv[0][0], kv[0][1], kv[0][2], kv[0][3], kv[0][4])
         ):
+            proto, src, dst, command, is_write = key
+            first, last = times.get(key, (None, None))
             pair_commands.append(
-                {"protocol": proto, "src": src, "dst": dst, "command": command, "write": bool(is_write), "count": int(count)}
+                {"protocol": proto, "src": src, "dst": dst, "command": command, "write": bool(is_write), "count": int(count),
+                 "first_seen": first, "last_seen": last}
             )
     else:
         notes.append("OT command inventory unavailable: the OT command analysis did not run or failed for this baseline.")
@@ -782,13 +835,58 @@ def _ot_hosts(*snapshots: BaselineSnapshot) -> set[str]:
     return hosts
 
 
-def _dev(severity: str, summary: str, details: str, src: object = None, dst: object = None, kind: str = "") -> dict[str, object]:
+def _dev(severity: str, summary: str, details: str, src: object = None, dst: object = None, kind: str = "", *,
+         ts: object = None, until: object = None, attack: str = "", protocol: str = "", actors: object = None,
+         background: bool = False) -> dict[str, object]:
     item: dict[str, object] = {"severity": severity, "summary": summary, "details": details, "kind": kind}
     if src:
         item["src"] = src
     if dst:
         item["dst"] = dst
+    if ts:
+        item["ts"] = ts
+    if until:
+        item["last_seen"] = until
+    if attack:
+        item["attack"] = attack
+    if protocol:
+        item["protocol"] = protocol
+    if actors:
+        item["actors"] = list(actors)
+    if background:
+        item["background"] = True
     return item
+
+
+def _background_ip(value: object) -> bool:
+    """Broadcast, multicast, link-local or unspecified: discovery and
+    autoconfiguration chatter that comes and goes, not a host's behaviour."""
+    text = str(value or "")
+    try:
+        addr = ipaddress.ip_address(text)
+    except ValueError:
+        return False
+    return addr.is_link_local or addr.is_unspecified or not is_unicast_host_ip(text)
+
+
+def _ot_clients(snapshot: BaselineSnapshot) -> set[str]:
+    """Hosts that acted as an OT/IoT client (master) in a snapshot."""
+    clients = {str(f.get("client", "")) for f in snapshot.flows if f.get("category") in ("OT", "IoT")}
+    clients |= {str(i.get("src", "")) for i in snapshot.pair_commands}
+    clients.discard("")
+    return clients
+
+
+def _host_first_seen(snapshot: BaselineSnapshot) -> dict[str, float]:
+    first: dict[str, float] = {}
+    for flow in snapshot.flows:
+        ts = flow.get("first_seen")
+        if not ts:
+            continue
+        for ip in (flow.get("client"), flow.get("server")):
+            if ip and (str(ip) not in first or float(ts) < first[str(ip)]):
+                first[str(ip)] = float(ts)
+    return first
 
 
 def _compare_flows(current: BaselineSnapshot, baseline: BaselineSnapshot, deviations: list[dict[str, object]]):
@@ -796,6 +894,7 @@ def _compare_flows(current: BaselineSnapshot, baseline: BaselineSnapshot, deviat
     curr = {_flow_key(f): f for f in current.flows}
     ot_hosts = _ot_hosts(baseline, current)
     base_pairs = {(k[0], k[1]) for k in base} | {(k[1], k[0]) for k in base}
+    base_masters = _ot_clients(baseline)
 
     new_flows = [curr[k] for k in sorted(curr.keys() - base.keys())]
     missing_flows = [base[k] for k in sorted(base.keys() - curr.keys())]
@@ -805,29 +904,49 @@ def _compare_flows(current: BaselineSnapshot, baseline: BaselineSnapshot, deviat
         client, server = flow.get("client"), flow.get("server")
         category = str(flow.get("category", "other"))
         port = int(flow.get("port", 0) or 0)
-        what = f"{describe_flow(flow)}, {int(flow.get('packets', 0)):,} packets"
+        interval = flow.get("interval_median")
+        what = f"{describe_flow(flow)}, {int(flow.get('packets', 0)):,} packets" + (
+            f", every {_seconds(float(interval))}" if interval else "")
         known_pair = (client, server) in base_pairs
-        if category == "OT":
+        seen = flow.get("first_seen")
+        until = flow.get("last_seen")
+        protocol = str(flow.get("protocol", "") or "")
+        if _background_ip(client) or _background_ip(server):
+            deviations.append(_dev("info", "Background chatter: new conversation", what, client, server, "flow",
+                                   ts=seen, protocol=protocol, background=True))
+        elif category == "OT":
+            rogue = ATTACK_ROGUE_MASTER if client not in base_masters else ""
             if known_pair:
-                deviations.append(_dev("high", "New OT protocol between known hosts", what, client, server, "flow"))
+                deviations.append(_dev("high", "New OT protocol between known hosts", what, client, server, "flow",
+                                       ts=seen, until=until, attack=rogue, protocol=protocol))
             else:
-                deviations.append(_dev("high", "New OT communication pair", what, client, server, "flow"))
+                deviations.append(_dev("high", "New OT communication pair", what, client, server, "flow",
+                                       ts=seen, until=until, attack=rogue, protocol=protocol))
         elif category == "IoT":
-            deviations.append(_dev("medium", "New IoT communication pair", what, client, server, "flow"))
+            deviations.append(_dev("medium", "New IoT communication pair", what, client, server, "flow", ts=seen, until=until,
+                                   protocol=protocol))
         elif client in ot_hosts or server in ot_hosts:
             on = server if server in ot_hosts else client
             if port in REMOTE_ADMIN_PORTS and flow.get("transport") in ("TCP", "UDP"):
-                deviations.append(_dev("high", "Remote-access/file-transfer protocol on OT host", f"{what} (OT host {on})", client, server, "flow"))
+                deviations.append(_dev("high", "Remote-access/file-transfer protocol on OT host", f"{what} (OT host {on})",
+                                       client, server, "flow", ts=seen, until=until, attack=ATTACK_REMOTE_SERVICES,
+                                       protocol=protocol))
             elif flow.get("transport") not in ("TCP", "UDP"):
-                deviations.append(_dev("low", "New ICMP/IP-level traffic on OT host", f"{what} (OT host {on})", client, server, "flow"))
+                deviations.append(_dev("low", "New ICMP/IP-level traffic on OT host", f"{what} (OT host {on})", client, server, "flow",
+                                       ts=seen, protocol=protocol))
             else:
-                deviations.append(_dev("medium", "IT protocol on OT host", f"{what} (OT host {on})", client, server, "flow"))
+                deviations.append(_dev("medium", "IT protocol on OT host", f"{what} (OT host {on})", client, server, "flow",
+                                       ts=seen, protocol=protocol))
         else:
-            deviations.append(_dev("low", "New conversation", what, client, server, "flow"))
+            deviations.append(_dev("low", "New conversation", what, client, server, "flow", ts=seen, protocol=protocol))
 
     current_seconds = current.duration_seconds
     for flow in missing_flows:
         category = str(flow.get("category", "other"))
+        if _background_ip(flow.get("client")) or _background_ip(flow.get("server")):
+            deviations.append(_dev("info", "Background chatter: conversation absent", describe_flow(flow), flow.get("client"),
+                                   flow.get("server"), "flow", background=True))
+            continue
         if category not in ("OT", "IoT"):
             deviations.append(_dev("info", "Conversation absent", describe_flow(flow), flow.get("client"), flow.get("server"), "flow"))
             continue
@@ -840,7 +959,8 @@ def _compare_flows(current: BaselineSnapshot, baseline: BaselineSnapshot, deviat
         if interval:
             detail += f", polled every {_seconds(float(interval))} in the baseline"
         if would_poll:
-            deviations.append(_dev("medium", f"{category} communication absent", detail, flow.get("client"), flow.get("server"), "flow"))
+            deviations.append(_dev("medium", f"{category} communication absent", detail, flow.get("client"), flow.get("server"), "flow",
+                                   protocol=str(flow.get("protocol", "") or "")))
         else:
             deviations.append(_dev("info", f"{category} communication absent (capture too short to tell)", detail,
                                    flow.get("client"), flow.get("server"), "flow"))
@@ -852,14 +972,19 @@ def _compare_flows(current: BaselineSnapshot, baseline: BaselineSnapshot, deviat
         change: dict[str, object] = {"flow": c}
         category = str(c.get("category", "other"))
         ot_like = category in ("OT", "IoT")
+        if _background_ip(key[0]) or _background_ip(key[1]):
+            continue  # discovery chatter's rate and cadence are not behaviour
+        protocol = str(c.get("protocol", "") or "")
         if rates_comparable and int(b.get("packets", 0) or 0) >= MIN_RATE_PACKETS:
             b_rate = _per_minute(b.get("packets"), base_seconds)
             c_rate = _per_minute(c.get("packets"), current_seconds)
             if b_rate > 0 and (c_rate >= b_rate * RATE_CHANGE_FACTOR or c_rate <= b_rate / RATE_CHANGE_FACTOR):
                 change["rate"] = {"baseline": round(b_rate, 2), "current": round(c_rate, 2)}
-                deviations.append(_dev("medium" if ot_like else "low", "Traffic rate changed",
+                flood = ot_like and c_rate >= b_rate * FLOOD_FACTOR
+                deviations.append(_dev("high" if flood else ("medium" if ot_like else "low"),
+                                       "OT traffic flood" if flood else "Traffic rate changed",
                                        f"{describe_flow(c)}: {b_rate:,.1f} -> {c_rate:,.1f} packets/min",
-                                       key[0], key[1], "rate"))
+                                       key[0], key[1], "rate", attack=ATTACK_DOS if flood else "", protocol=protocol))
         b_med, c_med = b.get("interval_median"), c.get("interval_median")
         if (
             b_med and c_med
@@ -873,13 +998,13 @@ def _compare_flows(current: BaselineSnapshot, baseline: BaselineSnapshot, deviat
                 faster = "faster" if c_med < b_med else "slower"
                 deviations.append(_dev("medium" if ot_like else "low", f"Polling cadence changed ({faster})",
                                        f"{describe_flow(c)}: every {_seconds(b_med)} -> every {_seconds(c_med)}",
-                                       key[0], key[1], "cadence"))
+                                       key[0], key[1], "cadence", protocol=protocol))
             b_jit, c_jit = b.get("interval_jitter"), c.get("interval_jitter")
             if b_jit is not None and c_jit is not None and float(b_jit) <= REGULAR_JITTER and float(c_jit) >= IRREGULAR_JITTER:
                 change["jitter"] = {"baseline": float(b_jit), "current": float(c_jit)}
                 deviations.append(_dev("medium" if ot_like else "low", "Regular polling became irregular",
                                        f"{describe_flow(c)}: jitter {float(b_jit):.2f} -> {float(c_jit):.2f}",
-                                       key[0], key[1], "cadence"))
+                                       key[0], key[1], "cadence", protocol=protocol))
         if len(change) > 1:
             flow_changes.append(change)
     return new_flows, missing_flows, flow_changes
@@ -893,8 +1018,10 @@ def _compare_l2(current: BaselineSnapshot, baseline: BaselineSnapshot, deviation
     for flow in new_l2:
         protocol = str(flow.get("protocol", ""))
         sev = "low" if protocol in ("LLDP", "PTP") else "high"
+        spoof = ATTACK_SPOOF_REPORTING if protocol in ("IEC 61850 GOOSE", "IEC 61850 SV") else ""
         deviations.append(_dev(sev, "New layer-2 industrial stream", f"{protocol}, {int(flow.get('packets', 0)):,} frames",
-                               flow.get("src_mac"), flow.get("dst_mac"), "l2"))
+                               flow.get("src_mac"), flow.get("dst_mac"), "l2", ts=flow.get("first_seen"), attack=spoof,
+                               protocol=protocol))
     for flow in missing_l2:
         protocol = str(flow.get("protocol", ""))
         sev = "info" if protocol in ("LLDP", "PTP") else "medium"
@@ -908,6 +1035,8 @@ def _compare_macs(current: BaselineSnapshot, baseline: BaselineSnapshot, deviati
                 for ip, entries in snap.ip_macs.items()}
 
     base, curr = macs_of(baseline), macs_of(current)
+    first_seen = {(ip, str(e.get("mac", ""))): e.get("first_seen") for ip, entries in current.ip_macs.items() for e in entries}
+    last_seen = {(ip, str(e.get("mac", ""))): e.get("last_seen") for ip, entries in current.ip_macs.items() for e in entries}
     fronting: Counter[str] = Counter()
     for snap in (base, curr):
         for macs in snap.values():
@@ -934,14 +1063,18 @@ def _compare_macs(current: BaselineSnapshot, baseline: BaselineSnapshot, deviati
 
         new_text = ", ".join(_label(m, v) for m, v in new.items())
         old_text = ", ".join(f"{m} ({v})" if v else m for m, v in base[ip].items())
+        spoofers = sorted({o for m in new for o, macs in curr.items() if m in macs and o != ip})
+        seen = min((float(first_seen[(ip, m)]) for m in new if first_seen.get((ip, m))), default=None)
+        until = max((float(last_seen[(ip, m)]) for m in new if last_seen.get((ip, m))), default=None)
+        change["actors"] = spoofers
         if still:
             deviations.append(_dev("high", "IP address seen from an additional MAC",
                                    f"{new_text} alongside baseline {old_text}: possible ARP spoofing or duplicate IP",
-                                   ip, None, "identity"))
+                                   ip, None, "identity", ts=seen, until=until, attack=ATTACK_AITM, actors=spoofers))
         else:
             deviations.append(_dev("high", "IP address moved to a different MAC",
                                    f"was {old_text}, now {new_text}: device replaced or impersonated",
-                                   ip, None, "identity"))
+                                   ip, None, "identity", ts=seen, until=until, attack=ATTACK_AITM, actors=spoofers))
     return changes
 
 
@@ -960,15 +1093,20 @@ def _compare_pair_commands(current: BaselineSnapshot, baseline: BaselineSnapshot
     for item in new_items:
         proto, src, dst, command = _command_key(item)
         count = int(item.get("count", 0) or 0)
+        seen = item.get("first_seen")
+        until = item.get("last_seen")
         if item.get("write"):
+            attack = ATTACK_UNAUTH_COMMAND + (f"; {ATTACK_MODIFY_PARAMETER}" if "write" in command.lower() else "")
             if (proto, src, dst) not in base_writers:
                 deviations.append(_dev("high", "New writer to OT device",
                                        f"{proto} {command} (x{count}); this pair never wrote in the baseline",
-                                       src, dst, "command"))
+                                       src, dst, "command", ts=seen, until=until, attack=attack, protocol=proto))
             else:
-                deviations.append(_dev("high", "New OT write/control command", f"{proto} {command} (x{count})", src, dst, "command"))
+                deviations.append(_dev("high", "New OT write/control command", f"{proto} {command} (x{count})", src, dst, "command",
+                                       ts=seen, until=until, attack=attack, protocol=proto))
         else:
-            deviations.append(_dev("low", "New OT read/diagnostic command", f"{proto} {command} (x{count})", src, dst, "command"))
+            deviations.append(_dev("low", "New OT read/diagnostic command", f"{proto} {command} (x{count})", src, dst, "command",
+                                   ts=seen, protocol=proto))
     for item in missing_items:
         proto, src, dst, command = _command_key(item)
         deviations.append(_dev("info", "OT command absent", f"{proto} {command}", src, dst, "command"))
@@ -983,8 +1121,10 @@ def _compare_pair_commands(current: BaselineSnapshot, baseline: BaselineSnapshot
             c_rate = _per_minute(c.get("count"), current_seconds)
             if b_rate > 0 and (c_rate >= b_rate * RATE_CHANGE_FACTOR or c_rate <= b_rate / RATE_CHANGE_FACTOR):
                 changes.append({"item": c, "baseline_per_min": round(b_rate, 2), "current_per_min": round(c_rate, 2)})
-                deviations.append(_dev("medium", "OT write/control rate changed",
-                                       f"{key[0]} {key[3]}: {b_rate:,.1f} -> {c_rate:,.1f} per min", key[1], key[2], "command"))
+                burst = c_rate >= b_rate * FLOOD_FACTOR
+                deviations.append(_dev("high" if burst else "medium", "OT write/control rate changed",
+                                       f"{key[0]} {key[3]}: {b_rate:,.1f} -> {c_rate:,.1f} per min", key[1], key[2], "command",
+                                       attack=ATTACK_BRUTE_IO if burst else "", protocol=key[0]))
     return new_items, missing_items, changes
 
 
@@ -1028,7 +1168,15 @@ def _compare_registers(current: BaselineSnapshot, baseline: BaselineSnapshot, de
             summary, severity = "Register value outside baseline range", "medium"
             detail = f"{_register_name(key)}: baseline {_span(bmin, bmax)}, now {_span(cmin, cmax)}"
         changes.append({"register": c, "baseline": [bmin, bmax], "current": [cmin, cmax]})
-        deviations.append(_dev(severity, summary, detail, None, key[0], "register"))
+        # When the value first left the baseline: the first time the
+        # offending extreme was seen.
+        stamps = []
+        if cmin < bmin and c.get("min_first_seen"):
+            stamps.append(float(c["min_first_seen"]))
+        if cmax > bmax and c.get("max_first_seen"):
+            stamps.append(float(c["max_first_seen"]))
+        deviations.append(_dev(severity, summary, detail, None, key[0], "register", ts=min(stamps) if stamps else None,
+                               attack=ATTACK_MANIPULATION, protocol="Modbus"))
     known_servers = {k[0] for k in base}
     for key in sorted(curr.keys() - base.keys()):
         if key[0] in known_servers:
@@ -1036,11 +1184,19 @@ def _compare_registers(current: BaselineSnapshot, baseline: BaselineSnapshot, de
     return changes
 
 
-def _inventory_deviations(delta_parts: dict[str, list], ot_hosts: set[str], deviations: list[dict[str, object]]) -> None:
+def _inventory_deviations(delta_parts: dict[str, list], ot_hosts: set[str], deviations: list[dict[str, object]],
+                          first_seen: dict[str, float] | None = None) -> None:
+    first_seen = first_seen or {}
     for ip in delta_parts["new_hosts"]:
-        deviations.append(_dev("medium", "New host", "", ip, None, "host"))
+        if _background_ip(ip):
+            deviations.append(_dev("info", "Background chatter: new host", "", ip, None, "host", ts=first_seen.get(ip), background=True))
+        else:
+            deviations.append(_dev("medium", "New host", "", ip, None, "host", ts=first_seen.get(ip)))
     for ip in delta_parts["missing_hosts"]:
-        deviations.append(_dev("info", "Host absent", "", ip, None, "host"))
+        if _background_ip(ip):
+            deviations.append(_dev("info", "Background chatter: host absent", "", ip, None, "host", background=True))
+        else:
+            deviations.append(_dev("info", "Host absent", "", ip, None, "host"))
     for change in delta_parts["host_changes"]:
         ip = str(change.get("ip", ""))
         os_change = change.get("os_change")
@@ -1050,7 +1206,8 @@ def _inventory_deviations(delta_parts: dict[str, list], ot_hosts: set[str], devi
         ip = str(svc.get("ip", ""))
         sev = "high" if ip in ot_hosts else "medium"
         name = svc.get("service") or "service"
-        deviations.append(_dev(sev, "New service", f"{ip}:{svc.get('port')}/{str(svc.get('protocol', '')).lower()} {name}", None, ip, "service"))
+        deviations.append(_dev(sev, "New service", f"{ip}:{svc.get('port')}/{str(svc.get('protocol', '')).lower()} {name}", None, ip, "service",
+                               ts=first_seen.get(ip)))
     for svc in delta_parts["service_changes"]:
         ip = str(svc.get("ip", ""))
         was = " ".join(v for v in (svc.get("from_service"), svc.get("from_software")) if v) or "-"
@@ -1106,6 +1263,7 @@ def compare_baseline(current: BaselineSnapshot, baseline: BaselineSnapshot) -> B
          "new_services": new_services, "service_changes": service_changes},
         _ot_hosts(baseline, current),
         deviations,
+        _host_first_seen(current),
     )
     if not profiled:
         for cmd in new_ot_commands:
@@ -1143,7 +1301,164 @@ def compare_baseline(current: BaselineSnapshot, baseline: BaselineSnapshot) -> B
         mac_changes=mac_changes,
         register_changes=register_changes,
         deviations=deviations,
+        incidents=correlate_incidents(deviations, set(new_hosts), _ot_clients(baseline)),
     )
+
+
+# --- Correlation ------------------------------------------------------------
+
+
+_CONTROL = {"New OT communication pair", "New OT protocol between known hosts", "New writer to OT device",
+            "New OT write/control command", "OT write/control rate changed", "OT traffic flood"}
+_WRITES = {"New writer to OT device", "New OT write/control command", "OT write/control rate changed"}
+
+
+def _incident(title: str, actor: object, targets: list, members: list[int], deviations: list[dict[str, object]]) -> dict[str, object]:
+    items = [deviations[i] for i in sorted(members)]
+    worst = max(items, key=lambda d: _SEV.get(str(d.get("severity")), 0))
+    stamps = [float(d["ts"]) for d in items if d.get("ts")]
+    ends = stamps + [float(d["last_seen"]) for d in items if d.get("last_seen")]
+    attacks: list[str] = []
+    for d in items:
+        for technique in str(d.get("attack", "") or "").split("; "):
+            if technique and technique not in attacks:
+                attacks.append(technique)
+    attacks.sort(key=lambda t: (_ATTACK_ORDER.index(t[:5]) if t[:5] in _ATTACK_ORDER else len(_ATTACK_ORDER), t))
+    protocols = sorted({str(d.get("protocol")) for d in items if d.get("protocol")})
+    return {
+        "severity": worst.get("severity"),
+        "title": title,
+        "actor": actor,
+        "targets": [t for t in targets if t],
+        "first_seen": min(stamps) if stamps else None,
+        "last_seen": max(ends) if ends else None,
+        "attack": "; ".join(attacks),
+        "members": sorted(members),
+        "protocols": protocols,
+        "pivots": _pivots(actor, [t for t in targets if t], items, protocols),
+    }
+
+
+_SEV = {"info": 0, "low": 1, "medium": 2, "high": 3, "critical": 4}
+# How an incident lists its techniques: who acted, what they sent, how they
+# got there, what it did to the process.
+_ATTACK_ORDER = ["T0848", "T0855", "T0836", "T0830", "T0856", "T0886", "T0806", "T0814", "T0831", "T0832"]
+
+
+def _pivots(actor: object, targets: list, items: list[dict[str, object]], protocols: list[str]) -> list[list[str]]:
+    """pcapper flags for the next look at an incident: the protocols it
+    involves, the actor's dossier and timeline, ARP for identity changes."""
+    pivots: list[list[str]] = []
+    flags = sorted({PROTOCOL_FLAGS[p] for p in protocols if p in PROTOCOL_FLAGS})
+    kinds = {d.get("kind") for d in items}
+    if "register" in kinds and "--modbus" in flags:
+        flags.append("--control-loop")
+    if "identity" in kinds:
+        flags.insert(0, "--arp")
+    if flags:
+        pivots.append(flags)
+    for host in [actor, *targets][:2]:
+        if host and is_unicast_host_ip(str(host)):
+            pivots.append(["--hostdetails", "-ip", str(host)])
+    if actor and is_unicast_host_ip(str(actor)):
+        pivots.append(["--timeline", "-ip", str(actor)])
+    return pivots
+
+
+def correlate_incidents(deviations: list[dict[str, object]], new_hosts: set[str], base_masters: set[str]) -> list[dict[str, object]]:
+    """Group deviations into what happened, by the host that did it.
+
+    Fixed rules, in this order (a deviation joins one incident at most):
+    control activity per source -- a rogue master when the source never
+    acted as an OT client in the baseline -- with the process values that
+    changed on its targets; identity changes, attributed to the IP that sent
+    from the intruding MAC; remote access to an OT host; process values that
+    changed with no new writer to explain them; OT conversations gone silent.
+    """
+    claimed: set[int] = set()
+    incidents: list[dict[str, object]] = []
+
+    def free(i: int) -> bool:
+        return i not in claimed and not deviations[i].get("background")
+
+    # 1. Control activity per source.
+    by_src: dict[str, list[int]] = defaultdict(list)
+    for i, d in enumerate(deviations):
+        if d.get("summary") in _CONTROL and d.get("src") and free(i):
+            by_src[str(d["src"])].append(i)
+    for actor, idx in sorted(by_src.items()):
+        members = set(idx)
+        targets = sorted({str(deviations[i].get("dst")) for i in idx if deviations[i].get("dst")})
+        writes = any(deviations[i].get("summary") in _WRITES for i in idx)
+        for j, d in enumerate(deviations):
+            if j in members or not free(j):
+                continue
+            if d.get("kind") in ("host", "flow", "rate", "cadence") and d.get("src") == actor:
+                members.add(j)
+            elif writes and d.get("kind") == "register" and d.get("dst") in targets:
+                members.add(j)
+        if actor in new_hosts or actor not in base_masters:
+            title = f"Rogue OT master {actor}" + (" writing to " + ", ".join(targets[:3]) if writes and targets else "")
+        elif writes:
+            title = f"New control activity from {actor} to " + ", ".join(targets[:3])
+        else:
+            title = f"New OT access from {actor} to " + ", ".join(targets[:3])
+        claimed |= members
+        incidents.append(_incident(title, actor, targets, sorted(members), deviations))
+
+    # 2. Identity: an IP sending from another device's MAC.
+    for i, d in enumerate(deviations):
+        if d.get("kind") != "identity" or not free(i):
+            continue
+        victim = str(d.get("src", ""))
+        actors = [str(a) for a in d.get("actors") or []]
+        members = {i}
+        for j, other in enumerate(deviations):
+            if free(j) and j != i and other.get("kind") in ("host", "flow") and other.get("src") in actors:
+                members.add(j)
+        title = (f"Adversary-in-the-middle: {actors[0]} impersonating {victim}" if actors
+                 else f"{victim} answered from an unknown MAC")
+        claimed |= members
+        incidents.append(_incident(title, actors[0] if actors else None, [victim], sorted(members), deviations))
+
+    # 3. Remote access to OT hosts, per source.
+    remote: dict[str, list[int]] = defaultdict(list)
+    for i, d in enumerate(deviations):
+        if d.get("summary") == "Remote-access/file-transfer protocol on OT host" and free(i):
+            remote[str(d.get("src", ""))].append(i)
+    for actor, idx in sorted(remote.items()):
+        members = set(idx) | {j for j, d in enumerate(deviations) if free(j) and d.get("kind") == "host" and d.get("src") == actor}
+        targets = sorted({str(deviations[i].get("dst")) for i in idx})
+        claimed |= members
+        incidents.append(_incident(f"Remote access to OT asset {', '.join(targets[:3])} from {actor}", actor, targets,
+                                   sorted(members), deviations))
+
+    # 4. Process values that moved with no new writer behind them.
+    by_server: dict[str, list[int]] = defaultdict(list)
+    for i, d in enumerate(deviations):
+        if d.get("kind") == "register" and d.get("severity") in ("high", "medium") and free(i):
+            by_server[str(d.get("dst", ""))].append(i)
+    for server, idx in sorted(by_server.items()):
+        claimed |= set(idx)
+        incidents.append(_incident(f"Process values changed on {server} (no new writer seen)", None, [server], idx, deviations))
+
+    # 5. OT conversations gone silent, per server.
+    silent: dict[str, list[int]] = defaultdict(list)
+    for i, d in enumerate(deviations):
+        if str(d.get("summary", "")).endswith("communication absent") and d.get("severity") == "medium" and free(i):
+            silent[str(d.get("dst", ""))].append(i)
+    for server, idx in sorted(silent.items()):
+        claimed |= set(idx)
+        incidents.append(_incident(f"OT communication lost with {server}", None, [server], idx, deviations))
+
+    # Worst first; among equals, the best corroborated (most high-severity
+    # deviations behind it), then the earliest.
+    def _rank(inc: dict[str, object]) -> tuple:
+        highs = sum(1 for i in inc["members"] if deviations[i].get("severity") in ("high", "critical"))  # type: ignore[union-attr]
+        return (-_SEV.get(str(inc["severity"]), 0), -highs, inc["first_seen"] or float("inf"), inc["title"])
+
+    incidents.sort(key=_rank)
+    return incidents
 
 
 # --- Loading ----------------------------------------------------------------

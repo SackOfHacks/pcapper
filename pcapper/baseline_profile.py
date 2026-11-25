@@ -135,6 +135,8 @@ class TrafficProfile:
     # (src MAC, dst MAC, protocol label) -> stats
     l2_flows: dict[tuple[str, str, str], FlowStats] = field(default_factory=dict)
     ip_macs: dict[str, Counter[str]] = field(default_factory=dict)
+    # (first, last) time each IP was seen sending from each MAC.
+    ip_mac_times: dict[tuple[str, str], tuple[float, float]] = field(default_factory=dict)
     skipped_flows: int = 0
     errors: list[str] = field(default_factory=list)
 
@@ -256,6 +258,7 @@ def analyze_baseline_profile(
     flows = profile.flows
     l2_flows = profile.l2_flows
     ip_macs: dict[str, Counter[str]] = defaultdict(Counter)
+    mac_times = profile.ip_mac_times
 
     for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status, lite=True):
         profile.total_packets += 1
@@ -285,7 +288,13 @@ def analyze_baseline_profile(
         src_mac, dst_mac, ethertype, src_ip, dst_ip, is_arp, transport, sport, dport, payload = fields
 
         if src_ip and src_mac and src_mac != "ff:ff:ff:ff:ff:ff":
-            ip_macs[src_ip][src_mac.lower()] += 1
+            mac = src_mac.lower()
+            ip_macs[src_ip][mac] += 1
+            seen = mac_times.get((src_ip, mac))
+            if seen is None:
+                mac_times[(src_ip, mac)] = (ts, ts)
+            elif ts > seen[1] or ts < seen[0]:
+                mac_times[(src_ip, mac)] = (min(seen[0], ts), max(seen[1], ts))
         if is_arp:
             continue
         if src_ip is None:

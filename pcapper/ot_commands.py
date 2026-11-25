@@ -105,6 +105,8 @@ class OtCommandSummary:
     # (protocol, src, dst, command, is_write): what --baseline profiles, so a
     # pair that only ever read and now writes is a deviation.
     pair_commands: Counter[tuple[str, str, str, str, bool]] = field(default_factory=Counter)
+    # (first, last) time each pair command was seen, same keys.
+    pair_command_times: dict[tuple[str, str, str, str, bool], tuple[float, float]] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
@@ -339,10 +341,25 @@ def _is_reply(command: str) -> bool:
     )
 
 
+def _note_pair_time(times: dict, key: tuple, ts: object) -> None:
+    try:
+        value = float(ts)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return
+    if value <= 0:
+        return
+    seen = times.get(key)
+    if seen is None:
+        times[key] = (value, value)
+    elif value < seen[0] or value > seen[1]:
+        times[key] = (min(seen[0], value), max(seen[1], value))
+
+
 def _collect_pair_commands(
     sources: list[tuple[str, object, tuple[str, ...]]],
     base_markers: tuple[str, ...],
     dnp3_control_names: set[str],
+    times: dict | None = None,
 ) -> Counter[tuple[str, str, str, str, bool]]:
     """(protocol, src, dst, command, is_write) counts from the analyzers' own
     per-message records: Modbus/DNP3 messages and every other protocol's
@@ -372,14 +389,20 @@ def _collect_pair_commands(
             is_write = _is_write_command(command, markers, base_markers) or (
                 label == "DNP3" and command.lower() in dnp3_control_names
             )
-            out[(label, src, dst, command, is_write)] += 1
+            key = (label, src, dst, command, is_write)
+            out[key] += 1
+            if times is not None:
+                _note_pair_time(times, key, getattr(msg, "ts", None))
         for event in events:
             command = str(getattr(event, "command", "") or "")
             src = str(getattr(event, "src", "") or "")
             dst = str(getattr(event, "dst", "") or "")
             if not command or not src or not dst or _is_reply(command):
                 continue
-            out[(label, src, dst, command, _is_write_command(command, markers, base_markers))] += 1
+            key = (label, src, dst, command, _is_write_command(command, markers, base_markers))
+            out[key] += 1
+            if times is not None:
+                _note_pair_time(times, key, getattr(event, "ts", None))
         for service, endpoints in endpoints_by_service.items():
             if _is_reply(str(service)):
                 continue
@@ -642,6 +665,7 @@ def _analyze_ot_commands_fast(
     command_counts: Counter[str] = Counter()
     all_command_counts: Counter[str] = Counter()
     pair_commands: Counter[tuple[str, str, str, str, bool]] = Counter()
+    pair_command_times: dict[tuple[str, str, str, str, bool], tuple[float, float]] = {}
     sources: Counter[str] = Counter()
     destinations: Counter[str] = Counter()
     command_sessions: Counter[str] = Counter()
@@ -800,7 +824,9 @@ def _analyze_ot_commands_fast(
                 else _is_write_command(cmd, proto_extra, base_markers)
             )
             if not _is_reply(cmd):
-                pair_commands[(proto, src_ip, dst_ip, cmd, bool(is_control))] += 1
+                pair_key = (proto, src_ip, dst_ip, cmd, bool(is_control))
+                pair_commands[pair_key] += 1
+                _note_pair_time(pair_command_times, pair_key, ts)
             if not is_control:
                 continue
             command_counts[f"{proto}:{cmd}"] += 1
@@ -848,6 +874,7 @@ def _analyze_ot_commands_fast(
         errors=errors,
         all_command_counts=all_command_counts,
         pair_commands=pair_commands,
+        pair_command_times=pair_command_times,
     )
 
 
@@ -1423,7 +1450,8 @@ def analyze_ot_commands(
         (label, summary, _merge_markers(_protocol_extra(label), markers))
         for label, summary, markers in extra_sources
     )
-    pair_commands = _collect_pair_commands(pair_sources, base_markers, dnp3_control_names)
+    pair_command_times: dict[tuple[str, str, str, str, bool], tuple[float, float]] = {}
+    pair_commands = _collect_pair_commands(pair_sources, base_markers, dnp3_control_names, pair_command_times)
 
     detections: list[dict[str, object]] = []
     if command_counts:
@@ -1457,4 +1485,5 @@ def analyze_ot_commands(
         all_command_counts=all_command_counts,
         unnormalized_streams=unnormalized,
         pair_commands=pair_commands,
+        pair_command_times=pair_command_times,
     )

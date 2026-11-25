@@ -263,3 +263,52 @@ def test_tampered_register_values_are_flagged(tmp_path) -> None:
     assert [(d["severity"], d["summary"]) for d in found] == [("high", "Constant register changed value")]
     assert "holding_register[0]: always 0 in the baseline, now 0..95" in found[0]["details"]
     assert compare_baseline(clean, clean).deviations == []
+
+
+def test_attack_deviations_correlate_into_incidents(captures) -> None:
+    """The rogue host's pair, writes, SMB and arrival are one incident;
+    the PLC's MAC change is another. Each has a time span, ATT&CK and a
+    pcapper command to run next."""
+    delta = compare_baseline(_snapshot(captures["attack"]), _snapshot(captures["normal"]))
+    titles = [i["title"] for i in delta.incidents]
+    assert titles[0] == f"Rogue OT master {ROGUE} writing to {PLC}"
+    rogue = delta.incidents[0]
+    members = {delta.deviations[i]["summary"] for i in rogue["members"]}
+    assert {"New OT communication pair", "New writer to OT device", "New host",
+            "Remote-access/file-transfer protocol on OT host"} <= members
+    assert "T0848 Rogue Master" in rogue["attack"] and "T0855 Unauthorized Command Message" in rogue["attack"]
+    assert rogue["first_seen"] == pytest.approx(T0 + 30) and rogue["last_seen"] == pytest.approx(T0 + 42)
+    # Its writes set holding register 1 to 99 where the baseline read 0: the
+    # process impact joins the incident, and the control-loop view the pivots.
+    assert "Constant register changed value" in members
+    assert ["--modbus", "--smb", "--control-loop"] in rogue["pivots"] and ["--hostdetails", "-ip", ROGUE] in rogue["pivots"]
+    assert f"{PLC} answered from an unknown MAC" in titles
+    # Every deviation that names a time carries the first sighting.
+    writer = next(d for d in delta.deviations if d["summary"] == "New writer to OT device")
+    assert writer["ts"] == pytest.approx(T0 + 30)
+
+
+def test_background_chatter_stays_out_of_the_signal(tmp_path) -> None:
+    from scapy.layers.inet import IP, UDP  # type: ignore
+    from scapy.layers.inet6 import IPv6  # type: ignore
+    from scapy.layers.l2 import Ether  # type: ignore
+    from scapy.packet import Raw  # type: ignore
+
+    _SEQ.clear()
+    base = _snapshot(_write(tmp_path / "b.pcap", _polls(1.0, 20)))
+    _SEQ.clear()
+    chatter = _polls(1.0, 20)
+    for i in range(3):
+        pkt = Ether(src="02:00:00:00:00:77") / IPv6(src="fe80::77", dst="ff02::1:3") / UDP(sport=5355, dport=5355) / Raw(b"q")
+        pkt.time = T0 + i
+        chatter.append(pkt)
+        ssdp = Ether(src=HMI_MAC) / IP(src=HMI, dst="239.255.255.250") / UDP(sport=50000, dport=1900) / Raw(b"M-SEARCH")
+        ssdp.time = T0 + i
+        chatter.append(ssdp)
+    delta = compare_baseline(_snapshot(_write(tmp_path / "c.pcap", chatter)), base)
+    assert delta.deviations and all(d.get("background") and d["severity"] == "info" for d in delta.deviations)
+    assert delta.incidents == []
+    from pcapper.reporting import render_baseline_delta
+
+    text = render_baseline_delta(delta)
+    assert "matches the baseline" in text and "fe80::77" not in text  # shown with -v only
