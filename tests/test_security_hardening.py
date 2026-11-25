@@ -17,6 +17,7 @@ from collections import Counter
 from scapy.all import Ether, IP, TCP, Raw, wrpcap  # type: ignore
 
 from pcapper import cli
+from pcapper.coloring import ANSI_BLACK, PALETTE, danger, suspicious_bg
 from pcapper.files import _safe_decompress
 from pcapper.goose import analyze_goose
 from pcapper.utils import redact_sensitive_text, terminal_safe, to_serializable
@@ -44,10 +45,23 @@ def test_oversized_goose_integers_do_not_crash(tmp_path) -> None:
 
 
 def test_terminal_safe_keeps_colours_and_escapes_controls() -> None:
-    text = "\x1b[1;31mHIGH\x1b[0m var=\x1b]0;PWNED\x07 end\x1b[2J"
-    safe = terminal_safe(text)
-    assert "\x1b[1;31m" in safe and "\x1b[0m" in safe
+    high = danger("HIGH", enabled=True)
+    badge = suspicious_bg("WARN", enabled=True)  # black text on a yellow badge
+    safe = terminal_safe(f"{high} {badge} var=\x1b]0;PWNED\x07 end\x1b[2J")
+    assert safe.startswith(f"{high} {badge} var=")
     assert "\x1b]" not in safe and "\x07" not in safe and "\x1b[2J" not in safe
+
+
+def test_terminal_safe_keeps_only_pcappers_own_colours() -> None:
+    """Packet text that reaches a renderer unescaped can colour text only the
+    way pcapper does: concealed, reverse-video, blinking, 256-colour, 24-bit
+    and bare black text (invisible on a dark terminal) are shown escaped."""
+    for code in PALETTE - {ANSI_BLACK}:
+        assert terminal_safe(f"x{code}y") == f"x{code}y"
+    for injected in ("\x1b[8m", "\x1b[7m", "\x1b[5m", "\x1b[38;5;16m",
+                     "\x1b[38;2;0;0;0m", "\x1b[40m", "\x1b[1;31m", "\x1b[30m"):
+        safe = terminal_safe(f"ioc {injected}evil.example\x1b[0m")
+        assert safe == f"ioc \\x1b{injected[1:]}evil.example\x1b[0m"
 
 
 def test_redaction_covers_ot_evidence_and_common_forms() -> None:

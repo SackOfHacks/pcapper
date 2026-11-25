@@ -924,7 +924,7 @@ def _hassh_from_kex(kex: dict[str, list[str]], *, server: bool) -> tuple[str, st
             ",".join(kex.get("comp_c2s", [])),
         ]
     hassh_str = ";".join(parts)
-    hassh = hashlib.md5(hassh_str.encode("utf-8", errors="ignore")).hexdigest()
+    hassh = hashlib.md5(hassh_str.encode("utf-8", errors="ignore"), usedforsecurity=False).hexdigest()
     return hassh, hassh_str
 
 

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 
-import os
 import re
 from collections import Counter, deque
 from dataclasses import dataclass, field
@@ -19,6 +18,7 @@ from .utils import (
     network_egress_allowed,
     safe_float,
 )
+from .utils import vt_api_key
 
 try:
     from scapy.layers.inet import TCP  # type: ignore
@@ -738,7 +738,7 @@ def analyze_webrequests(
     if vt_lookup:
         if not network_egress_allowed():
             vt_errors.append("VirusTotal lookups skipped: network egress is disabled.")
-        elif not (api_key := os.environ.get("VT_API_KEY")):
+        elif not (api_key := vt_api_key()):
             vt_errors.append("VT_API_KEY is not set; skipping VirusTotal lookups.")
         else:
             def _normalized_domain(host_value: str) -> str:

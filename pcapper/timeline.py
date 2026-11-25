@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from .utils import read_ber_length as _read_ber_length
 import ipaddress
-import os
 from array import array
 import re
 from collections import Counter, defaultdict
@@ -40,6 +39,7 @@ from .utils import (
 )
 from .winrm import WINRM_PORTS, WSMAN_RE
 from .wmic import WMIC_COMMAND_RE
+from .utils import vt_api_key
 
 try:
     from scapy.layers.dns import DNS, DNSQR  # type: ignore
@@ -3126,7 +3126,7 @@ def analyze_timeline(
             timeline_vt_errors.append(
                 "VirusTotal lookups skipped: network egress is disabled."
             )
-        elif not (api_key := os.environ.get("VT_API_KEY")):
+        elif not (api_key := vt_api_key()):
             timeline_vt_errors.append(
                 "VT_API_KEY is not set; skipping VirusTotal lookups."
             )

@@ -5,7 +5,6 @@ mDNS lookups use the same wire format and are included, labelled."""
 
 from __future__ import annotations
 
-import os
 from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +21,7 @@ from .utils import (
     memoize_analysis,
     safe_float,
 )
+from .utils import vt_api_key
 
 try:  # pragma: no cover - scapy is a hard dependency; keep import errors readable
     from scapy.layers.dns import DNS
@@ -73,7 +73,7 @@ def _protocol(src: str, dst: str, sport: Optional[int], dport: Optional[int]) ->
 def _vt_lookups(names: list[str]) -> tuple[dict[str, dict[str, object]], list[str]]:
     from .dns import _vt_lookup_domains
 
-    api_key = os.environ.get("VT_API_KEY")
+    api_key = vt_api_key()
     if not api_key:
         return {}, ["VT_API_KEY is not set; skipping VirusTotal lookups."]
     try:

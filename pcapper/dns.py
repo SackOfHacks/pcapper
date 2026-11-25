@@ -3,7 +3,6 @@ from __future__ import annotations
 from .utils import shannon_entropy as _shannon_entropy
 import ipaddress
 import json
-import os
 import re
 import time
 import urllib.error
@@ -30,6 +29,7 @@ from .utils import (
     set_add_cap,
     setdict_add,
 )
+from .utils import vt_api_key
 
 try:
     from scapy.layers.dns import DNS, DNSQR, DNSRR  # type: ignore
@@ -1910,7 +1910,7 @@ def analyze_dns(
 
     vt_results: dict[str, dict[str, object]] = {}
     if vt_lookup:
-        api_key = os.environ.get("VT_API_KEY")
+        api_key = vt_api_key()
         if not api_key:
             errors.append("VT_API_KEY is not set; skipping VirusTotal lookups.")
         else:

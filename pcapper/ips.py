@@ -42,6 +42,7 @@ from .utils import (
     shannon_entropy,
     tcp_flags_int,
 )
+from .utils import vt_api_key
 
 MAX_ENDPOINTS = env_int("PCAPPER_MAX_ENDPOINTS", 20000, minimum=1)
 MAX_CONVERSATIONS = env_int("PCAPPER_MAX_CONVERSATIONS", 50000, minimum=1)
@@ -1618,7 +1619,7 @@ def analyze_ips(
                 ja3 = _ja3_from_client_hello(client_hello)
                 if ja3:
                     ja3_hash = hashlib.md5(
-                        ja3.encode("utf-8", errors="ignore")
+                        ja3.encode("utf-8", errors="ignore"), usedforsecurity=False
                     ).hexdigest()
                     ja3_counts[ja3_hash] += 1
 
@@ -1834,13 +1835,16 @@ def analyze_ips(
     ja4s_rep = _load_reputation_list(os.environ.get("PCAPPER_JA4S_REP"))
     abuse_key = os.environ.get("PCAPPER_ABUSEIPDB_KEY")
     otx_key = os.environ.get("PCAPPER_OTX_KEY")
-    vt_key = os.environ.get("PCAPPER_VT_KEY")
+    vt_key = vt_api_key()
     opt_in_raw = os.environ.get("PCAPPER_INTEL_OPT_IN", "0").strip().lower()
     opt_in = opt_in_raw in {"1", "true", "yes", "y"}
-    if not opt_in and (abuse_key or otx_key or vt_key):
-        errors.append(
-            "External IP intelligence lookups disabled; set PCAPPER_INTEL_OPT_IN=1 to enable."
-        )
+    if not opt_in:
+        # The notice answers keys set for these lookups; a VT_API_KEY set for
+        # -vt does not ask for IP reputation, so it does not raise it.
+        if abuse_key or otx_key or os.environ.get("PCAPPER_VT_KEY"):
+            errors.append(
+                "External IP intelligence lookups disabled; set PCAPPER_INTEL_OPT_IN=1 to enable."
+            )
         abuse_key = None
         otx_key = None
         vt_key = None

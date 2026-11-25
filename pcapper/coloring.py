@@ -18,6 +18,18 @@ ANSI_BLUE_BG = "\x1b[104m"
 ANSI_RED_BG = "\x1b[41m"
 ANSI_YELLOW_BG = "\x1b[43m"
 
+# Every colour pcapper writes. utils.terminal_safe keeps these and escapes any
+# other SGR sequence in a rendered report: one that is not in this set came
+# from a capture.
+PALETTE = frozenset(
+    {
+        ANSI_RESET, ANSI_BOLD, ANSI_DIM, ANSI_RED, ANSI_GREEN, ANSI_YELLOW,
+        ANSI_BLUE, ANSI_MAGENTA, ANSI_CYAN, ANSI_WHITE, ANSI_BLACK,
+        ANSI_BLUE_BG, ANSI_RED_BG, ANSI_YELLOW_BG,
+    }
+)
+BACKGROUNDS = (ANSI_BLUE_BG, ANSI_RED_BG, ANSI_YELLOW_BG)
+
 _COLOR_OVERRIDE: bool | None = None
 # The isatty/NO_COLOR answer, computed once. colorize() is called for every
 # coloured token of every rendered line, and a syscall per call adds up on a

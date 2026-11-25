@@ -12,9 +12,8 @@ needs somewhere to send it that is not a public issue.
 
 | Version | Supported |
 | --- | --- |
-| `main` | Yes |
-| Latest tagged release | Yes |
-| Earlier releases | No — please reproduce against `main` first |
+| The current release (`main`) | Yes |
+| Anything older | No — please reproduce against `main` first |
 
 ## Reporting a vulnerability
 
@@ -80,3 +79,9 @@ untrusted source, run it in a disposable VM or container, with no credentials
 mounted and no network path back into the environment under investigation.
 `--carve` and `--files` write reconstructed attacker-supplied files to disk;
 those are malware samples, and nothing in pcapper detonates or defangs them.
+
+pcapper sends nothing off the machine unless you configure it to: reputation
+lookups need an API key and an explicit flag or opt-in, the plaintext
+geolocation lookup needs `PCAPPER_ALLOW_PLAINTEXT_EGRESS=1`, and
+`--network off` forbids every lookup whatever is configured. The details are
+under "Network egress" in [docs/reference.md](docs/reference.md#notes).

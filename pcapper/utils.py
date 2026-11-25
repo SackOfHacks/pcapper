@@ -41,6 +41,7 @@ except Exception:  # pragma: no cover
     TCP = UDP = None  # type: ignore
 
 from . import progress as _progress
+from .coloring import ANSI_BLACK, BACKGROUNDS, PALETTE
 from .lite import UNSUPPORTED as _LITE_UNSUPPORTED
 from .lite import LitePacket as _LitePacket
 
@@ -152,24 +153,42 @@ _SGR = re.compile(r"\x1b\[[0-9;]*m")
 _UNSAFE_CONTROL = re.compile(r"[\x00-\x08\x0b-\x1f\x7f-\x9f]")
 
 
+def _escape_controls(text: str) -> str:
+    return _UNSAFE_CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text)
+
+
+def _own_colour(text: str, match: re.Match[str]) -> bool:
+    """Whether an SGR sequence in a rendered report is one pcapper wrote."""
+    sequence = match.group()
+    if sequence == ANSI_BLACK:
+        # Black is the text colour of the yellow badge and nothing else; on its
+        # own it would hide what follows on a dark terminal.
+        return text.endswith(BACKGROUNDS, 0, match.start())
+    return sequence in PALETTE
+
+
 def terminal_safe(text: str) -> str:
     """Neutralise terminal control sequences in a rendered report.
 
-    Pcapper's own colours are SGR sequences (ESC[...m) and are kept; every
-    other control byte - OSC title/hyperlink sequences, cursor movement,
-    screen clears, BEL, lone ESC - is shown escaped. Applied to every rendered
-    section, so a renderer that forgets ``display_safe`` on packet text (a
-    variable name, a GOOSE dataset, a file name) cannot drive the terminal.
+    Pcapper's own colours (``coloring.PALETTE``) are kept; every other control
+    byte - an SGR sequence pcapper does not write (conceal, reverse video,
+    blink, 256-colour and 24-bit colours), OSC title/hyperlink sequences,
+    cursor movement, screen clears, BEL, lone ESC - is shown escaped. Applied
+    to every rendered section, so a renderer that forgets ``display_safe`` on
+    packet text (a variable name, a GOOSE dataset, a file name) cannot drive
+    the terminal, and can colour text only the way pcapper itself does.
     """
     if not text:
         return text
     parts = []
     last = 0
     for match in _SGR.finditer(text):
-        parts.append(_UNSAFE_CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text[last:match.start()]))
+        if not _own_colour(text, match):
+            continue  # escaped with the text around it
+        parts.append(_escape_controls(text[last:match.start()]))
         parts.append(match.group())
         last = match.end()
-    parts.append(_UNSAFE_CONTROL.sub(lambda m: f"\\x{ord(m.group()):02x}", text[last:]))
+    parts.append(_escape_controls(text[last:]))
     return "".join(parts)
 
 
@@ -208,6 +227,16 @@ def egress_mode() -> str:
 
 def network_egress_allowed() -> bool:
     return egress_mode() == "enrichment"
+
+
+def vt_api_key() -> str | None:
+    """The VirusTotal API key: ``VT_API_KEY``, or ``PCAPPER_VT_KEY`` (the name
+    the --ips reputation lookup read while every other lookup read the first)."""
+    for name in ("VT_API_KEY", "PCAPPER_VT_KEY"):
+        value = os.environ.get(name, "").strip()
+        if value:
+            return value
+    return None
 
 
 def allow_plaintext_egress() -> bool:

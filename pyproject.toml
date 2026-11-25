@@ -1,5 +1,7 @@
 [build-system]
-requires = ["setuptools>=68", "wheel"]
+# 77: license as an SPDX expression (PEP 639) with license-files; setuptools
+# builds wheels itself since 70.1, so "wheel" is no longer a build requirement.
+requires = ["setuptools>=77"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -7,12 +9,14 @@ name = "pcapper"
 # Read from pcapper/__init__.py so there is exactly one source of truth.
 # See [tool.setuptools.dynamic] below.
 dynamic = ["version"]
-description = "Modular PCAP threat-hunting, forensics & incident-response/triage CLI for IT and OT/ICS networks"
+description = "PCAP forensics and threat hunting for IT and OT/ICS networks: triage, incident response and protocol deep dives from one CLI"
 readme = "README.md"
 requires-python = ">=3.9"
-license = { file = "LICENSE" }
+license = "MIT"
+license-files = ["LICENSE"]
 keywords = [
     "pcap",
+    "pcapng",
     "network",
     "forensics",
     "security",
@@ -22,13 +26,17 @@ keywords = [
     "ot",
     "ics",
     "scada",
+    "modbus",
+    "dnp3",
     "mitre-attack",
 ]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
+    "Environment :: Console",
     "Intended Audience :: Information Technology",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
+    "Intended Audience :: System Administrators",
+    "Operating System :: OS Independent",
     "Programming Language :: Python :: 3",
     "Programming Language :: Python :: 3 :: Only",
     "Programming Language :: Python :: 3.9",
@@ -36,10 +44,10 @@ classifiers = [
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
     "Programming Language :: Python :: 3.13",
+    "Programming Language :: Python :: 3.14",
     "Topic :: Security",
     "Topic :: System :: Networking :: Monitoring",
 ]
-urls = { Homepage = "https://github.com/SackOfHacks/pcapper", Repository = "https://github.com/SackOfHacks/pcapper", Issues = "https://github.com/SackOfHacks/pcapper/issues" }
 dependencies = [
     "cryptography>=42.0.0",
     "dpkt>=1.9.8",
@@ -48,6 +56,13 @@ dependencies = [
     "scapy>=2.5.0",
     "tomli>=2.0.1; python_version < \"3.11\"",
 ]
+
+[project.urls]
+Homepage = "https://github.com/SackOfHacks/pcapper"
+Repository = "https://github.com/SackOfHacks/pcapper"
+Changelog = "https://github.com/SackOfHacks/pcapper/blob/main/CHANGELOG.md"
+Issues = "https://github.com/SackOfHacks/pcapper/issues"
+Security = "https://github.com/SackOfHacks/pcapper/security/policy"
 
 [project.optional-dependencies]
 dev = [

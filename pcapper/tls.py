@@ -40,6 +40,7 @@ from .utils import (
     safe_float,
     shannon_entropy,
 )
+from .utils import vt_api_key
 
 try:
     from scapy.layers.inet import IP, TCP  # type: ignore
@@ -771,7 +772,7 @@ def _parse_raw_client_hello(payload: bytes) -> Optional[_RawClientHello]:
         f"{_join_decimal(ext_types)},{_join_decimal(groups)},"
         f"{_join_decimal(ec_points)}"
     )
-    ja3_hash = hashlib.md5(ja3.encode("utf-8", errors="ignore")).hexdigest()
+    ja3_hash = hashlib.md5(ja3.encode("utf-8", errors="ignore"), usedforsecurity=False).hexdigest()
     ja4 = _ja4_from_raw_client_hello(
         version=negotiated_version,
         ciphers=ciphers,
@@ -1375,7 +1376,7 @@ def analyze_tls(
                 ja3 = _ja3_from_client_hello(client_hello)
                 if ja3:
                     ja3_hash = hashlib.md5(
-                        ja3.encode("utf-8", errors="ignore")
+                        ja3.encode("utf-8", errors="ignore"), usedforsecurity=False
                     ).hexdigest()
 
                 ja4 = _ja4_from_client_hello(client_hello, sni_val, alpn_vals)
@@ -2189,7 +2190,7 @@ def analyze_tls(
     if vt_lookup:
         if not network_egress_allowed():
             vt_errors.append("VirusTotal lookups skipped: network egress is disabled.")
-        elif not (api_key := os.environ.get("VT_API_KEY")):
+        elif not (api_key := vt_api_key()):
             vt_errors.append("VT_API_KEY is not set; skipping VirusTotal lookups.")
         else:
             # Public names only, filtered *before* taking the top 80 so

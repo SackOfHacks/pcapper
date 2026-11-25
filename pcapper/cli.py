@@ -1273,10 +1273,10 @@ def _build_run_header() -> str:
     """The line an analysis run starts with: the name and version. The quote
     of the day is shown only on the full ASCII-art banner (`pcapper` without
     arguments, and -h)."""
-    from .coloring import ANSI_CYAN, colorize
+    from .coloring import ANSI_CYAN, ANSI_WHITE, colorize
 
     product = colorize("PCAPPER", ANSI_CYAN, bold=True)
-    rest = colorize(f"v{__version__} · PCAP forensics and threat hunting for IT and OT/ICS", "\x1b[37m", dim=True)
+    rest = colorize(f"v{__version__} · PCAP forensics and threat hunting for IT and OT/ICS", ANSI_WHITE, dim=True)
     return f"{product} {rest}"
 
 

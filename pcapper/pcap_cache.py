@@ -1507,7 +1507,7 @@ class _CaptureRaw(io.RawIOBase):
             self._meta_key = self.meta_key
         self._hash_key = hash_key
         self._sha256 = hashlib.sha256() if hash_key is not None else None
-        self._sha1 = hashlib.sha1() if hash_key is not None else None
+        self._sha1 = hashlib.sha1(usedforsecurity=False) if hash_key is not None else None
         self._hash_ok = hash_key is not None
         # A part of a split capture: (state, index, key) of the group's hashes,
         # carried on from the state the parts before it left.
@@ -1688,7 +1688,7 @@ class _GroupHash:
         self.count = count
         self.next_index = 0
         self.sha256 = hashlib.sha256()
-        self.sha1 = hashlib.sha1()
+        self.sha1 = hashlib.sha1(usedforsecurity=False)
 
     def part_done(self, index: int, sha256, sha1, group_key: tuple) -> None:  # type: ignore[no-untyped-def]
         if index != self.next_index:
@@ -2568,7 +2568,7 @@ def capture_hashes(path: Path) -> tuple[str | None, str | None]:
 def _hash_parts(parts: list[Path]) -> tuple[str | None, str | None]:
     """A read of the capture's files, in order, for nothing but their hashes."""
     sha256 = hashlib.sha256()
-    sha1 = hashlib.sha1()
+    sha1 = hashlib.sha1(usedforsecurity=False)
     try:
         for part in parts:
             with part.open("rb") as handle:

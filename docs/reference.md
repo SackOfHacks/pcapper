@@ -636,7 +636,11 @@ mistaken for media).
 - Use `--no-status` for cleaner output in logs/pipelines (no bar is drawn when stderr is not a terminal either).
 - `--ot-commands-config` accepts JSON/YAML with `write_markers` and `protocol_markers` overrides (YAML requires PyYAML).
 - Use `--ot-commands-sessions` to change the number of session rows in the OT commands block.
-- VirusTotal lookups require `VT_API_KEY` and `-vt`/`--vt`.
+- **Network egress.** pcapper contacts no outside service unless you configure one:
+  - VirusTotal lookups need `-vt`/`--vt` and a key in `VT_API_KEY` (`PCAPPER_VT_KEY` is also read).
+  - `--ips` reputation lookups need `PCAPPER_INTEL_OPT_IN=1` and run for the services whose keys are set: `PCAPPER_ABUSEIPDB_KEY`, `PCAPPER_OTX_KEY`, and the VirusTotal key above.
+  - `--ips` reads local MaxMind databases when `PCAPPER_GEOIP_CITY_DB` / `PCAPPER_GEOIP_ASN_DB` point at them (offline). `--ip-geo` asks ip-api.com instead, over plaintext HTTP, so it runs only with `PCAPPER_ALLOW_PLAINTEXT_EGRESS=1`.
+  - `--network off` (or `PCAPPER_NETWORK=off`) forbids every lookup, whatever is configured.
 - Set `PCAPPER_QUOTE` to override the banner quote, or `PCAPPER_QUOTE_SEED` for deterministic rotation.
 - Output ordering is deterministic by default; set `PCAPPER_DETERMINISTIC=0` to restore Python's default Counter tie ordering.
 - Use `--self-check` for a quick dependency and environment check, and `--list-plugins` to inspect loaded plugins.

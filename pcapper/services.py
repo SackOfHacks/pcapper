@@ -113,7 +113,7 @@ _ADMIN_SERVICE_NAMES = {"SSH", "RDP", "SMB", "VNC", "Telnet", "WinRM"}
 # reachable instance is frequently an unauthenticated, internet-leaked breach.
 _DATASTORE_SERVICES = {
     "MSSQL", "MySQL", "PostgreSQL", "Oracle", "Redis", "MongoDB",
-    "Elasticsearch", "Memcached", "CouchDB", "Cassandra", "Redis",
+    "Elasticsearch", "Memcached", "CouchDB", "Cassandra",
 }
 _UNAUTH_DEFAULT_DATASTORES = {
     "Redis", "MongoDB", "Elasticsearch", "Memcached", "CouchDB", "Cassandra",

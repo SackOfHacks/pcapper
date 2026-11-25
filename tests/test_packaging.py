@@ -73,13 +73,33 @@ class TestVersionHasOneSource:
     def test_version_looks_like_semver(self) -> None:
         assert re.fullmatch(r"\d+\.\d+\.\d+([-.].+)?", pcapper.__version__)
 
-    def test_requirements_header_matches(self) -> None:
-        """The header comment names a version; keep it honest rather than
-        letting it rot into a third stale copy."""
-        first = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8").splitlines()[0]
-        match = re.search(r"pcapper v(\d+\.\d+\.\d+)", first)
-        assert match, f"expected a version in the requirements.txt header: {first!r}"
-        assert match.group(1) == pcapper.__version__
+    def test_the_version_is_written_once(self) -> None:
+        """Every copy of the version is a line two release branches both edit:
+        the README badge and "Current Release" section and the requirements.txt
+        header each conflicted when PRs came from two machines. The version
+        lives in pcapper/__init__.py; the changelog names releases."""
+        version = pcapper.__version__
+        docs = [REPO_ROOT / "README.md", REPO_ROOT / "SECURITY.md", PYPROJECT,
+                *sorted((REPO_ROOT / "docs").glob("**/*.md")),
+                *sorted((REPO_ROOT / ".github").glob("**/*.yml"))]
+        copies = [str(path.relative_to(REPO_ROOT)) for path in docs
+                  if path.is_file() and re.search(rf"(?<![\d.]){re.escape(version)}(?![\d.])",
+                                                  path.read_text(encoding="utf-8"))]
+        assert copies == [], f"the version {version} is copied into {copies}; name it only in pcapper/__init__.py"
+
+    def test_the_changelog_names_this_release_below_unreleased(self) -> None:
+        """Branches add entries under "## Unreleased", which stays the top
+        heading; a release adds its own heading directly below it. Renaming
+        Unreleased instead would let a branch opened before the release merge
+        its entries, without a conflict, into the release that shipped without
+        them. The release below Unreleased is the version the package declares,
+        so a version bump without its changelog heading (or the reverse) fails."""
+        text = (REPO_ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        headings = re.findall(r"^## (\S+)", text, re.MULTILINE)
+        assert headings[:1] == ["Unreleased"], "CHANGELOG.md must start with ## Unreleased"
+        assert headings[1:2] == [pcapper.__version__], (
+            f"the newest release in CHANGELOG.md is {headings[1:2]}, the package is {pcapper.__version__}"
+        )
 
     def test_cli_banner_uses_the_package_version(self) -> None:
         cli = (PACKAGE_ROOT / "cli.py").read_text(encoding="utf-8")
@@ -113,51 +133,15 @@ class TestEverySubpackageIsDistributed:
         assert "pcapper.reporting" in declared
 
 
-class TestRequirementsMatchPyproject:
-    """``requirements.txt`` and ``pyproject.toml`` must list the same runtime
-    dependencies, with the same specifiers.
+class TestOneDependencyManifest:
+    """pyproject.toml is the only dependency manifest. requirements.txt
+    repeated its list (and the version) by hand and needed a test to keep the
+    copies agreeing; installs resolve from pyproject.toml, and so does
+    Dependabot."""
 
-    The header of ``requirements.txt`` has always said "Keep in sync with
-    pyproject.toml [project.dependencies]", and nothing enforced it. A
-    Dependabot PR then proposed raising ``tomli>=2.0.1`` to ``>=2.4.1`` in
-    ``requirements.txt`` alone, which would have left the two disagreeing on
-    the first line it touched -- and silently, because installs resolve from
-    ``pyproject.toml``, so the requirements floor has no effect on what a user
-    actually gets. A manual-sync comment is not a control; this is.
-    """
+    def test_no_second_manifest(self) -> None:
+        assert sorted(p.name for p in REPO_ROOT.glob("requirements*.txt")) == []
 
-    @staticmethod
-    def _normalise(spec: str) -> str:
-        """Compare requirement strings without whitespace or quote noise.
-
-        ``tomli>=2.0.1; python_version < "3.11"`` and the pyproject spelling of
-        the same line differ only in spacing, so neither survives into the
-        comparison.
-        """
-        return re.sub(r"\s+", "", spec).replace("'", '"')
-
-    def _requirements(self) -> set[str]:
-        out = set()
-        text = (REPO_ROOT / "requirements.txt").read_text(encoding="utf-8")
-        for line in text.splitlines():
-            line = line.split("#", 1)[0].strip()
-            if line:
-                out.add(self._normalise(line))
-        return out
-
-    def test_the_two_manifests_agree(self) -> None:
-        declared = {self._normalise(d) for d in _pyproject()["project"]["dependencies"]}
-        listed = self._requirements()
-        only_in_requirements = listed - declared
-        only_in_pyproject = declared - listed
-        assert not (only_in_requirements or only_in_pyproject), (
-            "requirements.txt and pyproject.toml have drifted.\n"
-            f"  only in requirements.txt: {sorted(only_in_requirements)}\n"
-            f"  only in pyproject.toml:   {sorted(only_in_pyproject)}\n"
-            "Both files must be updated together -- note that installs resolve "
-            "from pyproject.toml, so a requirements-only change has no effect."
-        )
-
-    def test_requirements_is_not_empty(self) -> None:
-        """Guard the guard: an empty parse would make the test above vacuous."""
-        assert len(self._requirements()) >= 5
+    def test_runtime_dependencies_are_declared(self) -> None:
+        declared = {re.split(r"[<>=;\s]", d, maxsplit=1)[0] for d in _pyproject()["project"]["dependencies"]}
+        assert {"scapy", "cryptography", "dpkt"} <= declared

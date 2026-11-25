@@ -117,7 +117,7 @@ def _canonical_key(
 
 def _stream_id(src: str, sport: int, dst: str, dport: int) -> str:
     raw = f"{src}:{sport}<->{dst}:{dport}"
-    return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()[:12]
+    return hashlib.sha1(raw.encode("utf-8", errors="ignore"), usedforsecurity=False).hexdigest()[:12]
 
 
 def _client_server_tuple(
