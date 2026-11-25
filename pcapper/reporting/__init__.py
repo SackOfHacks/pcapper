@@ -399,6 +399,9 @@ from .smb import (
 from .snmp import (
     render_snmp_summary,
 )
+from .socks import (
+    render_socks_summary,
+)
 from .srtp import (
     render_srtp_summary,
 )
@@ -540,6 +543,7 @@ from ..services import COMMON_PORTS, ServiceSummary
 from ..sizes import SizeSummary, render_size_sparkline
 from ..smb import SmbSummary
 from ..snmp import SnmpSummary
+from ..socks import SocksSummary
 from ..ssdp import SsdpSummary
 from ..ssh import SshSummary
 from ..streams import StreamSummary
