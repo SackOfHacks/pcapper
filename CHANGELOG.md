@@ -4,6 +4,35 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## 3.1.0 — 2026-11-25
+
+### Baselines: `--baseline` and `--baseline-diff`
+
+`--baseline` records what a network normally does; `--baseline-diff` reports what deviates from it, as findings with a severity, in the drift report's usual layout (findings first, then the evidence tables).
+
+- **The profile:** every conversation as client -> server on its service port, classed OT, IoT, IT or other, with volume and request cadence (median interval and jitter); the commands each pair exchanges, reads and writes, from every analyzer `--ot-commands` runs; layer-2 industrial streams (GOOSE, SV, PROFINET RT, EtherCAT, PTP, LLDP); the MAC addresses each IP sent from. Hosts, services and OT command totals as before.
+- **The deviations** are fixed rules with named thresholds in `pcapper/baseline.py`: a new OT pair, a new writer to an OT device, remote-access/file-transfer protocols on an OT host, an IP answering from a different MAC, a polling cadence or rate change, an OT conversation gone silent, a new L2 stream, new hosts and services. The full table is in [docs/reference.md](docs/reference.md#baselines).
+- **File names follow the capture:** `X.pcap` -> `X.baseline.json` next to it. With `-summarize`, one merged baseline named after the captures' common prefix (`Site-1.pcap`, `Site-2.pcap` -> `Site.baseline.json`). `--baseline PATH` names the file or a directory.
+- **The reference can be a capture:** `--baseline-diff known-good.pcap` profiles it and compares, with no file in between.
+- **On their own, `--baseline` and `--baseline-diff` print only their report.** `--baseline-save` used to switch on `--services` and `--ot-commands` and print both; the analyses now run silently and are memoized, so asking for them as well costs nothing. `--baseline-save PATH` and `--baseline-compare REF` remain as aliases. Their files (schema 1) still load and compare: the sections they lack are noted, never reported as drift.
+- **Modbus register values:** the range each register held (from read responses paired with their requests, and from written values; `ModbusAnalysis.register_ranges`). A register constant in the baseline that now reads differently is HIGH; a value beyond its baseline range is MEDIUM. On the public Coimbra Modbus testbed captures, the Modbus query flood drove the PLC's holding register 6 to 0 where the clean hour held 30..31.
+- **`--ot-commands`** records every command per direction of communication (`OtCommandSummary.pair_commands`), in full and fast mode.
+
+Checked against the public [Coimbra ICS_PCAPS](https://github.com/tjcruz-dei/ICS_PCAPS) Modbus/TCP testbed captures: a clean hour as the baseline, the ARP man-in-the-middle hour (the HMI's IP sent from the attacker's MAC, naming the attacker's own IP) and the Modbus query flood hour (a new pair and writer, the register above), with the legitimate HMI polling and writer unflagged in both.
+
+### Faster host inventory
+
+- **Analyses called positionally and by keyword share one memo entry.** `analyze_hostname(path, None)` (the host inventory) and `analyze_hostname(path, target_ip=None)` (the IP analysis) were two cache entries, so `--hosts`, `--hostdetails` and baselines computed host names twice. Positional arguments are now keyed by the parameter they fill.
+- **OS fingerprinting reads lightweight records.** It dissected every packet to find TCP SYNs; it now drops non-SYN records, and SYNs from a host already sampled 250 times, from their header bytes, and dissects only the SYNs it samples. Results are identical (pinned by a test against dissected packets). On a 264,000-packet Modbus flood capture the fingerprint pass went from ~23 s to 0.7 s and the host inventory from 93 s to 64 s.
+
+### Fixed
+
+- **CODESYS was labelled "ODESYS"** in the service names, the OT command keys and the OT-presence aliases. The alias mismatch also meant CODESYS traffic never counted as present, so CODESYS findings were dropped from the merged OT view.
+- **`--ips`: a host addressing itself was counted twice.** A packet whose source and destination are the same IP counted in both its sent and received bytes, so the endpoint table's TOTAL doubled and "Traffic concentration on a single host" read 200%. Self-addressed bytes now count once (`IpEndpoint.bytes_self`, `bytes_total`).
+- **`-summarize`: the merged concentration finding is computed on the merged traffic.** Each capture's own "X accounts for 100% of IP bytes" was carried into the rollup, contradicting the merged endpoint table. It is now recomputed from the merged endpoints.
+- **Tests that assumed POSIX now pass on Windows:** the explicit `--jobs` assertion allows for no `fork()`, the loopback fixture uses the IPv6 family scapy binds on the platform (Windows: 24, not `AF_INET6` 23), and the stand-in tshark/Suricata run through a `.cmd` launcher where a shebang script cannot execute.
+- **`-summarize`: merged finding details no longer add up IP addresses and percentages.** Merging "same finding, different numbers" summed every digit run, so three captures turned `192.168.121.2 … 200.0%` into `394.418.283.109 … 600.0%`. Only standalone counts are summed now; any other difference lists the variants.
+
 ## 3.0.2 — 2026-11-24
 
 ### Scan-heavy captures: `--creds` and the analyses it starts dissect only what they read

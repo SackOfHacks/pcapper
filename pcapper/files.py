@@ -49,6 +49,7 @@ from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, complete_packet_view, iter_packets
 from .utils import open_capture_file
 from .utils import (
+    collapse_detection_details,
     fan_out,
     detect_file_type_bytes,
     env_int,
@@ -264,42 +265,7 @@ def _merge_detection_evidence(primary: Any, secondary: Any, limit: int = 10) -> 
 
 
 def _combine_detection_details(details: list[str]) -> str:
-    cleaned = [str(item).strip() for item in details if str(item).strip()]
-    if not cleaned:
-        return ""
-    if len(set(cleaned)) == 1:
-        return cleaned[0]
-
-    num_re = re.compile(r"\d+")
-    numeric_templates = [num_re.sub("#", value) for value in cleaned]
-    numeric_groups = [[int(v) for v in num_re.findall(value)] for value in cleaned]
-    if (
-        numeric_templates
-        and len(set(numeric_templates)) == 1
-        and numeric_groups
-        and all(len(group) == len(numeric_groups[0]) for group in numeric_groups)
-        and len(numeric_groups[0]) > 0
-    ):
-        summed = [sum(group[i] for group in numeric_groups) for i in range(len(numeric_groups[0]))]
-        next_index = 0
-
-        def _replace_num(_match: re.Match[str]) -> str:
-            nonlocal next_index
-            value = str(summed[next_index])
-            next_index += 1
-            return value
-
-        merged = num_re.sub(_replace_num, cleaned[0])
-        return f"{merged} Aggregated across {len(cleaned)} capture result(s)."
-
-    unique_details = list(dict.fromkeys(cleaned))
-    if len(unique_details) == 2:
-        return f"{unique_details[0]} | {unique_details[1]}"
-    preview = " | ".join(unique_details[:2])
-    return (
-        f"{preview} | +{len(unique_details) - 2} additional detail variant(s) "
-        f"across {len(cleaned)} capture result(s)."
-    )
+    return collapse_detection_details(details)
 
 
 def _merge_file_detection_items(

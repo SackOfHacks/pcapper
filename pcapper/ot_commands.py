@@ -101,6 +101,10 @@ class OtCommandSummary:
     # (GOOSE, SV, C37.118): their protection/measurement logic lives in
     # --goose/--sv/--synchrophasor.
     unnormalized_streams: list[str] = field(default_factory=list)
+    # Every command per direction of communication, reads included, keyed
+    # (protocol, src, dst, command, is_write): what --baseline profiles, so a
+    # pair that only ever read and now writes is a deviation.
+    pair_commands: Counter[tuple[str, str, str, str, bool]] = field(default_factory=Counter)
 
 
 @dataclass(frozen=True)
@@ -320,6 +324,71 @@ def _add_control_target(
     if not clean_detail:
         clean_detail = "control"
     targets.setdefault(proto, Counter())[f"{dst} :: {clean_detail}"] += 1
+
+
+def _is_reply(command: str) -> bool:
+    """A device answering (Modbus/DNP3 responses, IEC-104 confirmations and
+    terminations, ``STARTDT con``), not a command the sender issues."""
+    lowered = command.lower().strip()
+    return (
+        "response" in lowered
+        or "(reply)" in lowered
+        or "confirmation" in lowered
+        or "termination" in lowered
+        or lowered.endswith(" con")
+    )
+
+
+def _collect_pair_commands(
+    sources: list[tuple[str, object, tuple[str, ...]]],
+    base_markers: tuple[str, ...],
+    dnp3_control_names: set[str],
+) -> Counter[tuple[str, str, str, str, bool]]:
+    """(protocol, src, dst, command, is_write) counts from the analyzers' own
+    per-message records: Modbus/DNP3 messages and every other protocol's
+    command events. Replies are left out: a device answering is not a command
+    it issues. Each analyzer contributes from one record kind only -- the most
+    detailed it has (messages, else command events, else its per-service
+    endpoint counts) -- since the kinds describe the same packets."""
+    out: Counter[tuple[str, str, str, str, bool]] = Counter()
+    for label, summary, markers in sources:
+        if summary is None:
+            continue
+        messages = getattr(summary, "messages", None) or []
+        events = getattr(summary, "command_events", None) or []
+        endpoints_by_service = getattr(summary, "service_endpoints", None) or {}
+        if messages:
+            events, endpoints_by_service = [], {}
+        elif events:
+            endpoints_by_service = {}
+        for msg in messages:
+            command = str(getattr(msg, "func_name", "") or "")
+            if not command or getattr(msg, "direction", None) == "response" or _is_reply(command):
+                continue
+            src = str(getattr(msg, "src_ip", "") or "")
+            dst = str(getattr(msg, "dst_ip", "") or "")
+            if not src or not dst:
+                continue
+            is_write = _is_write_command(command, markers, base_markers) or (
+                label == "DNP3" and command.lower() in dnp3_control_names
+            )
+            out[(label, src, dst, command, is_write)] += 1
+        for event in events:
+            command = str(getattr(event, "command", "") or "")
+            src = str(getattr(event, "src", "") or "")
+            dst = str(getattr(event, "dst", "") or "")
+            if not command or not src or not dst or _is_reply(command):
+                continue
+            out[(label, src, dst, command, _is_write_command(command, markers, base_markers))] += 1
+        for service, endpoints in endpoints_by_service.items():
+            if _is_reply(str(service)):
+                continue
+            is_write = _is_write_command(str(service), markers, base_markers)
+            for endpoint, count in (endpoints or {}).items():
+                src, _, dst = str(endpoint).partition(" -> ")
+                if src and dst:
+                    out[(label, src, dst, str(service), is_write)] += int(count)
+    return out
 
 
 def _compute_control_intensity(
@@ -572,6 +641,7 @@ def _analyze_ot_commands_fast(
 
     command_counts: Counter[str] = Counter()
     all_command_counts: Counter[str] = Counter()
+    pair_commands: Counter[tuple[str, str, str, str, bool]] = Counter()
     sources: Counter[str] = Counter()
     destinations: Counter[str] = Counter()
     command_sessions: Counter[str] = Counter()
@@ -729,6 +799,8 @@ def _analyze_ot_commands_fast(
                 if command_gate
                 else _is_write_command(cmd, proto_extra, base_markers)
             )
+            if not _is_reply(cmd):
+                pair_commands[(proto, src_ip, dst_ip, cmd, bool(is_control))] += 1
             if not is_control:
                 continue
             command_counts[f"{proto}:{cmd}"] += 1
@@ -775,6 +847,7 @@ def _analyze_ot_commands_fast(
         detections=detections,
         errors=errors,
         all_command_counts=all_command_counts,
+        pair_commands=pair_commands,
     )
 
 
@@ -977,7 +1050,7 @@ def analyze_ot_commands(
     codesys_extra = _protocol_extra("CODESYS")
     _count_from_industrial(
         codesys,
-        "ODESYS",
+        "CODESYS",
         command_counts,
         sources,
         destinations,
@@ -1332,6 +1405,26 @@ def analyze_ot_commands(
         for _cmd, _cnt in (_ctr or Counter()).items():
             all_command_counts[f"{_label}:{_cmd}"] += _cnt
 
+    # CoAP's PUT/POST are its writes; every other protocol's markers are the
+    # configured ones its own counting above used.
+    marker_overrides = {"CoAP": coap_extra}
+    pair_sources: list[tuple[str, object, tuple[str, ...]]] = [
+        (label, summary, marker_overrides.get(label) or _protocol_extra(label))
+        for label, summary in (
+            ("Modbus", modbus), ("DNP3", dnp3), ("CIP", cip), ("IEC-104", iec),
+            ("S7", s7), ("OPC-UA", opc), ("CODESYS", codesys), ("PCCC", pccc),
+            ("Niagara", niagara), ("MQTT", mqtt), ("BACnet", bacnet), ("CoAP", coap),
+            ("DF1", df1), ("EtherCAT", ethercat), ("FINS", fins), ("MELSEC", melsec),
+            ("MMS", mms), ("Modicon", modicon), ("PROFINET", profinet), ("SRTP", srtp),
+            ("Yokogawa", yokogawa), ("PCWorx", pcworx), ("ProConOS", prconos),
+        )
+    ]
+    pair_sources.extend(
+        (label, summary, _merge_markers(_protocol_extra(label), markers))
+        for label, summary, markers in extra_sources
+    )
+    pair_commands = _collect_pair_commands(pair_sources, base_markers, dnp3_control_names)
+
     detections: list[dict[str, object]] = []
     if command_counts:
         detections.append(
@@ -1363,4 +1456,5 @@ def analyze_ot_commands(
         errors=errors,
         all_command_counts=all_command_counts,
         unnormalized_streams=unnormalized,
+        pair_commands=pair_commands,
     )

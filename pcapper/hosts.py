@@ -15,6 +15,7 @@ from .hostname import analyze_hostname
 from .ips import analyze_ips
 from .ldap import analyze_ldap
 from .netbios import analyze_netbios
+from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .progress import run_with_busy_status
 from .services import ServiceAsset, analyze_services
@@ -614,9 +615,22 @@ def _collect_os_fingerprints(
     per_host = Counter()
     total_samples = 0
 
-    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status):
+    # Records come lite from disk: a packet whose only transport is UDP, or a
+    # TCP segment without SYN, is dropped from its header bytes (the loop below
+    # would skip it); a SYN, and anything the bytes cannot answer, is dissected.
+    for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status, lite=True):
         if total_samples >= MAX_FP_SAMPLES:
             break
+        if type(pkt) is LitePacket:
+            l4 = pkt.lite_l4()
+            if l4 is not None and l4 is not UNSUPPORTED and (not l4[0] or not (l4[4] & 0x02)):
+                continue
+            # A SYN from a host already sampled MAX_FP_PER_HOST times is
+            # skipped below too: a SYN flood need not be dissected.
+            lite_src, _lite_dst = extract_packet_endpoints(pkt)
+            if lite_src and per_host[lite_src] >= MAX_FP_PER_HOST:
+                continue
+            pkt = pkt.materialize()
         tcp = pkt.getlayer(TCP)  # type: ignore[arg-type]
         if tcp is None:
             continue

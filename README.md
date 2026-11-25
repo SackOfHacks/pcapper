@@ -4,7 +4,7 @@
 ![CI](https://github.com/SackOfHacks/pcapper/actions/workflows/ci.yml/badge.svg)
 ![Tests](https://img.shields.io/badge/tests-1141%20passing-1B5E20)
 ![Analyzers](https://img.shields.io/badge/analyzers-120%2B-3D5A80)
-![Version](https://img.shields.io/badge/release-v3.0.2-7C3AED)
+![Version](https://img.shields.io/badge/release-v3.1.0-7C3AED)
 ![License](https://img.shields.io/badge/license-MIT-6C757D)
 ![CLI](https://img.shields.io/badge/cli-incident--grade-1B5E20)
 ![OT/ICS](https://img.shields.io/badge/ot%2Fics-ready-3D5A80)
@@ -138,6 +138,7 @@ flowchart LR
 | Investigate phone calls (VoIP) | `--voip` (add `--voip-out DIR` to recover call audio) |
 | Run OT/ICS-specific triage | `--modbus --dnp3 --iec104 --s7 --ot-commands --safety` |
 | Find OT protocols on moved ports | `--overview` (auto-detects), or `--decode-as tcp/10203=s7` |
+| Compare against a known-good baseline | `--baseline` once, then `--baseline-diff X.baseline.json` (or a known-good `.pcap`) |
 | Building automation / metering | `--knx --lontalk --bacnet` / `--dlms --c1222` |
 | Build IR exports and evidence packs | `--json --csv --sqlite --case-dir` |
 
@@ -390,7 +391,9 @@ CRIT  Pivot    IT->OT pivot: remote access then OT command  45.137.21.9(1)  10.0
   source) and subsequently issued a Modbus command to 10.0.0.20.   [ATT&CK T0859 / T0855]
 ```
 
-## Current Release: v3.0.2
+## Current Release: v3.1.0
+
+v3.1.0 adds baselines for OT/ICS/IoT networks. `--baseline` records what a network normally does: who talks to whom, at what polling cadence, with which read and write commands, from which MAC addresses, and the value range of every Modbus register. `--baseline-diff` compares a capture against that file, or straight against a known-good capture, and reports each deviation as a finding: a new OT pair or writer, a changed poll rate, an IP answering from another MAC (naming the spoofer's own IP), a register outside its range, remote access to an OT host. On the public Coimbra Modbus testbed captures it names the ARP man-in-the-middle and the Modbus flood, including the flood driving a PLC register to 0, and leaves the legitimate polling alone. Also: `-summarize` no longer adds up IP addresses and percentages in merged findings, self-addressed traffic counts once in `--ips`, and the host inventory is faster. See the [changelog](CHANGELOG.md).
 
 v3.0.2 makes scan-heavy captures fast: no analysis of `--creds`, `--threats` or `--overview` has scapy dissect every packet any more. Each one skips, from the packet's bytes, the packets its code would do nothing with -- 92% of maccdc2010's packets are scan segments without a payload -- and dissects the rest as before. maccdc2010 (10M packets): `--creds -v` 38.7 min → 6.4 min, `--overview` 69.6 min → 19.0 min. Reports are byte-identical. See the [changelog](CHANGELOG.md).
 
@@ -439,6 +442,7 @@ What you get:
 - Analyst-friendly outputs tuned for plant floors, substations, and mixed IT/OT environments.
 - Control-command visibility for safety/availability impacts (writes, downloads, starts/stops).
 - Control-loop validation on Modbus/DNP3 value changes (rate-of-change, oscillation, outliers).
+- Baselines (`--baseline`, `--baseline-diff`): record an OT/ICS/IoT network's normal (who talks to whom, at what polling cadence, with which read/write commands, from which MACs) and report deviations as findings: a new writer to a PLC, a changed poll rate, a PLC answering from a new MAC, SMB/RDP to an OT host.
 - Safety PLC/SIS analysis: TriStation decoded (functions, key switch, project) with TRITON-sequence detection.
 - OT/ICS-centric threat and anomaly rollups with evidence lines for fast triage.
 - Device fingerprinting across IT/OT/IoT traffic (vendor/model/OS/firmware/software) for asset-aware triage.

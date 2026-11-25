@@ -1008,6 +1008,24 @@ def _analysis_context_key(path: Path) -> tuple:
 
 
 @lru_cache(maxsize=None)
+def _memo_positional_names(func) -> tuple[str, ...]:
+    """Names of the parameters after the capture path that a call may fill
+    positionally (empty when the signature cannot be read or takes *args)."""
+    try:
+        params = list(inspect.signature(func).parameters.values())[1:]
+    except (TypeError, ValueError):
+        return ()
+    names = []
+    for param in params:
+        if param.kind not in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD):
+            break
+        if param.kind is inspect.Parameter.POSITIONAL_ONLY:
+            return ()
+        names.append(param.name)
+    return tuple(names)
+
+
+@lru_cache(maxsize=None)
 def _memo_defaults(func) -> dict[str, object]:
     try:
         return {
@@ -1120,6 +1138,14 @@ def fan_out(func):
 
 def _memo_key(func, path, args: tuple, kwargs: dict) -> Optional[tuple]:
     """The memo key of a call, or None when the call cannot be memoised."""
+    # A positional argument is the same request as the keyword it fills:
+    # analyze_hostname(path, None) and analyze_hostname(path, target_ip=None)
+    # made two cache entries, and --hosts computed host names twice. Done
+    # before anything reads kwargs (packets= below).
+    names = _memo_positional_names(func)
+    if args and len(args) <= len(names) and not (set(names[: len(args)]) & set(kwargs)):
+        kwargs = {**dict(zip(names, args)), **kwargs}
+        args = ()
     try:
         path_obj = Path(path).expanduser()
         try:
@@ -1825,3 +1851,45 @@ def x509_names(cert: object) -> tuple[str, str]:
         except Exception:  # noqa: BLE001 - malformed name in an attacker cert
             names.append("<unparseable name>")
     return names[0], names[1]
+
+
+# A standalone integer count. Digit runs that are part of a larger token —
+# IP octets, decimals, percentages, ratios, ports in host:port, hex, units —
+# are identifiers or ratios, and summing them across captures is meaningless
+# (it turned "10.0.0.1 ... 60.0%" x3 into "30.0.0.3 ... 180.0%").
+_SUMMABLE_COUNT_RE = re.compile(r"(?<![\w.:/%-])\d+(?![\w:%/]|\.\d)")
+
+
+def collapse_detection_details(details: list[str]) -> str:
+    """Merge one detection's detail text from several capture results.
+
+    When the texts differ only in standalone integer counts, the counts are
+    summed. Every other number (IPs, percentages, decimals, ports) must match
+    exactly for that to happen; otherwise the distinct variants are listed.
+    """
+    cleaned = [str(item).strip() for item in details if str(item).strip()]
+    if not cleaned:
+        return ""
+    if len(set(cleaned)) == 1:
+        return cleaned[0]
+
+    templates = {_SUMMABLE_COUNT_RE.sub("#", item) for item in cleaned}
+    number_groups = [
+        [int(v) for v in _SUMMABLE_COUNT_RE.findall(item)] for item in cleaned
+    ]
+    if len(templates) == 1 and number_groups[0]:
+        summed = iter(
+            sum(group[idx] for group in number_groups)
+            for idx in range(len(number_groups[0]))
+        )
+        merged = _SUMMABLE_COUNT_RE.sub(lambda _m: str(next(summed)), cleaned[0])
+        return f"{merged} Aggregated across {len(cleaned)} capture result(s)."
+
+    unique = list(dict.fromkeys(cleaned))
+    if len(unique) == 2:
+        return f"{unique[0]} | {unique[1]}"
+    preview = " | ".join(unique[:2])
+    return (
+        f"{preview} | +{len(unique) - 2} additional detail variant(s) "
+        f"across {len(cleaned)} capture result(s)."
+    )

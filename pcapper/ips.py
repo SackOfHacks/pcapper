@@ -115,6 +115,14 @@ class IpEndpoint:
     last_seen: Optional[float]
     geo: Optional[str]
     asn: Optional[str]
+    # Bytes of packets the host addressed to itself (src == dst); they are
+    # in both bytes_sent and bytes_recv. See ``bytes_total``.
+    bytes_self: int = 0
+
+    @property
+    def bytes_total(self) -> int:
+        """Bytes of the packets the host took part in, each counted once."""
+        return self.bytes_sent + self.bytes_recv - self.bytes_self
 
 
 @dataclass(frozen=True)
@@ -426,6 +434,33 @@ def _build_ips_enrichment(
         "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
     }
 
+CONCENTRATION_SUMMARY = "Traffic concentration on a single host"
+
+
+def _concentration_detection(
+    endpoints: list["IpEndpoint"],
+    total_bytes: int,
+) -> dict[str, object] | None:
+    """The host that took part in more than half of the IP bytes, if any.
+
+    A packet whose src and dst are the same host lands in both bytes_sent and
+    bytes_recv; it is counted once, so the share is the fraction of IP bytes
+    the host took part in (never >100%).
+    """
+    if total_bytes <= 0 or not endpoints:
+        return None
+    top = max(endpoints, key=lambda e: e.bytes_total)
+    involved = top.bytes_total
+    share = min(1.0, involved / total_bytes)
+    if share <= 0.5:
+        return None
+    return {
+        "severity": "info",
+        "summary": CONCENTRATION_SUMMARY,
+        "details": f"{top.ip} accounts for {share * 100:.1f}% of IP bytes.",
+    }
+
+
 def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
     summary_list = list(summaries)
     if not summary_list:
@@ -563,6 +598,10 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
         intel_findings.extend(summary.intel_findings)
 
         for detection in summary.detections:
+            # A per-capture share says nothing about the merged traffic;
+            # it is recomputed from the merged endpoints below.
+            if detection.get("summary") == CONCENTRATION_SUMMARY:
+                continue
             key = (
                 str(detection.get("severity", "info")),
                 str(detection.get("summary", "")),
@@ -587,6 +626,7 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
                     "packets_recv": 0,
                     "bytes_sent": 0,
                     "bytes_recv": 0,
+                    "bytes_self": 0,
                     "protocols": set(),
                     "peers": set(),
                     "ports": set(),
@@ -600,6 +640,7 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
             entry["packets_recv"] = int(entry["packets_recv"]) + endpoint.packets_recv
             entry["bytes_sent"] = int(entry["bytes_sent"]) + endpoint.bytes_sent
             entry["bytes_recv"] = int(entry["bytes_recv"]) + endpoint.bytes_recv
+            entry["bytes_self"] = int(entry["bytes_self"]) + endpoint.bytes_self
             entry["protocols"].update(endpoint.protocols)
             entry["peers"].update(endpoint.peers)
             entry["ports"].update(endpoint.ports)
@@ -654,6 +695,7 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
                 packets_recv=int(data["packets_recv"]),
                 bytes_sent=int(data["bytes_sent"]),
                 bytes_recv=int(data["bytes_recv"]),
+                bytes_self=int(data["bytes_self"]),
                 protocols=sorted(list(data["protocols"])),
                 peers=sorted(list(data["peers"])),
                 ports=sorted(list(data["ports"])),
@@ -678,6 +720,10 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
                 ports=sorted(list(data["ports"])),
             )
         )
+
+    concentration = _concentration_detection(endpoint_rows, total_bytes)
+    if concentration is not None:
+        detections.append(concentration)
 
     ipv4_count = 0
     ipv6_count = 0
@@ -1145,6 +1191,7 @@ def analyze_ips(
             "packets_recv": 0,
             "bytes_sent": 0,
             "bytes_recv": 0,
+            "bytes_self": 0,
             "protocols": set(),
             "peers": set(),
             "ports": set(),
@@ -1328,6 +1375,8 @@ def analyze_ips(
                         else:
                             entry["packets_recv"] = int(entry["packets_recv"]) + 1
                             entry["bytes_recv"] = int(entry["bytes_recv"]) + pkt_len
+                            if src_ip == dst_ip:
+                                entry["bytes_self"] = int(entry["bytes_self"]) + pkt_len
 
                         set_add_cap(entry["protocols"], protocol, max_size=MAX_SET_VALUES)
                         peer = dst_ip if ip_text == src_ip else src_ip
@@ -1508,6 +1557,8 @@ def analyze_ips(
                 else:
                     entry["packets_recv"] = int(entry["packets_recv"]) + 1
                     entry["bytes_recv"] = int(entry["bytes_recv"]) + pkt_len
+                    if src_ip == dst_ip:
+                        entry["bytes_self"] = int(entry["bytes_self"]) + pkt_len
 
                 set_add_cap(entry["protocols"], protocol, max_size=MAX_SET_VALUES)
                 peer = dst_ip if ip_text == src_ip else src_ip
@@ -1630,6 +1681,7 @@ def analyze_ips(
                 packets_recv=int(data["packets_recv"]),
                 bytes_sent=int(data["bytes_sent"]),
                 bytes_recv=int(data["bytes_recv"]),
+                bytes_self=int(data["bytes_self"]),
                 protocols=sorted(list(data["protocols"])),
                 peers=sorted(list(data["peers"])),
                 ports=sorted(list(data["ports"])),
@@ -1786,7 +1838,7 @@ def analyze_ips(
 
     top_endpoints = sorted(
         endpoint_rows,
-        key=lambda e: e.bytes_sent + e.bytes_recv,
+        key=lambda e: e.bytes_total,
         reverse=True,
     )
 
@@ -1841,6 +1893,7 @@ def analyze_ips(
                     packets_recv=endpoint.packets_recv,
                     bytes_sent=endpoint.bytes_sent,
                     bytes_recv=endpoint.bytes_recv,
+                    bytes_self=endpoint.bytes_self,
                     protocols=endpoint.protocols,
                     peers=endpoint.peers,
                     ports=endpoint.ports,
@@ -1868,7 +1921,7 @@ def analyze_ips(
         # Prioritise the highest-volume public peers within the rate-limit window.
         public_ips = [
             e.ip
-            for e in sorted(endpoint_rows, key=lambda e: e.bytes_sent + e.bytes_recv, reverse=True)
+            for e in sorted(endpoint_rows, key=lambda e: e.bytes_total, reverse=True)
             if is_public_ip(e.ip)
         ][:100]
         online, online_errors = _enrich_ips_online(public_ips)
@@ -2083,23 +2136,9 @@ def analyze_ips(
                 )
                 break
 
-        if total_bytes > 0:
-            sorted_endpoints = sorted(
-                endpoint_rows, key=lambda e: e.bytes_sent + e.bytes_recv, reverse=True
-            )
-            if sorted_endpoints:
-                top_endpoint = sorted_endpoints[0]
-                share = (
-                    top_endpoint.bytes_sent + top_endpoint.bytes_recv
-                ) / total_bytes
-                if share > 0.5:
-                    detections.append(
-                        {
-                            "severity": "info",
-                            "summary": "Traffic concentration on a single host",
-                            "details": f"{top_endpoint.ip} accounts for {share * 100:.1f}% of IP bytes.",
-                        }
-                    )
+        concentration = _concentration_detection(endpoint_rows, total_bytes)
+        if concentration is not None:
+            detections.append(concentration)
 
     # Browser (MS-BRWS) announced identity — enrich per-IP hostname, roles, OS
     # so the IP Host Details view names hosts and flags directory infrastructure.

@@ -25,6 +25,7 @@ from ..coloring import (
 from ..ipmac import mac_manufacturer
 from ..reporting_format import format_table
 from ..utils import (
+    collapse_detection_details,
     display_safe,
     format_bytes_as_mb,
     format_duration,
@@ -285,49 +286,8 @@ def _merge_detection_evidence_lines(values: list[object], limit: int = 10) -> li
     return list(dict.fromkeys(merged))[:limit]
 
 
-_NUMBER_RE = re.compile(r"\d+")
-
-
 def _collapse_detection_details(details: list[str]) -> str:
-    cleaned = [str(item).strip() for item in details if str(item).strip()]
-    if not cleaned:
-        return ""
-    if len(set(cleaned)) == 1:
-        return cleaned[0]
-
-    num_re = _NUMBER_RE
-    templates = [num_re.sub("#", item) for item in cleaned]
-    number_groups = [[int(v) for v in num_re.findall(item)] for item in cleaned]
-    if (
-        templates
-        and len(set(templates)) == 1
-        and number_groups
-        and all(len(group) == len(number_groups[0]) for group in number_groups)
-        and len(number_groups[0]) > 0
-    ):
-        summed = [
-            sum(group[idx] for group in number_groups)
-            for idx in range(len(number_groups[0]))
-        ]
-        next_index = 0
-
-        def _replace_num(_match: re.Match[str]) -> str:
-            nonlocal next_index
-            value = str(summed[next_index])
-            next_index += 1
-            return value
-
-        merged = num_re.sub(_replace_num, cleaned[0])
-        return f"{merged} Aggregated across {len(cleaned)} capture result(s)."
-
-    unique = list(dict.fromkeys(cleaned))
-    if len(unique) == 2:
-        return f"{unique[0]} | {unique[1]}"
-    preview = " | ".join(unique[:2])
-    return (
-        f"{preview} | +{len(unique) - 2} additional detail variant(s) "
-        f"across {len(cleaned)} capture result(s)."
-    )
+    return collapse_detection_details(details)
 
 
 def _collapse_rollup_detections(
@@ -442,7 +402,7 @@ _OT_ALIASES = {
     "CRIMSON": ["CRIMSON"],
     "PCWORX": ["PCWORX"],
     "MELSEC": ["MELSEC"],
-    "ODESYS": ["ODESYS"],
+    "CODESYS": ["CODESYS"],
     "NIAGARA": ["NIAGARA"],
     "MMS": ["MMS"],
     "SRTP": ["SRTP"],
