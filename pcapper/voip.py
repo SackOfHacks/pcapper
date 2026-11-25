@@ -2519,7 +2519,7 @@ def merge_voip_summaries(summaries) -> VoipSummary:
         return VoipSummary(path=Path("ALL_PCAPS"))
 
     merged = VoipSummary(path=Path("ALL_PCAPS"))
-    seen: set[tuple[str, str]] = set()
+    seen: set[tuple[str, str, str]] = set()
     for item in items:
         for name in (
             "total_packets", "signaling_packets", "signaling_bytes", "rtp_packets",
@@ -2533,18 +2533,18 @@ def merge_voip_summaries(summaries) -> VoipSummary:
             "rtcp_cnames", "devices", "enum_lookups", "stun_mapped_addresses",
         ):
             getattr(merged, name).update(getattr(item, name))
-        for name in (
-            "calls", "registrations", "credentials", "rtp_streams", "media",
-            "messages", "dtmf", "provisioning", "extracted_audio", "artifacts",
-            "analysis_notes", "errors", "threat_hypotheses",
-        ):
+        for name in ("extracted_audio", "errors"):  # files written per capture; errors deduped below
             getattr(merged, name).extend(getattr(item, name))
         for key, values in (item.deterministic_checks or {}).items():
             merged.deterministic_checks.setdefault(key, []).extend(values)
         for detection in item.detections:
+            # Each capture's own wording: detections are derived from state the
+            # summary does not keep, so they cannot be recomputed; keeping only
+            # the first capture's showed "1 credential" or "14" by input order.
             key = (
                 str(detection.get("severity", "")),
                 str(detection.get("summary", "")),
+                str(detection.get("details", "")),
             )
             if key in seen:
                 continue
@@ -2563,13 +2563,17 @@ def merge_voip_summaries(summaries) -> VoipSummary:
                 else max(merged.last_seen, item.last_seen)
             )
 
-    # A "nothing seen" note only holds for the rollup if it held for every capture.
-    counts: Counter[str] = Counter()
-    for item in items:
-        counts.update(set(item.benign_context))
-    merged.benign_context.extend(
-        sorted(note for note, count in counts.items() if count == len(items))
-    )
+    # A call, stream or credential several captures share is listed once; a
+    # "nothing seen" note holds only if it held for every capture, while an
+    # explanation of what a capture holds is kept from that capture.
+    from .rollup import merge_benign_claims, merge_records
+
+    for name in (
+        "calls", "registrations", "credentials", "rtp_streams", "media", "messages", "dtmf",
+        "provisioning", "artifacts", "analysis_notes", "threat_hypotheses", "anomalies",
+    ):
+        setattr(merged, name, merge_records([list(getattr(item, name) or []) for item in items]))
+    merged.benign_context[:] = merge_benign_claims([list(item.benign_context or []) for item in items])
 
     merged.calls.sort(
         key=lambda c: (c.first_seen if c.first_seen is not None else 0.0, c.call_id)
@@ -2579,7 +2583,7 @@ def merge_voip_summaries(summaries) -> VoipSummary:
         key=lambda s: (-s.packets, s.src_ip, s.src_port, s.dst_ip, s.dst_port, s.ssrc)
     )
     merged.dtmf.sort(key=lambda d: (d.protocol, d.source, d.destination, d.stream))
-    merged.errors[:] = sorted({e for e in merged.errors if e})
+    merged.errors[:] = list(dict.fromkeys(e for e in merged.errors if e))
     merged.analysis_notes[:] = sorted(set(merged.analysis_notes))
     if merged.first_seen is not None and merged.last_seen is not None:
         merged.duration_seconds = max(0.0, merged.last_seen - merged.first_seen)

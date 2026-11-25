@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import ipaddress
 import re
 from collections import Counter
@@ -42,6 +43,7 @@ from .port_heuristics import auto_decode
 from .port_overrides import is_standard as is_standard_port
 from .port_overrides import overrides as port_overrides_for
 from .utils import call_with_packet_view, fan_out
+from .rollup import merge_benign_claims, merge_undirected, record_digests, rollup_numeric_kind, union_count
 
 
 @dataclass(frozen=True)
@@ -51,6 +53,10 @@ class OverviewModuleResult:
     metrics: dict[str, object] = field(default_factory=dict)
     highlights: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # The records behind a count (detections, artifacts ...), as digests:
+    # -summarize counts a record several captures report once. Not exported.
+    digests: dict[str, Counter] = field(default_factory=dict, repr=False, compare=False,
+                                        metadata={"export": False})
 
 
 @dataclass(frozen=True)
@@ -88,6 +94,23 @@ class OverviewSummary:
     protocol_activity_total: int = 0
     service_activity_tail: list[dict[str, object]] = field(default_factory=list)
     service_activity_total: int = 0
+    # Every host and its scope (internal/public/...), not only the listed
+    # ones: what -summarize counts the union of captures' hosts from.
+    ip_scopes: dict[str, str] = field(default_factory=dict)
+    # Every protocol and service seen, likewise (the observed lists keep 20).
+    protocol_names: list[str] = field(default_factory=list)
+    service_names: list[str] = field(default_factory=list)
+    # Every conversation (and the cross-zone and cross-zone OT/IoT ones) as
+    # an 8-byte digest: -summarize counts the flows the captures have between
+    # them, where adding counts listed a flow once per capture. Not exported.
+    flow_digests: frozenset = field(default_factory=frozenset, repr=False, compare=False,
+                                    metadata={"export": False})
+    cross_zone_digests: frozenset = field(default_factory=frozenset, repr=False, compare=False,
+                                          metadata={"export": False})
+    ot_cross_zone_digests: frozenset = field(default_factory=frozenset, repr=False, compare=False,
+                                             metadata={"export": False})
+    # What the protocol and service tables count per row (see _activity_sets).
+    activity_sets: dict = field(default_factory=dict, repr=False, compare=False, metadata={"export": False})
 
 
 _OT_PROTOCOL_MATCHERS: list[tuple[str, str, tuple[str, ...]]] = [
@@ -425,35 +448,27 @@ def _iot_labels_from_ot_labels(labels: list[str]) -> list[str]:
     return output
 
 
+def _ranked_pairs(items) -> list[tuple[str, int]]:
+    """(name, count) pairs by count, ties by name: the same order for a
+    capture and for a -summarize merge."""
+    pairs = []
+    for name, raw in items:
+        try:
+            pairs.append((str(name), int(raw)))
+        except Exception:
+            continue
+    return sorted(pairs, key=lambda item: (-item[1], item[0]))
+
+
 def _top_services(services, limit: int = 10) -> list[tuple[str, int]]:
-    hierarchy = getattr(services, "hierarchy", {}) or {}
-    if isinstance(hierarchy, Counter):
-        return [(str(name), int(count)) for name, count in hierarchy.most_common(limit)]
-    if isinstance(hierarchy, dict):
-        items: list[tuple[str, int]] = []
-        for name, raw in hierarchy.items():
-            try:
-                items.append((str(name), int(raw)))
-            except Exception:
-                continue
-        items.sort(key=lambda item: item[1], reverse=True)
-        return items[:limit]
-    return []
+    return _all_services(services)[:limit]
 
 
 def _all_services(services) -> list[tuple[str, int]]:
+    """Every service by count, ties by name."""
     hierarchy = getattr(services, "hierarchy", {}) or {}
-    if isinstance(hierarchy, Counter):
-        return [(str(name), int(count)) for name, count in hierarchy.most_common()]
-    if isinstance(hierarchy, dict):
-        items: list[tuple[str, int]] = []
-        for name, raw in hierarchy.items():
-            try:
-                items.append((str(name), int(raw)))
-            except Exception:
-                continue
-        items.sort(key=lambda item: item[1], reverse=True)
-        return items
+    if isinstance(hierarchy, dict):  # a Counter included
+        return _ranked_pairs(hierarchy.items())
     return []
 
 
@@ -1145,18 +1160,126 @@ def _notable_flows(protocols, limit: int = 20) -> list[dict[str, object]]:
         return False
 
     notable = [row for row in rows if not _is_routine_baseline(row)]
-    notable.sort(
-        key=lambda item: (
-            0 if "external" in str(item.get("scope_pair", "")) else 1,
-            -int(item.get("bytes", 0) or 0),
-            -int(item.get("packets", 0) or 0),
-            -float(item.get("duration_seconds", 0.0) or 0.0),
-            str(item.get("src", "")),
-            str(item.get("dst", "")),
-            str(item.get("protocol", "")),
-        )
-    )
+    notable.sort(key=_notable_flow_rank)
     return notable[:limit]
+
+
+def _notable_flow_rank(item: dict) -> tuple:
+    """Cross-zone/external flows first, then by volume (the analyzer's
+    order, and a -summarize merge's)."""
+    return (
+        0 if "external" in str(item.get("scope_pair", "")) else 1,
+        -int(item.get("bytes", 0) or 0),
+        -int(item.get("packets", 0) or 0),
+        -float(item.get("duration_seconds", 0.0) or 0.0),
+        str(item.get("src", "")),
+        str(item.get("dst", "")),
+        str(item.get("protocol", "")),
+    )
+
+
+def flow_digest(src: object, dst: object, protocol: object) -> int:
+    """A conversation as the protocol analysis keys it -- its two endpoints
+    either way round, and its protocol -- in 8 stable bytes."""
+    ends = sorted((str(src or ""), str(dst or "")))
+    text = f"{ends[0]}|{ends[1]}|{protocol or ''}"
+    return int.from_bytes(hashlib.blake2b(text.encode("utf-8", "surrogatepass"), digest_size=8).digest(), "big")
+
+
+def _flow_digest_sets(protocols) -> tuple[frozenset, frozenset]:
+    """Digests of every conversation and of the cross-zone ones (counted
+    as :func:`_cross_zone_flow_count` counts them)."""
+    every: set[int] = set()
+    cross: set[int] = set()
+    for conv in list(getattr(protocols, "conversations", []) or []):
+        src = str(getattr(conv, "src", "") or "").strip()
+        dst = str(getattr(conv, "dst", "") or "").strip()
+        digest = flow_digest(src, dst, getattr(conv, "protocol", ""))
+        every.add(digest)
+        if src and dst and {_ip_scope(src), _ip_scope(dst)} == {"internal", "public"}:
+            cross.add(digest)
+    return frozenset(every), frozenset(cross)
+
+
+def _activity_sets(protocols, services) -> dict[str, dict[str, dict[str, frozenset]]]:
+    """What the protocol and service tables count in each row -- a protocol's
+    hosts and conversations (as digests), a service's assets, hosts and
+    clients -- so -summarize counts them over the captures together. Built as
+    _protocol_activity and _service_activity count them; not exported."""
+    by_protocol: dict[str, dict[str, set]] = {}
+    for conv in list(getattr(protocols, "conversations", []) or []):
+        name = str(getattr(conv, "protocol", "") or "Unknown").strip() or "Unknown"
+        sets = by_protocol.setdefault(name, {"hosts": set(), "flows": set()})
+        src = str(getattr(conv, "src", "") or "").strip()
+        dst = str(getattr(conv, "dst", "") or "").strip()
+        sets["hosts"].update(host for host in (src, dst) if host)
+        sets["flows"].add(flow_digest(src, dst, getattr(conv, "protocol", "")))
+    by_service: dict[str, dict[str, set]] = {}
+    for asset in list(getattr(services, "assets", []) or []):
+        service_name = str(getattr(asset, "service_name", "") or "").strip()
+        protocol = str(getattr(asset, "protocol", "") or "").upper().strip() or "TCP"
+        port = int(getattr(asset, "port", 0) or 0)
+        if not service_name:
+            service_name = f"{protocol}/{port}"
+        sets = by_service.setdefault(service_name, {"assets": set(), "hosts": set(), "clients": set()})
+        asset_ip = str(getattr(asset, "ip", "") or "").strip()
+        sets["assets"].add(f"{asset_ip}|{port}|{protocol}")
+        if asset_ip:
+            sets["hosts"].add(asset_ip)
+        sets["clients"].update(
+            str(client).strip() for client in (getattr(asset, "clients", set()) or set()) if str(client).strip()
+        )
+    by_ip: dict[str, dict[str, object]] = {}
+
+    def host(ip: str) -> dict[str, object]:
+        return by_ip.setdefault(ip, {"peers": set(), "flows": Counter(), "protocols": set(), "hosted": set(),
+                                     "used": set()})
+
+    for conv in list(getattr(protocols, "conversations", []) or []):
+        src = str(getattr(conv, "src", "") or "").strip()
+        dst = str(getattr(conv, "dst", "") or "").strip()
+        if not src or not dst:
+            continue
+        proto = str(getattr(conv, "protocol", "") or "Unknown").strip() or "Unknown"
+        digest = flow_digest(src, dst, getattr(conv, "protocol", ""))
+        for ip, peer in ((src, dst), (dst, src)):
+            sets = host(ip)
+            sets["peers"].add(peer)
+            # A multiset: a conversation of a host with itself counts twice,
+            # as _ip_activity counts it (once per side).
+            sets["flows"][digest] += 1
+            sets["protocols"].add(proto)
+    for asset in list(getattr(services, "assets", []) or []):
+        asset_ip = str(getattr(asset, "ip", "") or "").strip()
+        if not asset_ip:
+            continue
+        asset_port = int(getattr(asset, "port", 0) or 0)
+        asset_proto = str(getattr(asset, "protocol", "") or "").upper().strip() or "TCP"
+        service_name = str(getattr(asset, "service_name", "") or "").strip() or f"{asset_proto}/{asset_port}"
+        host(asset_ip)["hosted"].add(f"{service_name}:{asset_port}/{asset_proto}")
+        for client in set(getattr(asset, "clients", set()) or set()):
+            client_ip = str(client).strip()
+            if client_ip:
+                host(client_ip)["used"].add(service_name)
+
+    def frozen(values: object) -> object:
+        return frozenset(values) if isinstance(values, set) else values
+
+    return {
+        group: {name: {key: frozen(values) for key, values in sets.items()} for name, sets in rows.items()}
+        for group, rows in (("protocols", by_protocol), ("services", by_service), ("ips", by_ip))
+    }
+
+
+def _recount_activity(row: dict, sets: Optional[dict], columns: dict[str, str],
+                      floor: Optional[dict] = None) -> None:
+    """A merged table row's counts of distinct things from the captures' sets
+    (``columns`` maps a row column to its set), never below ``floor``."""
+    if not sets:
+        return
+    for column, key in columns.items():
+        if key in sets:
+            row[column] = max(len(sets[key]), int((floor or {}).get(column, 0) or 0))
 
 
 def _capture_window(protocols, services) -> tuple[float | None, float | None]:
@@ -1200,6 +1323,7 @@ def _cross_zone_ot_iot_flow_count(
     notable_flows: list[dict[str, object]],
     ot_markers: set[str],
     ot_ports: set[int],
+    counted: list | None = None,
 ) -> int:
     if not notable_flows:
         return 0
@@ -1219,12 +1343,13 @@ def _cross_zone_ot_iot_flow_count(
             if port <= 0:
                 continue
             ports.append(port)
-        if any(port in ot_ports for port in ports):
-            count += 1
-            continue
         protocol_blob = f" {str(flow.get('protocol', '') or '').lower()} "
-        if any(_token_match(protocol_blob, token) for token in ot_markers if token):
+        if any(port in ot_ports for port in ports) or any(
+            _token_match(protocol_blob, token) for token in ot_markers if token
+        ):
             count += 1
+            if counted is not None:
+                counted.append(flow)
     return count
 
 
@@ -1612,6 +1737,30 @@ def _summary_errors(summary: object) -> list[str]:
     return []
 
 
+_COUNTED_LISTS = (("detections", "detections"), ("artifacts", "artifacts"), ("anomalies", "anomalies"),
+                  ("findings", "findings"))
+
+
+def _metric_digests(metrics: dict[str, object], summary: object) -> dict[str, Counter]:
+    """Digests of the records each count of ``metrics`` counts, where the count
+    is the length of one of the summary's lists (and threats' critical/high)."""
+    out: dict[str, Counter] = {}
+    for metric, attr in _COUNTED_LISTS:
+        rows = getattr(summary, attr, None)
+        if isinstance(metrics.get(metric), int) and isinstance(rows, list) and len(rows) == metrics[metric]:
+            out[metric] = record_digests(rows)
+    scanner_ips = metrics.get("scanner_ips")
+    if isinstance(metrics.get("scanners"), int) and isinstance(scanner_ips, list) \
+            and len(scanner_ips) == metrics["scanners"]:
+        out["scanners"] = record_digests(scanner_ips)
+    if isinstance(metrics.get("high_severity"), int):
+        severe = [d for d in list(getattr(summary, "detections", []) or [])
+                  if isinstance(d, dict) and str(d.get("severity") or "info").lower() in ("critical", "high")]
+        if len(severe) == metrics["high_severity"]:
+            out["high_severity"] = record_digests(severe)
+    return out
+
+
 def _build_module_result(module: str, reason: str, summary: object) -> OverviewModuleResult:
     metrics: dict[str, object] = {}
     highlights: list[str] = []
@@ -1902,6 +2051,7 @@ def _build_module_result(module: str, reason: str, summary: object) -> OverviewM
         metrics=metrics,
         highlights=_dedupe_limited(highlights, 5),
         errors=_dedupe_limited(errors, 8),
+        digests=_metric_digests(metrics, summary),
     )
 
 
@@ -2235,10 +2385,12 @@ def analyze_overview(
         for step in detected_ot_steps
         for port in list(detected_meta.get(step, {}).get("decode_as_ports", []) or [])
     }
+    ot_cross_zone_flows: list[dict[str, object]] = []
     cross_zone_ot_iot_flows = _cross_zone_ot_iot_flow_count(
         notable_flows=notable_flows,
         ot_markers=ot_markers,
         ot_ports=ot_iot_ports,
+        counted=ot_cross_zone_flows,
     )
 
     # The deep dive is the authority on a family that a port or label hint
@@ -2402,19 +2554,33 @@ def analyze_overview(
             )
 
     module_error_count = sum(1 for item in module_results if item.errors)
-    unique_protocols = len({name for name, _count in observed_protocols})
-    unique_services = len({name for name, _count in observed_services})
+    protocol_names = sorted(
+        {str(item.get("protocol", "")) for item in protocol_rows_all if str(item.get("protocol", "")).strip()}
+        | {name for name, _count in observed_protocols}
+    )
+    service_names = sorted(
+        {str(item.get("service", "")) for item in service_rows_all if str(item.get("service", "")).strip()}
+        | {name for name, _count in observed_services}
+    )
+    unique_protocols = len(protocol_names)
+    unique_services = len(service_names)
     # Every host, not the 24 the report lists: "unique IPs" was capped at 24.
     scope_counts: Counter[str] = Counter(
         str(item.get("scope", "unknown")) for item in ip_rows_all if isinstance(item, dict)
     )
     flow_count = len(list(getattr(protocol_summary, "conversations", []) or []))
     cross_zone_flows = _cross_zone_flow_count(protocol_summary)
+    flow_digests, cross_zone_digests = _flow_digest_sets(protocol_summary)
     capture_span_seconds = (
         int(max(0.0, float(capture_end or 0.0) - float(capture_start or 0.0)))
         if capture_start is not None and capture_end is not None
         else int(max(0.0, float(getattr(base_summary, "duration_seconds", 0.0) or 0.0)))
     )
+    ip_scopes = {
+        str(item.get("ip")): str(item.get("scope", "unknown"))
+        for item in ip_rows_all
+        if isinstance(item, dict) and item.get("ip")
+    }
     summary_details = {
         "unique_ips": len(ip_rows_all),
         "unique_protocols": unique_protocols,
@@ -2444,6 +2610,15 @@ def analyze_overview(
         observed_protocols=observed_protocols[:20],
         observed_services=observed_services[:20],
         summary_details=summary_details,
+        ip_scopes=ip_scopes,
+        protocol_names=protocol_names,
+        service_names=service_names,
+        flow_digests=flow_digests,
+        cross_zone_digests=cross_zone_digests,
+        activity_sets=_activity_sets(protocol_summary, services_summary),
+        ot_cross_zone_digests=frozenset(
+            flow_digest(f.get("src"), f.get("dst"), f.get("protocol")) for f in ot_cross_zone_flows
+        ),
         ot_protocols=detected_ot_labels,
         modules_run=modules_run,
         module_results=module_results,
@@ -2505,6 +2680,10 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
     capture_end: float | None = None
 
     protocol_counter: Counter[str] = Counter()
+    top_protocol_counter: Counter[str] = Counter()
+    top_service_counter: Counter[str] = Counter()
+    protocol_name_set: set[str] = set()
+    service_name_set: set[str] = set()
     service_counter: Counter[str] = Counter()
     ip_aggregate: dict[str, dict[str, object]] = {}
 
@@ -2532,6 +2711,12 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
             protocol_counter[str(name)] += int(count)
         for name, count in service_source:
             service_counter[str(name)] += int(count)
+        for name, count in summary.top_protocols or []:
+            top_protocol_counter[str(name)] += int(count)
+        for name, count in summary.top_services or []:
+            top_service_counter[str(name)] += int(count)
+        protocol_name_set.update(getattr(summary, "protocol_names", None) or [n for n, _c in protocol_source])
+        service_name_set.update(getattr(summary, "service_names", None) or [n for n, _c in service_source])
 
         ip_rows = list(summary.ip_activity or summary.observed_ips) + list(getattr(summary, "ip_activity_tail", None) or [])
         for row in ip_rows:
@@ -2604,6 +2789,17 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
                 except Exception:
                     continue
 
+            for key in ("hostname", "os"):
+                if row.get(key) and not bucket.get(key):
+                    bucket[key] = str(row[key])
+            roles = bucket.setdefault("browser_roles", [])
+            for role_name in row.get("browser_roles") or []:
+                if role_name not in roles:
+                    roles.append(role_name)
+            if row.get("is_dc"):
+                bucket["is_dc"] = True
+            if row.get("active_seconds") is not None:
+                bucket["active_seconds"] = float(bucket.get("active_seconds") or 0.0) + float(row.get("active_seconds") or 0.0)
             bucket["service_count"] = int(bucket.get("service_count", 0) or 0) + int(
                 row.get("service_count", 0) or 0
             )
@@ -2627,10 +2823,10 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
             )
             protocol_counter_bucket = bucket.get("protocol_counter")
             if isinstance(protocol_counter_bucket, Counter):
-                for proto in protocol_values[:8]:
+                for rank, proto in enumerate(protocol_values[:8]):
                     text = str(proto).strip()
                     if text:
-                        protocol_counter_bucket[text] += 1
+                        protocol_counter_bucket[text] += 8 - rank
 
             peer_values = list(row.get("top_peers", []) or [])
             peer_counter_bucket = bucket.get("peer_counter")
@@ -2651,25 +2847,25 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
 
             port_counter_bucket = bucket.get("port_counter")
             if isinstance(port_counter_bucket, Counter):
-                for port_value in list(row.get("top_ports", []) or [])[:10]:
+                for rank, port_value in enumerate(list(row.get("top_ports", []) or [])[:10]):
                     try:
-                        port_counter_bucket[int(port_value)] += 1
+                        port_counter_bucket[int(port_value)] += 10 - rank
                     except Exception:
                         continue
 
             hosted_counter_bucket = bucket.get("services_hosted_counter")
             if isinstance(hosted_counter_bucket, Counter):
-                for svc in list(row.get("services_hosted", []) or [])[:8]:
+                for rank, svc in enumerate(list(row.get("services_hosted", []) or [])[:8]):
                     text = str(svc).strip()
                     if text:
-                        hosted_counter_bucket[text] += 1
+                        hosted_counter_bucket[text] += 8 - rank
 
             used_counter_bucket = bucket.get("services_used_counter")
             if isinstance(used_counter_bucket, Counter):
-                for svc in list(row.get("services_used", []) or [])[:8]:
+                for rank, svc in enumerate(list(row.get("services_used", []) or [])[:8]):
                     text = str(svc).strip()
                     if text:
-                        used_counter_bucket[text] += 1
+                        used_counter_bucket[text] += 8 - rank
 
     modules_run: list[str] = []
     seen_modules: set[str] = set()
@@ -2701,14 +2897,23 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
                     if isinstance(existing, (int, float)) and not isinstance(
                         existing, bool
                     ):
-                        metrics[key] = existing + value
+                        # Counts add up; a score or rate does not (two
+                        # captures at OT risk 85 and 60 are not "145/100").
+                        kind = rollup_numeric_kind(key)
+                        metrics[key] = (
+                            max(existing, value) if kind == "max"
+                            else min(existing, value) if kind == "min"
+                            else existing + value
+                        )
                     elif existing is None:
                         metrics[key] = value
+                elif isinstance(value, list) and isinstance(existing, list):
+                    # Lists (scanner IPs) are every capture's, each item once.
+                    metrics[key] = existing + [item for item in value if item not in existing]
                 elif existing is None:
                     metrics[key] = value
-            bucket_highlights = bucket.get("highlights")
-            if isinstance(bucket_highlights, list):
-                bucket_highlights.extend(result.highlights)
+            bucket.setdefault("highlight_lists", []).append(list(result.highlights or []))
+            bucket.setdefault("digest_maps", []).append(dict(getattr(result, "digests", None) or {}))
             bucket_errors = bucket.get("errors")
             if isinstance(bucket_errors, list):
                 bucket_errors.extend(result.errors)
@@ -2720,19 +2925,42 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
             continue
         metrics = dict(bucket.get("metrics") or {})
         metrics.setdefault("pcaps", int(bucket.get("pcaps", 0) or 0))
+        # A count of records (detections, artifacts ...) counts a record
+        # several captures report once, where every capture kept its digests.
+        digest_maps = list(bucket.get("digest_maps") or [])
+        merged_digests: dict[str, Counter] = {}
+        for metric in {name for digests in digest_maps for name in digests}:
+            if digest_maps and all(metric in digests for digests in digest_maps):
+                metrics[metric], merged_digests[metric] = union_count(digests[metric] for digests in digest_maps)
         module_results.append(
             OverviewModuleResult(
                 module=module,
                 reason=str(bucket.get("reason") or ""),
                 metrics=metrics,
                 highlights=_dedupe_limited(
-                    [str(item) for item in list(bucket.get("highlights") or [])], 6
+                    [str(item) for item in merge_benign_claims(list(bucket.get("highlight_lists") or []))], 6
                 ),
                 errors=_dedupe_limited(
                     [str(item) for item in list(bucket.get("errors") or [])], 10
                 ),
+                digests=merged_digests,
             )
         )
+
+    # The flows, hosts, assets and clients each table row counts, over the
+    # captures together (adding the rows' counts counted one once per capture).
+    activity_union: dict[str, dict[str, dict[str, object]]] = {"protocols": {}, "services": {}, "ips": {}}
+    have_activity = all(
+        getattr(summary, "activity_sets", None)
+        for summary in summaries
+        if summary.protocol_activity or summary.service_activity or summary.ip_activity
+    )
+    for summary in summaries:
+        for group in ("protocols", "services", "ips"):
+            for name, sets in ((getattr(summary, "activity_sets", None) or {}).get(group) or {}).items():
+                target = activity_union[group].setdefault(name, {})
+                for key, values in sets.items():
+                    target[key] = values if key not in target else target[key] | values
 
     merged_ip_activity: list[dict[str, object]] = []
     merged_observed_ips: list[dict[str, object]] = []
@@ -2785,6 +3013,25 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
             "service_count": int(bucket.get("service_count", 0) or 0),
             "used_service_count": int(bucket.get("used_service_count", 0) or 0),
         }
+        for key in ("hostname", "os", "active_seconds"):
+            if bucket.get(key) is not None:
+                row[key] = bucket[key]
+        if bucket.get("browser_roles"):
+            row["browser_roles"] = list(bucket["browser_roles"])
+        if bucket.get("is_dc"):
+            row["is_dc"] = True
+        host_sets = activity_union["ips"].get(row["ip"]) if have_activity else None
+        if host_sets:
+            # A host's peers, conversations, protocols and services counted over
+            # the captures together (the rows' counts added them up).
+            peers = host_sets.get("peers") or frozenset()
+            row["peer_count"] = len(peers)
+            row["public_peer_count"] = sum(1 for peer in peers if _ip_scope(peer) == "public")
+            row["internal_peer_count"] = sum(1 for peer in peers if _ip_scope(peer) == "internal")
+            row["conversation_count"] = sum((host_sets.get("flows") or Counter()).values())
+            row["protocol_count"] = len(host_sets.get("protocols") or ())
+            row["service_count"] = len(host_sets.get("hosted") or ())
+            row["used_service_count"] = len(host_sets.get("used") or ())
         merged_ip_activity.append(row)
         merged_observed_ips.append(row)
 
@@ -2855,11 +3102,21 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
                 bucket["last_seen"] = last_seen
             port_counter = bucket.get("port_counter")
             if isinstance(port_counter, Counter):
-                for port in list(row.get("top_ports", []) or [])[:8]:
+                # Rank-weighted: a capture's busiest port outweighs its last.
+                for rank, port in enumerate(list(row.get("top_ports", []) or [])[:8]):
                     try:
-                        port_counter[int(port)] += 1
+                        port_counter[int(port)] += 8 - rank
                     except Exception:
                         continue
+
+    if have_activity:
+        for counter, source in ((service_counter, "observed_services"), (top_service_counter, "top_services")):
+            for name in list(counter):
+                assets = (activity_union["services"].get(name) or {}).get("assets")
+                if assets is not None:
+                    floor = max((int(c) for summary in summaries for n, c in (getattr(summary, source) or [])
+                                 if str(n) == name), default=0)
+                    counter[name] = max(len(assets), floor)
 
     merged_protocol_activity: list[dict[str, object]] = []
     for bucket in protocol_activity_bucket.values():
@@ -2871,7 +3128,7 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
                     top_ports.append(int(port_value))
                 except Exception:
                     continue
-        merged_protocol_activity.append(
+        protocol_row = (
             {
                 "protocol": str(bucket.get("protocol", "")),
                 "packets": int(bucket.get("packets", 0) or 0),
@@ -2883,10 +3140,17 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
                 "top_ports": top_ports,
             }
         )
-    merged_protocol_activity.sort(
+        _recount_activity(
+            protocol_row,
+            activity_union["protocols"].get(str(protocol_row["protocol"])) if have_activity else None,
+            {"flow_count": "flows", "host_count": "hosts"},
+        )
+        merged_protocol_activity.append(protocol_row)
+    merged_protocol_activity.sort(  # as the analyzer ranks them
         key=lambda item: (
             -int(item.get("packets", 0) or 0),
             -int(item.get("bytes", 0) or 0),
+            -int(item.get("flow_count", 0) or 0),
             str(item.get("protocol", "")),
         )
     )
@@ -2923,6 +3187,7 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
             bucket["asset_count"] = int(bucket.get("asset_count", 0) or 0) + int(
                 row.get("asset_count", 0) or 0
             )
+            bucket["asset_floor"] = max(int(bucket.get("asset_floor", 0) or 0), int(row.get("asset_count", 0) or 0))
             bucket["packets"] = int(bucket.get("packets", 0) or 0) + int(
                 row.get("packets", 0) or 0
             )
@@ -2947,9 +3212,10 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
                 bucket["last_seen"] = last_seen
             port_counter = bucket.get("port_counter")
             if isinstance(port_counter, Counter):
-                for port in list(row.get("top_ports", []) or [])[:8]:
+                # Rank-weighted: a capture's busiest port outweighs its last.
+                for rank, port in enumerate(list(row.get("top_ports", []) or [])[:8]):
                     try:
-                        port_counter[int(port)] += 1
+                        port_counter[int(port)] += 8 - rank
                     except Exception:
                         continue
             host_counter = bucket.get("host_counter")
@@ -2979,7 +3245,7 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
                 except Exception:
                     continue
         top_hosts = _bucket_top_list(bucket.get("host_counter"), limit=3, with_counts=True)
-        merged_service_activity.append(
+        service_row = (
             {
                 "service": str(bucket.get("service", "")),
                 "asset_count": int(bucket.get("asset_count", 0) or 0),
@@ -2993,6 +3259,13 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
                 "top_hosts": top_hosts,
             }
         )
+        _recount_activity(
+            service_row,
+            activity_union["services"].get(str(service_row["service"])) if have_activity else None,
+            {"asset_count": "assets", "host_count": "hosts", "client_count": "clients"},
+            floor={"asset_count": int(bucket.get("asset_floor", 0) or 0)},
+        )
+        merged_service_activity.append(service_row)
     merged_service_activity.sort(
         key=lambda item: (
             -int(item.get("packets", 0) or 0),
@@ -3002,17 +3275,13 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
         )
     )
 
-    merged_notable_flows: list[dict[str, object]] = []
-    for summary in summaries:
-        merged_notable_flows.extend(list(summary.notable_flows or []))
-    merged_notable_flows.sort(
-        key=lambda item: (
-            -int(item.get("bytes", 0) or 0) if isinstance(item, dict) else 0,
-            -int(item.get("packets", 0) or 0) if isinstance(item, dict) else 0,
-            str(item.get("src", "")) if isinstance(item, dict) else "",
-            str(item.get("dst", "")) if isinstance(item, dict) else "",
-        )
-    )
+    # A conversation several captures share is one row (either direction),
+    # its traffic added and its window widened; ranked as the analyzer ranks.
+    merged_notable_flows: list[dict[str, object]] = [
+        flow for flow in merge_undirected([list(summary.notable_flows or []) for summary in summaries])
+        if isinstance(flow, dict)
+    ]
+    merged_notable_flows.sort(key=_notable_flow_rank)
 
     merged_ot_protocols: list[str] = []
     seen_ot: set[str] = set()
@@ -3077,13 +3346,22 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
             limit=14,
         )
 
-    flow_count = sum(
+    # Flows the captures have between them, from their digests (adding the
+    # counts listed a flow once per capture); the sum without digests.
+    has_digests = all(
+        summary.flow_digests or not int(summary.summary_details.get("flow_count", 0) or 0)
+        for summary in summaries
+    )
+    merged_flow_digests = frozenset().union(*(summary.flow_digests for summary in summaries))
+    merged_cross_digests = frozenset().union(*(summary.cross_zone_digests for summary in summaries))
+    merged_ot_cross_digests = frozenset().union(*(summary.ot_cross_zone_digests for summary in summaries))
+    flow_count = len(merged_flow_digests) if has_digests else sum(
         int(summary.summary_details.get("flow_count", 0) or 0) for summary in summaries
     )
     if flow_count <= 0:
         flow_count = len(merged_notable_flows)
 
-    cross_zone_flows = sum(
+    cross_zone_flows = len(merged_cross_digests) if has_digests else sum(
         int(summary.summary_details.get("cross_zone_flows", 0) or 0)
         for summary in summaries
     )
@@ -3096,11 +3374,19 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
             in {"internal->public", "public->internal"}
         )
 
-    scope_counts: Counter[str] = Counter(
-        str(item.get("scope", "unknown"))
-        for item in merged_ip_activity
-        if isinstance(item, dict)
-    )
+    # Hosts are the union of every capture's (ip_scopes), not of the rows
+    # each capture lists: counting those made 113 hosts 34.
+    merged_scopes: dict[str, str] = {}
+    for summary in summaries:
+        rows = getattr(summary, "ip_scopes", None) or {
+            str(item.get("ip")): str(item.get("scope", "unknown"))
+            for item in list(summary.ip_activity or summary.observed_ips)
+            + list(getattr(summary, "ip_activity_tail", None) or [])
+            if isinstance(item, dict) and item.get("ip")
+        }
+        for ip_text, scope in rows.items():
+            merged_scopes.setdefault(ip_text, scope)
+    scope_counts: Counter[str] = Counter(merged_scopes.values())
     module_error_count = sum(1 for item in module_results if item.errors)
     capture_span_seconds = (
         int(max(0.0, float(capture_end or 0.0) - float(capture_start or 0.0)))
@@ -3108,14 +3394,14 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
         else int(max(0.0, duration_seconds))
     )
     summary_details = {
-        "unique_ips": len(merged_ip_activity),
-        "unique_protocols": len(protocol_counter),
-        "unique_services": len(service_counter),
+        "unique_ips": len(merged_scopes) or len(merged_ip_activity),
+        "unique_protocols": len(protocol_name_set) or len(protocol_counter),
+        "unique_services": len(service_name_set) or len(service_counter),
         "internal_ips": int(scope_counts.get("internal", 0)),
         "public_ips": int(scope_counts.get("public", 0)),
         "flow_count": flow_count,
         "cross_zone_flows": cross_zone_flows,
-        "cross_zone_ot_iot_flows": sum(
+        "cross_zone_ot_iot_flows": len(merged_ot_cross_digests) if has_digests else sum(
             int(summary.summary_details.get("cross_zone_ot_iot_flows", 0) or 0)
             for summary in summaries
         ),
@@ -3142,12 +3428,22 @@ def merge_overview_summaries(summaries: list[OverviewSummary]) -> OverviewSummar
         path=Path("ALL_PCAPS"),
         total_packets=total_packets,
         duration_seconds=duration_seconds,
-        top_protocols=protocol_counter.most_common(12),
-        top_services=service_counter.most_common(12),
+        # As the analyzer: the protocol analysis's top 10 layers, the top 12
+        # services, 20 observed of each -- by count, ties by name. A service's
+        # count is its assets: counted over the captures together.
+        top_protocols=_ranked_pairs(top_protocol_counter.items())[:10],
+        top_services=_ranked_pairs(top_service_counter.items())[:12],
         observed_ips=merged_observed_ips[:20],
-        observed_protocols=protocol_counter.most_common(20),
-        observed_services=service_counter.most_common(20),
+        observed_protocols=_ranked_pairs(protocol_counter.items())[:20],
+        observed_services=_ranked_pairs(service_counter.items())[:20],
         summary_details=summary_details,
+        ip_scopes=merged_scopes,
+        protocol_names=sorted(protocol_name_set),
+        service_names=sorted(service_name_set),
+        flow_digests=merged_flow_digests,
+        cross_zone_digests=merged_cross_digests,
+        activity_sets=activity_union,
+        ot_cross_zone_digests=merged_ot_cross_digests,
         ot_protocols=merged_ot_protocols,
         modules_run=modules_run,
         module_results=module_results,

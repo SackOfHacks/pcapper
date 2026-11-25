@@ -303,7 +303,7 @@ _METRIC_LABELS = {  # most telling first: the Result column is cut at its width
     "findings": "findings", "candidates": "candidates", "hits": "hits", "decoded_hits": "decoded", "artifacts": "artifacts",
     "executable_artifacts": "executable", "scanners": "scanners", "high_risk_ops": "high-risk operations",
     "write_ops": "writes", "control_ops": "control operations", "total_changes": "value changes", "commands": "commands",
-    "requests": "requests", "responses": "responses", "pcaps": "captures",
+    "requests": "requests", "responses": "responses",
 }
 
 
@@ -363,7 +363,12 @@ def render_overview_summary(summary: OverviewSummary, verbose: bool = False) -> 
     modules = {r.module: r for r in summary.module_results or []}
     severity, verdict, reasons = _posture(summary)
     ot_families = list(summary.ot_protocols or [])
-    span = int(detail.get("capture_span_seconds", 0) or 0) or summary.duration_seconds
+    # The capture window to the tenth of a second, as the other reports give
+    # it (capture_span_seconds is whole seconds: 1m 17.0s beside 1m 17.2s).
+    if summary.capture_start is not None and summary.capture_end is not None:
+        span = max(0.0, float(summary.capture_end) - float(summary.capture_start))
+    else:
+        span = int(detail.get("capture_span_seconds", 0) or 0) or summary.duration_seconds
     rep.headline(severity, verdict, st.join([
         f"{'OT/ICS' if ot_families else 'IT/enterprise'} capture",
         f"{st.count(summary.total_packets)} packets",
@@ -526,7 +531,7 @@ def render_overview_summary(summary: OverviewSummary, verbose: bool = False) -> 
     top_talker = ip_rows[0] if ip_rows and isinstance(ip_rows[0], dict) else None
     iot = [label_text for label_text in ot_families if any(t in str(label_text).lower() for t in ("mqtt", "coap"))]
     rep.section("Capture", st.kv([
-        ("Path", str(summary.path)),
+        st.path_field(summary),
         ("Window", f"{format_ts(summary.capture_start)} / {format_ts(summary.capture_end)}" if summary.capture_start else ""),
         ("Duration", format_duration(summary.duration_seconds)),
         ("Top protocols", st.top(dict(summary.top_protocols or []), None)),

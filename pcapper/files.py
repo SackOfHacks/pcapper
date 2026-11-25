@@ -200,7 +200,7 @@ def merge_files_summaries(summaries: List[FileTransferSummary]) -> FileTransferS
         extracted=[],
         views=[],
         detections=merged_detections,
-        errors=sorted(set(errors)),
+        errors=list(dict.fromkeys(e for e in errors if e)),
         hashes=hashes,
         deterministic_checks={
             k: list(dict.fromkeys(v)) for k, v in deterministic_checks.items()

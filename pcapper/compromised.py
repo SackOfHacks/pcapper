@@ -92,6 +92,10 @@ class CompromiseSummary:
     deterministic_checks: dict[str, list[str]] = field(default_factory=dict)
     benign_context: list[str] = field(default_factory=list)
     errors: list[str] = field(default_factory=list)
+    # The hosts assessed, so -summarize counts them once across captures
+    # (not exported).
+    assessed_hosts: frozenset = field(default_factory=frozenset, repr=False, compare=False,
+                                      metadata={"export": False})
 
 
 def _pick_hostname(ip_value: str, candidates: list[str]) -> str:
@@ -908,7 +912,9 @@ def analyze_compromised(
         )
         evidence = asset_evidence + state.get("details", []) + state.get("evidence", [])
         evidence = [str(item) for item in evidence if str(item).strip()]
-        evidence = evidence[:6]
+        # The same line often comes from two sources; listed twice it also
+        # took two of the six places.
+        evidence = list(dict.fromkeys(evidence))[:6]
 
         iocs = set(state.get("iocs", set()))
         iocs = {ioc for ioc in iocs if not (ioc == ip_value)}
@@ -1105,6 +1111,7 @@ def analyze_compromised(
     return CompromiseSummary(
         path=path,
         total_hosts=len(hosts_summary.hosts),
+        assessed_hosts=frozenset(str(getattr(h, "ip", h)) for h in hosts_summary.hosts),
         compromised_hosts=compromised_hosts,
         detections=detections,
         incidents=incidents,
@@ -1114,6 +1121,57 @@ def analyze_compromised(
         benign_context=benign_context[:20],
         errors=sorted({err for err in errors if err}),
     )
+
+
+_PRIORITY_SEVERITY = {"critical": 4, "high": 3, "medium": 2, "low": 1, "info": 0}
+
+
+def _merge_host_priority(lists: list[list[dict[str, object]]]) -> list[dict[str, object]]:
+    """Priority rows of several captures, one per host: its highest score and
+    severity, earliest detection, and every stage and IOC count seen."""
+    merged: dict[str, dict[str, object]] = {}
+    for rows in lists:
+        for row in rows:
+            key = str(row.get("ip") or row.get("host") or "")
+            current = merged.get(key)
+            if current is None:
+                merged[key] = dict(row)
+                continue
+            if str(current.get("host") or "-") in ("", "-") and row.get("host"):
+                current["host"] = row["host"]
+            current["score"] = max(int(current.get("score", 0) or 0), int(row.get("score", 0) or 0))
+            if _PRIORITY_SEVERITY.get(str(row.get("severity", "")).lower(), -1) > _PRIORITY_SEVERITY.get(
+                str(current.get("severity", "")).lower(), -1
+            ):
+                current["severity"] = row.get("severity")
+            times = [t for t in (current.get("detection_time"), row.get("detection_time")) if t is not None]
+            current["detection_time"] = min(times) if times else None
+            stages = list(current.get("stages") or [])
+            stages += [s for s in (row.get("stages") or []) if s not in stages]
+            current["stages"] = stages
+            current["stage_count"] = len(stages)
+            current["ioc_count"] = max(int(current.get("ioc_count", 0) or 0), int(row.get("ioc_count", 0) or 0))
+    return list(merged.values())
+
+
+def _merge_campaigns(lists: list[list[dict[str, object]]]) -> list[dict[str, object]]:
+    """Campaigns of several captures, one per shared indicator (campaign ids
+    are numbered per capture): the hosts of every capture that shared it."""
+    merged: dict[str, dict[str, object]] = {}
+    for rows in lists:
+        for row in rows:
+            key = str(row.get("ioc") or row.get("campaign_id") or "")
+            current = merged.get(key)
+            if current is None:
+                merged[key] = dict(row, hosts=list(row.get("hosts") or []))
+                continue
+            hosts = list(current.get("hosts") or [])
+            hosts += [h for h in (row.get("hosts") or []) if h not in hosts]
+            current["hosts"] = hosts
+            current["host_count"] = len(hosts)
+    for index, row in enumerate(merged.values(), 1):
+        row["campaign_id"] = f"CMP-{index:03d}"
+    return list(merged.values())
 
 
 def merge_compromised_summaries(
@@ -1136,11 +1194,6 @@ def merge_compromised_summaries(
     for summary in summary_list:
         total_hosts += int(getattr(summary, "total_hosts", 0) or 0)
         errors.update(getattr(summary, "errors", []) or [])
-        detections.extend(getattr(summary, "detections", []) or [])
-        incidents.extend(getattr(summary, "incidents", []) or [])
-        campaigns.extend(getattr(summary, "campaigns", []) or [])
-        host_priority.extend(getattr(summary, "host_priority", []) or [])
-        benign_context.extend(getattr(summary, "benign_context", []) or [])
         for key, values in (getattr(summary, "deterministic_checks", {}) or {}).items():
             for value in values or []:
                 deterministic_checks[str(key)].append(str(value))
@@ -1152,8 +1205,9 @@ def merge_compromised_summaries(
                     "ip": host.ip,
                     "detection_time": host.detection_time,
                     "explanation": [host.explanation],
-                    "evidence": set(host.evidence),
-                    "iocs": set(host.iocs),
+                    # Ordered: the analyzer lists the strongest evidence first.
+                    "evidence": list(dict.fromkeys(host.evidence)),
+                    "iocs": list(dict.fromkeys(host.iocs)),
                     "severity": host.severity,
                     "score": host.score,
                     "roles": list(host.roles),
@@ -1166,8 +1220,8 @@ def merge_compromised_summaries(
                 current = entry.get("detection_time")
                 if current is None or host.detection_time < current:
                     entry["detection_time"] = host.detection_time
-            entry["evidence"].update(host.evidence)
-            entry["iocs"].update(host.iocs)
+            entry["evidence"] = list(dict.fromkeys([*entry["evidence"], *host.evidence]))
+            entry["iocs"] = list(dict.fromkeys([*entry["iocs"], *host.iocs]))
             if host.explanation not in entry["explanation"]:
                 entry["explanation"].append(host.explanation)
             if SEVERITY_WEIGHT.get(host.severity, 0) > SEVERITY_WEIGHT.get(
@@ -1180,6 +1234,20 @@ def merge_compromised_summaries(
                     entry["roles"].append(role)
             entry["is_infra"] = bool(entry.get("is_infra")) or bool(host.is_infra)
 
+    # A row several captures share is listed once, its counts added; a claim
+    # of absence stands only when every capture makes it.
+    from .rollup import merge_benign_claims, merge_records
+
+    detections = merge_records([list(getattr(s, "detections", []) or []) for s in summary_list])
+    incidents = merge_records([list(getattr(s, "incidents", []) or []) for s in summary_list])
+    campaigns = _merge_campaigns([list(getattr(s, "campaigns", []) or []) for s in summary_list])
+    host_priority = _merge_host_priority([list(getattr(s, "host_priority", []) or []) for s in summary_list])
+    benign_context = merge_benign_claims([list(getattr(s, "benign_context", []) or []) for s in summary_list])
+    # Hosts assessed: the captures' hosts between them (adding the counts
+    # counted a host once per capture); the sum when a summary has no list.
+    if all(getattr(s, "assessed_hosts", None) or not s.total_hosts for s in summary_list):
+        total_hosts = len(frozenset().union(*(getattr(s, "assessed_hosts", frozenset()) for s in summary_list)))
+
     merged_list: list[CompromisedHost] = []
     for ip_value, entry in merged_hosts.items():
         merged_list.append(
@@ -1189,8 +1257,8 @@ def merge_compromised_summaries(
                 detection_time=entry.get("detection_time"),
                 explanation="; ".join(entry.get("explanation", [])[:2])
                 or "Evidence of compromise",
-                evidence=sorted(entry.get("evidence", set()))[:6],
-                iocs=sorted(entry.get("iocs", set()))[:10],
+                evidence=list(entry.get("evidence", [])),
+                iocs=list(entry.get("iocs", [])),
                 severity=str(entry.get("severity", "info")),
                 score=int(entry.get("score", 0) or 0),
                 roles=list(entry.get("roles", []) or []),
@@ -1208,7 +1276,7 @@ def merge_compromised_summaries(
     )
 
     host_priority.sort(key=_host_priority_key)
-    incidents.sort(key=_incident_key)
+    incidents = sorted(incidents, key=_incident_key)
     dedup_checks: dict[str, list[str]] = {}
     for key, values in deterministic_checks.items():
         seen: set[str] = set()
@@ -1225,6 +1293,7 @@ def merge_compromised_summaries(
     return CompromiseSummary(
         path=Path(f"ALL_PCAPS_{len(summary_list)}"),
         total_hosts=total_hosts,
+        assessed_hosts=frozenset().union(*(getattr(s, "assessed_hosts", frozenset()) for s in summary_list)),
         compromised_hosts=merged_list,
         detections=detections,
         incidents=incidents,

@@ -10,8 +10,18 @@ Split out of the README, which had reached 28 KB. Content is verbatim.
 
 Use `-summarize` (single dash) to aggregate selected analyses across all resolved target pcaps.
 
-- Summarize renders merged rollup output only (no per‑pcap sections).
+- Summarize renders merged rollup output only (no per‑pcap sections), one report per analysis, in the order the analyses were asked for, titled `all captures (N)`.
 - Recursive directory traversal is enabled only with `-r/--recursive`.
+- **The order the captures are named in does not matter:** they are merged in chronological order of their first packet (by name when that is unknown), so lists read in time order and `-summarize a.pcap b.pcap` and `-summarize b.pcap a.pcap` print the same report.
+- **A rollup says what the captures say together.** Counts are summed; first/last-seen times take the earliest and latest; sets and host lists are unions; histograms are merged per bucket; verdicts are recomputed from the merged data where the analysis allows it, and otherwise take the most severe capture's.
+- **What the captures share is listed once.** A conversation, host, service, lease, technique hit or finding that several captures hold is one row, with its packets and bytes added and its first/last widened -- a conversation whichever way round another capture first saw it. An event at the same moment in two captures (overlapping captures, or one file given twice) is one event.
+- **Counts of distinct things count them once:** hosts, flows, unique strings, a service's clients, detections and findings are counted over the captures together, not added up per capture. `-summarize a.pcap a-copy.pcap` lists every row once with its counts doubled and leaves every distinct count as it was.
+- **A duration is the span** from the captures' first packet to their last (consecutive ring-buffer files: their total time); rates are taken over it.
+- **A capture without the traffic changes nothing.** A quiet capture's "No DNS traffic detected", its claims of absence ("no SYN scan observed") and its empty statistics are left out of the merge: a claim of absence stands only when every capture makes it. Benign explanations of what a capture did hold are kept.
+- **Percentiles across captures are estimates**, shown with `≈` (`p50 ≈64`): min and max are exact; averages and percentiles are weighted by each capture's samples.
+- Free-text finding details are never added up: identical details merge, differing ones are listed as variants.
+- `pcapmeta` stays per capture (file metadata describes each file); `--json`/`--csv`/`--sqlite` export the merged summaries, Modbus and DNP3 included.
+- Rows that come from one capture (CTF candidates, DNS queries, obfuscation sessions, malware downloads) name it; rows located by a packet number keep their capture, since the number means nothing in another file.
 
 ## DNS Queries
 

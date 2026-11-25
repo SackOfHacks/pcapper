@@ -78,6 +78,7 @@ def _mitre_kill_chain_rows(summary: MitreSummary) -> list[dict[str, object]]:
             },
         )
         row["count"] = int(row["count"]) + 1
+        row.setdefault("tactic_ids", set()).add(str(hit.tactic_id))
         row["techniques"][f"{hit.technique} ({hit.technique_id})"] += 1
         for host in hit.host_refs:
             if isinstance(row["hosts"], set):
@@ -85,6 +86,10 @@ def _mitre_kill_chain_rows(summary: MitreSummary) -> list[dict[str, object]]:
         rank = {"high": 3, "medium": 2}.get(str(hit.confidence), 1)
         row["confidence_rank"] = max(int(row["confidence_rank"]), rank)
     rows = list(by_tactic.values())
+    for row in rows:
+        # A tactic named in both matrices (Discovery: TA0007 Enterprise,
+        # TA0102 ICS) carries both ids, not whichever hit came first.
+        row["tactic_id"] = ", ".join(sorted(i for i in row.pop("tactic_ids", set()) if i)) or row["tactic_id"]
     rows.sort(key=lambda r: _MITRE_KILLCHAIN_ORDER.get(str(r["tactic"]), 99))
     return rows
 

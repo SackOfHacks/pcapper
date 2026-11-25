@@ -1310,6 +1310,9 @@ def analyze_exfil(
                 "details": "No strong exfiltration signal from current heuristics.",
                 "evidence": exfil_signal_reasons[:10],
                 "confidence_score": exfil_signal_score,
+                # An absence claim: -summarize keeps it only when every capture
+                # makes it, never beside another capture's positive verdict.
+                "absence": True,
             },
         )
 

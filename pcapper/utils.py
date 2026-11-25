@@ -1398,7 +1398,7 @@ def to_serializable(value: Any, *, redact: bool = False) -> Any:
     if is_dataclass(value) and not isinstance(value, type) and redact:
         try:
             return to_serializable(
-                {f.name: getattr(value, f.name) for f in fields(value)}, redact=True
+                {f.name: getattr(value, f.name) for f in fields(value) if f.metadata.get("export", True)}, redact=True
             )
         except Exception:
             pass
@@ -1410,6 +1410,9 @@ def to_serializable(value: Any, *, redact: bool = False) -> Any:
             return {
                 f.name: to_serializable(getattr(value, f.name), redact=redact)
                 for f in fields(value)
+                # Merge-only data (digests -summarize counts distinct items
+                # from) is not part of a report.
+                if f.metadata.get("export", True)
             }
         except Exception:
             pass
@@ -1853,37 +1856,20 @@ def x509_names(cert: object) -> tuple[str, str]:
     return names[0], names[1]
 
 
-# A standalone integer count. Digit runs that are part of a larger token —
-# IP octets, decimals, percentages, ratios, ports in host:port, hex, units —
-# are identifiers or ratios, and summing them across captures is meaningless
-# (it turned "10.0.0.1 ... 60.0%" x3 into "30.0.0.3 ... 180.0%").
-_SUMMABLE_COUNT_RE = re.compile(r"(?<![\w.:/%-])\d+(?![\w:%/]|\.\d)")
-
-
 def collapse_detection_details(details: list[str]) -> str:
     """Merge one detection's detail text from several capture results.
 
-    When the texts differ only in standalone integer counts, the counts are
-    summed. Every other number (IPs, percentages, decimals, ports) must match
-    exactly for that to happen; otherwise the distinct variants are listed.
+    Identical texts are one. Different texts are listed as variants, never
+    added up: a number in free text may be a count, but also a port, an
+    extension, an account or a percentage, and summing every digit run once
+    turned three captures into "394.418.283.109 ... 600.0%" and two
+    "for 1 account(s): 1001" into account 2002.
     """
     cleaned = [str(item).strip() for item in details if str(item).strip()]
     if not cleaned:
         return ""
     if len(set(cleaned)) == 1:
         return cleaned[0]
-
-    templates = {_SUMMABLE_COUNT_RE.sub("#", item) for item in cleaned}
-    number_groups = [
-        [int(v) for v in _SUMMABLE_COUNT_RE.findall(item)] for item in cleaned
-    ]
-    if len(templates) == 1 and number_groups[0]:
-        summed = iter(
-            sum(group[idx] for group in number_groups)
-            for idx in range(len(number_groups[0]))
-        )
-        merged = _SUMMABLE_COUNT_RE.sub(lambda _m: str(next(summed)), cleaned[0])
-        return f"{merged} Aggregated across {len(cleaned)} capture result(s)."
 
     unique = list(dict.fromkeys(cleaned))
     if len(unique) == 2:

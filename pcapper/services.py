@@ -360,7 +360,6 @@ def merge_services_summaries(
     errors: List[str] = []
 
     for summary in summary_list:
-        risks.extend(summary.risks)
         hierarchy.update(summary.hierarchy)
         errors.extend(summary.errors)
         for asset in summary.assets:
@@ -398,6 +397,12 @@ def merge_services_summaries(
                     == "handshake_confirmed"
                 ):
                     existing.discovery_method = "handshake_confirmed"
+
+    # A row several captures share is listed once, its counts added; a claim
+    # of absence stands only when every capture makes it.
+    from .rollup import merge_records
+
+    risks = merge_records([list(summary.risks or []) for summary in summary_list])
 
     assets = sorted(
         assets_map.values(),
@@ -1288,7 +1293,9 @@ def analyze_services(
     for s in services.values():
         hier[s.service_name] += 1
 
-    assets_sorted = sorted(list(services.values()), key=lambda x: x.ip)
+    # By address, then port and protocol: the order a -summarize merge lists
+    # them in (ties used to keep the order the packets came in).
+    assets_sorted = sorted(list(services.values()), key=lambda x: (x.ip, x.port, x.protocol))
     context = _build_services_enrichment(assets_sorted, risks)
 
     return ServiceSummary(

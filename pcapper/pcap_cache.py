@@ -3139,6 +3139,31 @@ def get_forced_packet_view_serial(path: Path) -> int | None:
     return _FORCED_VIEW_SERIALS.get(_path_key(path))
 
 
+def capture_start_time(path: Path) -> Optional[float]:
+    """The timestamp of a capture's first packet (pcap, pcapng, gzip), or
+    None when it has none or cannot be read: what -summarize orders captures
+    by, so a rollup does not depend on the order they were named in."""
+    try:
+        from scapy.utils import PcapReader  # type: ignore
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        handle = open_capture_file(Path(path), buffering=65536)
+    except Exception:  # noqa: BLE001
+        return None
+    try:
+        reader = PcapReader(handle)
+        first = next(iter(reader), None)
+        return float(first.time) if first is not None else None
+    except Exception:  # noqa: BLE001
+        return None
+    finally:
+        try:
+            handle.close()
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def get_reader(
     path: Path,
     *,

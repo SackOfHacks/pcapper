@@ -1121,10 +1121,13 @@ def analyze_tcp(
         if name:
             file_artifacts[str(name)] += 1
 
+    _CLIENT_LIST_LIMIT = 2000
     service_rows = []
-    for asset in getattr(services_summary, "assets", [])[:10]:
-        if asset.protocol.upper() != "TCP":
-            continue
+    # This protocol's ten busiest services. (The first ten assets of any
+    # protocol, by IP string, could leave none of these in the table.)
+    own_assets = [a for a in getattr(services_summary, "assets", []) if a.protocol.upper() == "TCP"]
+    own_assets.sort(key=lambda a: (-int(a.packets or 0), str(a.ip), int(a.port or 0)))
+    for asset in own_assets[:10]:
         clients_preview = ", ".join(sorted(asset.clients)[:5]) if asset.clients else "-"
         service_rows.append(
             {
@@ -1135,6 +1138,9 @@ def analyze_tcp(
                 "endpoint": asset.ip,
                 "clients": clients_preview,
                 "client_count": len(asset.clients),
+                # Every client (to 2,000): a rollup counts the ones the captures
+                # share once; the preview above shows five.
+                "client_list": sorted(asset.clients)[:_CLIENT_LIST_LIMIT],
             }
         )
 

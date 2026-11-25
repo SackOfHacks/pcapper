@@ -70,6 +70,10 @@ class NtlmAnomaly:
 class NtlmAnalysis:
     path: Path
     duration: float = 0.0
+    # When the traffic starts and ends: -summarize spans them (a duration
+    # alone could only be added up, as if the captures never overlapped).
+    first_seen: float | None = None
+    last_seen: float | None = None
     total_packets: int = 0
     ntlm_packets: int = 0
     versions: Counter[str] = field(default_factory=Counter)
@@ -1020,6 +1024,8 @@ def analyze_ntlm(
     return NtlmAnalysis(
         path=path,
         duration=duration,
+        first_seen=start_time,
+        last_seen=last_time,
         total_packets=total_packets,
         ntlm_packets=ntlm_packets,
         versions=versions,

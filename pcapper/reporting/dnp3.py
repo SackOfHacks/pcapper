@@ -182,15 +182,17 @@ def render_dnp3_summary(summary: "Dnp3Analysis") -> str:
     return rep.render()
 
 
-def render_dnp3_rollup(summaries: Iterable["Dnp3Analysis"]) -> str:
+def merge_dnp3_rollup(summaries: Iterable["Dnp3Analysis"]) -> "Dnp3Analysis | None":
     """DNP3 across several captures (-summarize): merged into one summary and
     rendered exactly like a single capture."""
     from dataclasses import replace
     from pathlib import Path
 
+    from ..rollup import merge_records
+
     items = [s for s in summaries if s]
     if not items:
-        return ""
+        return None
 
     def merged(name: str) -> Counter:
         total: Counter = Counter()
@@ -212,7 +214,7 @@ def render_dnp3_rollup(summaries: Iterable["Dnp3Analysis"]) -> str:
         errors += [e for e in s.errors if e not in errors]
     total = replace(
         items[0],
-        path=Path(f"ALL PCAPS ({len(items)})"),
+        path=Path(f"ALL_PCAPS_{len(items)}"),
         duration=sum(s.duration for s in items),
         total_packets=sum(s.total_packets for s in items),
         dnp3_packets=sum(int(getattr(s, "dnp3_packets", 0) or 0) for s in items),
@@ -230,20 +232,29 @@ def render_dnp3_rollup(summaries: Iterable["Dnp3Analysis"]) -> str:
         outstation_ips=merged("outstation_ips"),
         conversations=dict(conversations),
         iin_flags=merged("iin_flags"),
-        control_commands=[c for s in items for c in (s.control_commands or [])],
+        control_commands=merge_records([list(s.control_commands or []) for s in items]),
         directed_conversations=dict(directed),
         master_funcs=merged("master_funcs"),
         outstation_funcs=merged("outstation_funcs"),
         select_count=sum(s.select_count for s in items),
         operate_count=sum(s.operate_count for s in items),
         noncontiguous_capture=any(s.noncontiguous_capture for s in items),
-        messages=[m for s in items for m in s.messages],
+        messages=merge_records([list(s.messages) for s in items]),
         object_counts=merged("object_counts"),
         object_group_counts=merged("object_group_counts"),
-        anomalies=[a for s in items for a in s.anomalies],
+        anomalies=merge_records([list(s.anomalies) for s in items]),
         value_changes=[c for s in items for c in (s.value_changes or [])],
         ip_dnp3_addrs=dict(ip_addrs),
         sav5_present=any(getattr(s, "sav5_present", False) for s in items),
         errors=errors,
     )
-    return render_dnp3_summary(total)
+    from ..rollup import merge_window
+
+    merge_window(total, items)
+    return total
+
+
+def render_dnp3_rollup(summaries: Iterable["Dnp3Analysis"]) -> str:
+    """DNP3 across several captures (-summarize), rendered like one capture."""
+    merged = merge_dnp3_rollup(summaries)
+    return render_dnp3_summary(merged) if merged is not None else ""

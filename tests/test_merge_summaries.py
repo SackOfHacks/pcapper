@@ -52,6 +52,8 @@ def _is_default(value: object) -> bool:
 def _merge_cases() -> list[tuple[str, str]]:
     cases = []
     for path in sorted(PACKAGE.glob("*.py")):
+        if path.stem == "rollup":  # the generic machinery: tests/test_rollup_generic.py
+            continue
         for name in re.findall(r"^def (merge_\w+)\(", path.read_text(encoding="utf-8"), re.M):
             if name not in SKIP:
                 cases.append((path.stem, name))

@@ -91,7 +91,7 @@ def render_summary(summary: PcapSummary, protocol_limit: int = 15) -> str:
         max_rows=None,
     ), detail=True)
     rep.section("File", st.kv([
-        ("Path", str(summary.path)), ("Type", f"{summary.file_type}{gzipped}"), ("Size", f"{summary.size_bytes} bytes"),
+        st.path_field(summary), ("Type", f"{summary.file_type}{gzipped}"), ("Size", f"{summary.size_bytes} bytes"),
         ("Start / end", f"{format_ts(summary.start_ts)} / {format_ts(summary.end_ts)}"),
         ("Duration", format_duration(summary.duration_seconds)),
         ("Capture hardware / OS / application", " / ".join(str(v or "not recorded") for v in

@@ -256,9 +256,10 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
 
     target_ip = summary_list[0].target_ip
     total_packets = sum(item.total_packets for item in summary_list)
-    merged_events: list[TimelineEvent] = []
-    for item in summary_list:
-        merged_events.extend(item.events)
+    # The same event seen by two captures is one event.
+    from .rollup import merge_benign_claims, merge_records
+
+    merged_events: list[TimelineEvent] = merge_records([list(item.events or []) for item in summary_list])
     merged_events.sort(key=lambda event: (event.ts is None, event.ts))
 
     seen_errors: set[str] = set()
@@ -368,28 +369,10 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
                 for value in values:
                     if value not in bucket:
                         bucket.append(value)
-        if item.sequence_timeline:
-            merged_sequence_timeline.extend(item.sequence_timeline)
         if item.sequence_violations:
             for value in item.sequence_violations:
                 if value not in merged_sequence_violations:
                     merged_sequence_violations.append(value)
-        if item.beacon_candidates:
-            merged_beacons.extend(item.beacon_candidates)
-        if item.auth_abuse_profiles:
-            merged_auth_abuse.extend(item.auth_abuse_profiles)
-        if item.lateral_movement_paths:
-            merged_lateral_paths.extend(item.lateral_movement_paths)
-        if item.exfiltration_chains:
-            merged_exfil_chains.extend(item.exfiltration_chains)
-        if item.ot_impact_signals:
-            merged_ot_impact.extend(item.ot_impact_signals)
-        if item.evidence_anchors:
-            merged_anchors.extend(item.evidence_anchors)
-        if item.benign_context:
-            for value in item.benign_context:
-                if value not in merged_benign:
-                    merged_benign.append(value)
         if item.vt_lookup_enabled:
             merged_vt_enabled = True
         if item.vt_results:
@@ -420,6 +403,17 @@ def merge_timeline_summaries(summaries: Iterable[TimelineSummary]) -> TimelineSu
                 err_text = str(err).strip()
                 if err_text and err_text not in merged_vt_errors:
                     merged_vt_errors.append(err_text)
+
+    # A row several captures share is listed once, its counts added; a claim
+    # of absence stands only when every capture makes it.
+    merged_sequence_timeline = merge_records([list(item.sequence_timeline or []) for item in summary_list])
+    merged_beacons = merge_records([list(item.beacon_candidates or []) for item in summary_list])
+    merged_auth_abuse = merge_records([list(item.auth_abuse_profiles or []) for item in summary_list])
+    merged_lateral_paths = merge_records([list(item.lateral_movement_paths or []) for item in summary_list])
+    merged_exfil_chains = merge_records([list(item.exfiltration_chains or []) for item in summary_list])
+    merged_ot_impact = merge_records([list(item.ot_impact_signals or []) for item in summary_list])
+    merged_anchors = merge_records([list(item.evidence_anchors or []) for item in summary_list])
+    merged_benign = merge_benign_claims([list(item.benign_context or []) for item in summary_list])
 
     duration = None
     if first_seen is not None and last_seen is not None:

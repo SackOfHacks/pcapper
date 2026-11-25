@@ -1843,6 +1843,7 @@ def analyze_beacons(
                 "severity": "info",
                 "summary": "No beacon-like flows detected",
                 "details": "No periodic flows met detection thresholds.",
+                "absence": True,
             }
         )
 

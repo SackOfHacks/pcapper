@@ -80,20 +80,20 @@ def test_rollup_details_do_not_sum_ip_octets_or_percentages() -> None:
     assert same == "10.0.0.1 accounts for 60.0% of IP bytes."
 
 
-def test_rollup_details_still_sum_standalone_counts() -> None:
+def test_rollup_details_never_add_up_free_text_numbers() -> None:
+    """Unique peers of two captures are not 4 + 6 (a peer may be in both),
+    and an account named 1001 in two captures is not account 2002: differing
+    details are listed, not summed."""
     from pcapper.utils import collapse_detection_details
 
     merged = collapse_detection_details([
         "10.0.0.1 received traffic from 4 unique peers.",
         "10.0.0.1 received traffic from 6 unique peers.",
     ])
-    assert merged.startswith("10.0.0.1 received traffic from 10 unique peers.")
-    # The IP differs, so the counts must not be summed under one host.
-    split = collapse_detection_details([
-        "10.0.0.1 received traffic from 4 unique peers.",
-        "10.0.0.2 received traffic from 6 unique peers.",
-    ])
-    assert "10 unique" not in split
+    assert merged == "10.0.0.1 received traffic from 4 unique peers. | 10.0.0.1 received traffic from 6 unique peers."
+    accounts = collapse_detection_details(["1 credential(s) for 1 account(s): 1001", "13 credential(s) for 1 account(s): 1001"])
+    assert "2002" not in accounts and "14 credential" not in accounts
+    assert collapse_detection_details(["same text", "same text"]) == "same text"
 
 
 def test_self_addressed_traffic_share_is_at_most_100_percent(tmp_path) -> None:

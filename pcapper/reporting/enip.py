@@ -207,7 +207,7 @@ def cip_family_report(summary: object, *, name: str, unit: str, packets: int, si
         ("Normal (tag reads/other)", str(max(0, total_services - high_risk - suspicious_total - enumeration_total))),
     ]), detail=True)
 
-    all_tags = sorted(set(tag_reads) | set(tag_writes), key=lambda t: -(tag_reads.get(t, 0) + tag_writes.get(t, 0)))
+    all_tags = sorted(set(tag_reads) | set(tag_writes), key=lambda t: (-(tag_reads.get(t, 0) + tag_writes.get(t, 0)), str(t)))
     rep.section("Tag access map", st.table(
         ["Tag", "Reads", "Writes", "Top endpoint"],
         [[t, st.count(tag_reads.get(t, 0)), st.bad(str(tag_writes[t])) if tag_writes.get(t) else "0",
@@ -225,8 +225,8 @@ def cip_family_report(summary: object, *, name: str, unit: str, packets: int, si
     rtt = getattr(summary, "rtt_by_server", {}) or {}
     rep.section("Response times", st.table(
         ["Server", "Min ms", "p50 ms", "p95 ms", "Max ms"],
-        [[ip, f"{v.get('min', 0):.0f}", f"{v.get('p50', 0):.0f}", f"{v.get('p95', 0):.0f}", f"{v.get('max', 0):.0f}"]
-         for ip, v in sorted(rtt.items(), key=lambda kv: -kv[1].get("p95", 0))],
+        [[ip, st.stat(v, "min"), st.stat(v, "p50"), st.stat(v, "p95"), st.stat(v, "max")]
+         for ip, v in sorted(rtt.items(), key=lambda kv: (-kv[1].get("p95", 0), kv[0]))],
         align="lrrrr", max_rows=None,
     ), detail=True)
 

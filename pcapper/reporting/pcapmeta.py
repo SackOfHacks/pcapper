@@ -61,6 +61,6 @@ def render_pcapmeta_summary(summary: PcapMetaSummary) -> str:
         [[linktype_text(d.get(k)) if k == "linktype" else ("-" if d.get(k) in (None, "") else d.get(k)) for k in keys] for d in details],
         max_rows=10, noun="interface",
     ))
-    rep.section("File", st.kv([("Path", str(summary.path)), ("Size", f"{summary.size_bytes} bytes"),
+    rep.section("File", st.kv([st.path_field(summary), ("Size", f"{summary.size_bytes} bytes"),
                                ("Interface names", ", ".join(summary.interface_names))]), detail=True)
     return rep.render()

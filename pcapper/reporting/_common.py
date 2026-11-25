@@ -486,9 +486,10 @@ def _filtered_detections(summary, verbose: bool) -> list[dict[str, object]]:
             filtered.append(item)
         detections = filtered
 
-    path_obj = getattr(summary, "path", None)
-    if path_obj is not None and str(getattr(path_obj, "name", "") or "").startswith("ALL_PCAPS"):
-        detections = _collapse_rollup_detections(detections)
+    # A rollup's detections are listed as a capture's are: the findings block
+    # groups same-titled findings (×N, each one with -v). Collapsing them
+    # here first merged distinct findings of one capture (two GOOSE
+    # publishers became one finding) and hid all but one detail.
     return detections
 
 

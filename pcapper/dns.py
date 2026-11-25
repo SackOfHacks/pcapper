@@ -1165,6 +1165,7 @@ def analyze_dns(
                 "severity": "info",
                 "summary": "No DNS traffic detected",
                 "details": "DNS not observed in capture.",
+                "absence": True,
             }
         )
     else:
@@ -2319,14 +2320,15 @@ def analyze_dns(
         )
 
     for det in detections[:120]:
-        timeline.append(
-            {
-                "ts": first_seen,
-                "event": str(det.get("type", "detection")),
-                "summary": str(det.get("summary", "")),
-                "details": str(det.get("details", "")),
-            }
-        )
+        event = {
+            "ts": first_seen,
+            "event": str(det.get("type", "detection")),
+            "summary": str(det.get("summary", "")),
+            "details": str(det.get("details", "")),
+        }
+        if det.get("absence"):
+            event["absence"] = True  # kept by -summarize only when every capture has it
+        timeline.append(event)
 
     return DnsSummary(
         path=path,

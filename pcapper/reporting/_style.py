@@ -72,6 +72,17 @@ def is_rollup(summary: object) -> bool:
     return str(getattr(getattr(summary, "path", None), "name", "") or "").startswith(ROLLUP_NAME)
 
 
+def path_field(summary: object) -> tuple[str, str]:
+    """The ("Path", path) line of a report's file section, or ("Captures",
+    n) for a -summarize rollup -- whose path is an internal name."""
+    path = getattr(summary, "path", None)
+    name = str(getattr(path, "name", path) or "")
+    if name.startswith(ROLLUP_NAME):
+        count = name[len(ROLLUP_NAME):].lstrip("_")
+        return ("Captures", count if count.isdigit() else "several")
+    return ("Path", str(path))
+
+
 def verbose() -> bool:
     """True when the user asked for everything (-v)."""
     from . import _common
@@ -247,6 +258,16 @@ def duration(seconds: object) -> str:
 
 
 _FRACTION_RE = re.compile(r"\.\d+(?=Z$)")
+
+
+def stat(stats: object, key: str, fmt: str = ".0f") -> str:
+    """One value of a sample-statistics dict ({min, max, avg, p50, p95}),
+    "≈"-prefixed when it is an estimate: -summarize merges percentiles and
+    averages of several captures by weighting (min and max stay exact)."""
+    values = stats if isinstance(stats, dict) else {}
+    number = float(values.get(key, 0) or 0)
+    estimated = bool(values.get("approx")) and key not in ("min", "max", "count")
+    return f"{'≈' if estimated else ''}{number:{fmt}}"
 
 
 def ts(value: object) -> str:

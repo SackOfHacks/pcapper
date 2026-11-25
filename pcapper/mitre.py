@@ -4,6 +4,7 @@ import ipaddress
 import json
 import os
 import re
+from .rollup import record_digests
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from functools import lru_cache
@@ -150,6 +151,10 @@ class MitreSummary:
     host_attack_paths: dict[str, list[str]] = field(default_factory=dict)
     host_roles: dict[str, list[str]] = field(default_factory=dict)
     technique_heat: list[dict[str, object]] = field(default_factory=list)
+    # The detections mapped, as digests: -summarize counts a detection several
+    # captures report once (not exported).
+    detection_digests: Counter = field(default_factory=Counter, repr=False, compare=False,
+                                       metadata={"export": False})
     checks: dict[str, list[str]] = field(default_factory=dict)
 
 
@@ -922,6 +927,84 @@ def _fallback_from_explicit_ids(
     return tactic, tactic_id, technique, technique_id
 
 
+def _alternate_explanations(hits: list, sequence_issues: list) -> list[str]:
+    """Caveats to the mapping, from the hits and sequence issues: the same
+    for one capture and for a -summarize merge (where one clean capture's
+    "no regression" must not stand beside another capture's regressions)."""
+    out: list[str] = []
+    low_conf_count = sum(1 for hit in hits if hit.confidence == "low")
+    single_source_count = sum(1 for hit in hits if hit.corroborating_sources <= 1)
+    if low_conf_count >= 3:
+        out.append(
+            "Multiple low-confidence mappings could reflect noisy scanning or baseline variability."
+        )
+    if single_source_count >= 3:
+        out.append(
+            "Several mappings are single-source and should be corroborated with endpoint or IDS telemetry."
+        )
+    if not sequence_issues:
+        out.append(
+            "No ATT&CK sequence order regression was detected in this capture."
+        )
+    return out
+
+
+def _hit_counters(hits: list[MitreHit]) -> tuple[Counter[str], ...]:
+    """The counts the analyzer makes from its hits (one per hit)."""
+    tactics: Counter[str] = Counter()
+    techniques: Counter[str] = Counter()
+    procedures: Counter[str] = Counter()
+    frameworks: Counter[str] = Counter()
+    iocs: Counter[str] = Counter()
+    artifacts: Counter[str] = Counter()
+    for hit in hits:
+        tactics[f"{hit.tactic} ({hit.tactic_id})"] += 1
+        techniques[f"{hit.technique} ({hit.technique_id})"] += 1
+        procedures[hit.procedure] += 1
+        frameworks[hit.framework] += 1
+        iocs.update(hit.iocs)
+        artifacts.update(hit.artifacts)
+    return tactics, techniques, procedures, frameworks, iocs, artifacts
+
+
+_CONFIDENCE_ORDER = {"high": 3, "medium": 2, "low": 1}
+
+
+def _merge_technique_heat(lists: list[list[dict[str, object]]]) -> list[dict[str, object]]:
+    """Technique heat rows of several captures, one per technique: hits added,
+    hosts and sources at the most any capture saw, the widest window and the
+    highest confidence; ranked as the analyzer ranks them."""
+    merged: dict[tuple, dict[str, object]] = {}
+    for rows in lists:
+        for row in rows:
+            key = (row.get("framework"), row.get("tactic"), row.get("technique"), row.get("technique_id"))
+            current = merged.get(key)
+            if current is None:
+                merged[key] = dict(row)
+                continue
+            for name in ("count", "evidence_count"):
+                current[name] = int(current.get(name, 0) or 0) + int(row.get(name, 0) or 0)
+            for name in ("host_count", "source_count"):
+                current[name] = max(int(current.get(name, 0) or 0), int(row.get(name, 0) or 0))
+            firsts = [t for t in (current.get("first_seen"), row.get("first_seen")) if t is not None]
+            lasts = [t for t in (current.get("last_seen"), row.get("last_seen")) if t is not None]
+            current["first_seen"] = min(firsts) if firsts else None
+            current["last_seen"] = max(lasts) if lasts else None
+            if _CONFIDENCE_ORDER.get(str(row.get("confidence", "")).lower(), 0) > _CONFIDENCE_ORDER.get(
+                str(current.get("confidence", "")).lower(), 0
+            ):
+                current["confidence"] = row.get("confidence")
+    return sorted(
+        merged.values(),
+        key=lambda item: (
+            -int(item.get("count", 0) or 0),
+            -int(item.get("host_count", 0) or 0),
+            -int(item.get("source_count", 0) or 0),
+            str(item.get("technique_id", "")),
+        ),
+    )
+
+
 def merge_mitre_summaries(summaries: list[MitreSummary]) -> MitreSummary:
     if not summaries:
         return MitreSummary(
@@ -938,7 +1021,6 @@ def merge_mitre_summaries(summaries: list[MitreSummary]) -> MitreSummary:
     hits: list[MitreHit] = []
     errors: list[str] = []
     sequence_issues: list[str] = []
-    alternate_explanations: list[str] = []
     host_attack_paths: dict[str, list[str]] = defaultdict(list)
     host_roles: dict[str, set[str]] = defaultdict(set)
     technique_heat_rows: list[dict[str, object]] = []
@@ -958,14 +1040,8 @@ def merge_mitre_summaries(summaries: list[MitreSummary]) -> MitreSummary:
         framework_counts.update(summary.framework_counts)
         ioc_counts.update(summary.ioc_counts)
         artifact_counts.update(summary.artifact_counts)
-        attack_path.extend(summary.attack_path)
-        hits.extend(summary.hits)
         errors.extend(summary.errors)
         sequence_issues.extend(summary.sequence_issues)
-        alternate_explanations.extend(summary.alternate_explanations)
-        technique_heat_rows.extend(summary.technique_heat)
-        for host, chain in summary.host_attack_paths.items():
-            host_attack_paths[host].extend(chain)
         for host, roles in summary.host_roles.items():
             for role in roles:
                 host_roles[host].add(role)
@@ -989,6 +1065,34 @@ def merge_mitre_summaries(summaries: list[MitreSummary]) -> MitreSummary:
     if first_seen is not None and last_seen is not None:
         duration_seconds = max(0.0, last_seen - first_seen)
 
+    # A technique hit several captures share is one hit, its evidence joined;
+    # the counts hits make are recounted from the merged hits, the rest (IOC
+    # matches) added. Heat rows merge per technique, host paths per host.
+    from .rollup import merge_records, union_count
+
+    hits = merge_records([list(summary.hits or []) for summary in summaries])
+    attack_path = merge_records([list(summary.attack_path or []) for summary in summaries])
+    technique_heat_rows = _merge_technique_heat([list(summary.technique_heat or []) for summary in summaries])
+    for host in sorted({h for summary in summaries for h in summary.host_attack_paths}):
+        host_attack_paths[host] = merge_records(
+            [list(summary.host_attack_paths.get(host) or []) for summary in summaries]
+        )
+    recounted = _hit_counters(hits)
+    for summary in summaries:
+        own = _hit_counters(summary.hits or [])
+        totals = (summary.tactic_counts, summary.technique_counts, summary.procedure_counts,
+                  summary.framework_counts, summary.ioc_counts, summary.artifact_counts)
+        for merged_counter, total, part in zip(recounted, totals, own):
+            merged_counter.update(Counter(total) - part)
+    tactic_counts, technique_counts, procedure_counts, framework_counts, ioc_counts, artifact_counts = recounted
+    # Detections and hits several captures share are counted once.
+    mapped_detections = len(hits)
+    if all(summary.detection_digests or not summary.total_detections for summary in summaries):
+        total_detections, detection_digests = union_count(summary.detection_digests for summary in summaries)
+    else:
+        detection_digests = Counter()
+
+    sequence_issues = list(dict.fromkeys(sequence_issues))
     executive_verdict, executive_confidence, executive_reasons = _executive_assessment(
         total_detections,
         hits,
@@ -1013,6 +1117,7 @@ def merge_mitre_summaries(summaries: list[MitreSummary]) -> MitreSummary:
         path=Path("ALL_PCAPS"),
         total_detections=total_detections,
         mapped_detections=mapped_detections,
+        detection_digests=detection_digests,
         tactic_counts=tactic_counts,
         technique_counts=technique_counts,
         procedure_counts=procedure_counts,
@@ -1021,15 +1126,15 @@ def merge_mitre_summaries(summaries: list[MitreSummary]) -> MitreSummary:
         artifact_counts=artifact_counts,
         attack_path=attack_path,
         hits=hits,
-        errors=sorted(set(errors)),
+        errors=list(dict.fromkeys(e for e in errors if e)),
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration_seconds,
         executive_verdict=executive_verdict,
         executive_confidence=executive_confidence,
         executive_reasons=executive_reasons,
-        sequence_issues=sorted(set(sequence_issues)),
-        alternate_explanations=sorted(set(alternate_explanations))[:40],
+        sequence_issues=list(dict.fromkeys(sequence_issues)),
+        alternate_explanations=_alternate_explanations(hits, sequence_issues),
         host_attack_paths={
             key: value[:120]
             for key, value in sorted(
@@ -1386,20 +1491,7 @@ def analyze_mitre(
         )
     )
 
-    low_conf_count = sum(1 for hit in hits if hit.confidence == "low")
-    single_source_count = sum(1 for hit in hits if hit.corroborating_sources <= 1)
-    if low_conf_count >= 3:
-        alternate_explanations.append(
-            "Multiple low-confidence mappings could reflect noisy scanning or baseline variability."
-        )
-    if single_source_count >= 3:
-        alternate_explanations.append(
-            "Several mappings are single-source and should be corroborated with endpoint or IDS telemetry."
-        )
-    if not sequence_issues:
-        alternate_explanations.append(
-            "No ATT&CK sequence order regression was detected in this capture."
-        )
+    alternate_explanations = _alternate_explanations(hits, sequence_issues)
 
     if ioc_summary is not None:
         for value, count in ioc_summary.ip_hits.items():
@@ -1417,6 +1509,7 @@ def analyze_mitre(
             0.0, threat_summary.last_seen - threat_summary.first_seen
         )
 
+    sequence_issues = list(dict.fromkeys(sequence_issues))  # each regression once, counted once
     executive_verdict, executive_confidence, executive_reasons = _executive_assessment(
         len(threat_summary.detections),
         hits,
@@ -1435,6 +1528,7 @@ def analyze_mitre(
         path=path,
         total_detections=len(threat_summary.detections),
         mapped_detections=len(hits),
+        detection_digests=record_digests(threat_summary.detections),
         tactic_counts=tactic_counts,
         technique_counts=technique_counts,
         procedure_counts=procedure_counts,
@@ -1450,7 +1544,7 @@ def analyze_mitre(
         executive_verdict=executive_verdict,
         executive_confidence=executive_confidence,
         executive_reasons=executive_reasons,
-        sequence_issues=sequence_issues,
+        sequence_issues=list(dict.fromkeys(sequence_issues)),  # each regression once
         alternate_explanations=alternate_explanations,
         host_attack_paths={
             key: value[:120]

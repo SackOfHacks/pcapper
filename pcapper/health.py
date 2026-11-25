@@ -84,6 +84,80 @@ class HealthSummary:
     errors: list[str]
 
 
+def health_assessment(
+    deterministic_checks: dict[str, list[str]],
+) -> tuple[str, str, list[str], list[str]]:
+    """(verdict, confidence, reasons, benign context) from the deterministic
+    checks: the one assessment a capture and a -summarize merge both use."""
+
+    def hit(name: str) -> bool:
+        return bool(deterministic_checks.get(name))
+
+    verdict_score = 0
+    verdict_score += 2 if hit("udp_reflection_amplification") else 0
+    verdict_score += 2 if hit("snmp_exposure_risk") else 0
+    verdict_score += 2 if hit("ot_cycle_instability") else 0
+    verdict_score += 1 if hit("syn_scan_or_exhaustion") else 0
+    verdict_score += 1 if hit("tcp_reset_storm") else 0
+    verdict_score += 1 if hit("persistent_zero_window") else 0
+    verdict_score += 1 if hit("certificate_hygiene_risk") else 0
+    verdict_score += 1 if hit("zone_policy_drift") else 0
+
+    analyst_reasons: list[str] = []
+    if hit("udp_reflection_amplification"):
+        analyst_reasons.append("UDP reflection/amplification profile detected")
+    if hit("snmp_exposure_risk"):
+        analyst_reasons.append(
+            "SNMP exposure risks detected (version/community/write behavior)"
+        )
+    if hit("ot_cycle_instability"):
+        analyst_reasons.append("OT cycle-time jitter instability detected")
+    if hit("syn_scan_or_exhaustion"):
+        analyst_reasons.append("SYN scan/exhaustion behavior detected")
+    if hit("tcp_reset_storm"):
+        analyst_reasons.append("TCP RST storm behavior detected")
+    if hit("sequence_degradation_chain"):
+        analyst_reasons.append("Sequence-based degradation chain observed")
+    if hit("zone_policy_drift"):
+        analyst_reasons.append("Cross-zone management/OT service flows observed")
+
+    if verdict_score >= 8:
+        analyst_verdict = (
+            "YES - HIGH-CONFIDENCE NETWORK HEALTH SECURITY RISK PATTERN DETECTED"
+        )
+        analyst_confidence = "high"
+    elif verdict_score >= 5:
+        analyst_verdict = (
+            "LIKELY - MULTIPLE CORROBORATING NETWORK HEALTH RISK INDICATORS"
+        )
+        analyst_confidence = "medium"
+    elif verdict_score >= 3:
+        analyst_verdict = "POSSIBLE - SUSPICIOUS HEALTH INDICATORS REQUIRE VALIDATION"
+        analyst_confidence = "medium"
+    else:
+        analyst_verdict = (
+            "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE HEALTH RISK PATTERN"
+        )
+        analyst_confidence = "low"
+
+    benign_context: list[str] = []
+    if not hit("syn_scan_or_exhaustion"):
+        benign_context.append(
+            "No sustained SYN fan-out behavior exceeded scan/exhaustion thresholds"
+        )
+    if not hit("udp_reflection_amplification"):
+        benign_context.append("No strong UDP reflection/amplification profile detected")
+    if not hit("ot_cycle_instability"):
+        benign_context.append(
+            "OT timing jitter remained within expected variability thresholds"
+        )
+    if not hit("zone_policy_drift"):
+        benign_context.append(
+            "No cross-zone management/OT service placement drift detected"
+        )
+    return analyst_verdict, analyst_confidence, analyst_reasons, benign_context
+
+
 def merge_health_summaries(
     summaries: list[HealthSummary] | tuple[HealthSummary, ...] | set[HealthSummary],
 ) -> HealthSummary:
@@ -183,7 +257,6 @@ def merge_health_summaries(
         "s7_rosctr": [],
     }
     errors: list[str] = []
-    analyst_reasons: list[str] = []
     deterministic_checks: dict[str, list[str]] = {}
     sequence_findings: list[dict[str, object]] = []
     host_risk_profiles: list[dict[str, object]] = []
@@ -192,7 +265,6 @@ def merge_health_summaries(
     ot_risk_profiles: list[dict[str, object]] = []
     zone_anomalies: list[str] = []
     evidence_anchors: list[dict[str, object]] = []
-    benign_context: list[str] = []
 
     for summary in summary_list:
         total_packets += summary.total_packets
@@ -239,9 +311,6 @@ def merge_health_summaries(
         ecn_counts.update(summary.ecn_counts)
         snmp_versions.update(summary.snmp_versions)
         snmp_communities.update(summary.snmp_communities)
-        for reason in summary.analyst_reasons:
-            if reason not in analyst_reasons:
-                analyst_reasons.append(reason)
         for key, values in summary.deterministic_checks.items():
             bucket = deterministic_checks.setdefault(key, [])
             for value in values:
@@ -268,14 +337,16 @@ def merge_health_summaries(
         for item in summary.evidence_anchors:
             if item not in evidence_anchors:
                 evidence_anchors.append(item)
-        for item in summary.benign_context:
-            if item not in benign_context:
-                benign_context.append(item)
 
-        udp_amp_candidates.extend(summary.udp_amp_candidates)
-        for key in ("profinet_rt", "enip_io", "s7_rosctr"):
-            ot_timing[key].extend(summary.ot_timing.get(key, []))
         errors.extend(summary.errors)
+
+    # A row several captures share is listed once, its counts added; a claim
+    # of absence stands only when every capture makes it.
+    from .rollup import merge_records
+
+    udp_amp_candidates = merge_records([list(summary.udp_amp_candidates or []) for summary in summary_list])
+    for key in ("profinet_rt", "enip_io", "s7_rosctr"):
+        ot_timing[key] = merge_records([list(summary.ot_timing.get(key, []) or []) for summary in summary_list])
 
     if udp_amp_candidates:
         seen_amp: set[str] = set()
@@ -377,54 +448,10 @@ def merge_health_summaries(
                 }
             )
 
-    merged_score = 0
-    merged_score += (
-        2
-        if any(v for v in deterministic_checks.get("udp_reflection_amplification", []))
-        else 0
-    )
-    merged_score += (
-        2 if any(v for v in deterministic_checks.get("snmp_exposure_risk", [])) else 0
-    )
-    merged_score += (
-        2 if any(v for v in deterministic_checks.get("ot_cycle_instability", [])) else 0
-    )
-    merged_score += (
-        1
-        if any(v for v in deterministic_checks.get("syn_scan_or_exhaustion", []))
-        else 0
-    )
-    merged_score += (
-        1 if any(v for v in deterministic_checks.get("tcp_reset_storm", [])) else 0
-    )
-    merged_score += (
-        1
-        if any(v for v in deterministic_checks.get("persistent_zero_window", []))
-        else 0
-    )
-    merged_score += (
-        1
-        if any(v for v in deterministic_checks.get("certificate_hygiene_risk", []))
-        else 0
-    )
-    if merged_score >= 7:
-        merged_verdict = (
-            "YES - high-confidence network health security risk pattern detected"
-        )
-        merged_conf = "high"
-    elif merged_score >= 4:
-        merged_verdict = (
-            "LIKELY - multiple corroborating network health risk indicators detected"
-        )
-        merged_conf = "medium"
-    elif merged_score >= 2:
-        merged_verdict = (
-            "POSSIBLE - suspicious network health indicators require validation"
-        )
-        merged_conf = "medium"
-    else:
-        merged_verdict = "NO STRONG SIGNAL - no convincing high-confidence health risk pattern from current heuristics"
-        merged_conf = "low"
+    # The merged checks assessed exactly as one capture's are; reasons and
+    # benign context follow from them, so a quiet capture's "no SYN scan"
+    # cannot stand beside another capture's SYN scan.
+    merged_verdict, merged_conf, analyst_reasons, benign_context = health_assessment(deterministic_checks)
 
     return HealthSummary(
         path=Path("ALL_PCAPS"),
@@ -1336,68 +1363,9 @@ def analyze_health(
         f"{len(event_anchors)} anchor event(s) captured with packet provenance"
     )
 
-    verdict_score = 0
-    verdict_score += 2 if deterministic_checks["udp_reflection_amplification"] else 0
-    verdict_score += 2 if deterministic_checks["snmp_exposure_risk"] else 0
-    verdict_score += 2 if deterministic_checks["ot_cycle_instability"] else 0
-    verdict_score += 1 if deterministic_checks["syn_scan_or_exhaustion"] else 0
-    verdict_score += 1 if deterministic_checks["tcp_reset_storm"] else 0
-    verdict_score += 1 if deterministic_checks["persistent_zero_window"] else 0
-    verdict_score += 1 if deterministic_checks["certificate_hygiene_risk"] else 0
-    verdict_score += 1 if deterministic_checks["zone_policy_drift"] else 0
-
-    analyst_reasons: list[str] = []
-    if deterministic_checks["udp_reflection_amplification"]:
-        analyst_reasons.append("UDP reflection/amplification profile detected")
-    if deterministic_checks["snmp_exposure_risk"]:
-        analyst_reasons.append(
-            "SNMP exposure risks detected (version/community/write behavior)"
-        )
-    if deterministic_checks["ot_cycle_instability"]:
-        analyst_reasons.append("OT cycle-time jitter instability detected")
-    if deterministic_checks["syn_scan_or_exhaustion"]:
-        analyst_reasons.append("SYN scan/exhaustion behavior detected")
-    if deterministic_checks["tcp_reset_storm"]:
-        analyst_reasons.append("TCP RST storm behavior detected")
-    if deterministic_checks["sequence_degradation_chain"]:
-        analyst_reasons.append("Sequence-based degradation chain observed")
-    if deterministic_checks["zone_policy_drift"]:
-        analyst_reasons.append("Cross-zone management/OT service flows observed")
-
-    if verdict_score >= 8:
-        analyst_verdict = (
-            "YES - HIGH-CONFIDENCE NETWORK HEALTH SECURITY RISK PATTERN DETECTED"
-        )
-        analyst_confidence = "high"
-    elif verdict_score >= 5:
-        analyst_verdict = (
-            "LIKELY - MULTIPLE CORROBORATING NETWORK HEALTH RISK INDICATORS"
-        )
-        analyst_confidence = "medium"
-    elif verdict_score >= 3:
-        analyst_verdict = "POSSIBLE - SUSPICIOUS HEALTH INDICATORS REQUIRE VALIDATION"
-        analyst_confidence = "medium"
-    else:
-        analyst_verdict = (
-            "NO STRONG SIGNAL - NO CONVINCING HIGH-CONFIDENCE HEALTH RISK PATTERN"
-        )
-        analyst_confidence = "low"
-
-    benign_context: list[str] = []
-    if not deterministic_checks["syn_scan_or_exhaustion"]:
-        benign_context.append(
-            "No sustained SYN fan-out behavior exceeded scan/exhaustion thresholds"
-        )
-    if not deterministic_checks["udp_reflection_amplification"]:
-        benign_context.append("No strong UDP reflection/amplification profile detected")
-    if not deterministic_checks["ot_cycle_instability"]:
-        benign_context.append(
-            "OT timing jitter remained within expected variability thresholds"
-        )
-    if not deterministic_checks["zone_policy_drift"]:
-        benign_context.append(
-            "No cross-zone management/OT service placement drift detected"
-        )
+    analyst_verdict, analyst_confidence, analyst_reasons, benign_context = health_assessment(
+        deterministic_checks
+    )
 
     return HealthSummary(
         path=path,

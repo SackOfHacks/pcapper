@@ -159,6 +159,10 @@ class ModbusArtifact:
 class ModbusAnalysis:
     path: Path
     duration: float = 0.0
+    # When the traffic starts and ends: -summarize spans them (a duration
+    # alone could only be added up, as if the captures never overlapped).
+    start_ts: float | None = None
+    end_ts: float | None = None
     total_packets: int = 0
     modbus_packets: int = 0
     total_bytes: int = 0
@@ -2004,6 +2008,8 @@ def analyze_modbus(
     return ModbusAnalysis(
         path=path,
         duration=duration,
+        start_ts=start_time,
+        end_ts=last_time,
         total_packets=total_packets,
         modbus_packets=modbus_packets,
         total_bytes=total_bytes,

@@ -156,6 +156,7 @@ def analyze_sizes(
                 "severity": "info",
                 "summary": "No packets observed",
                 "details": "No packet sizes to analyze.",
+                "absence": True,
             }
         )
     else:

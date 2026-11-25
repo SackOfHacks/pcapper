@@ -41,10 +41,14 @@ def deterministic_output(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setenv("NO_COLOR", "1")
     coloring.set_color_override(False)
     reporting.set_verbose_output(False)
+    # --quiet (passed by the in-process CLI runs) is module-level state too;
+    # left on, it dropped the "-v adds" footer from later golden renders.
+    reporting.set_quiet_mode(False)
     progress.set_verbose_progress(False)
     yield
     coloring.set_color_override(None)
     reporting.set_verbose_output(False)
+    reporting.set_quiet_mode(False)
     progress.set_verbose_progress(False)
 
 

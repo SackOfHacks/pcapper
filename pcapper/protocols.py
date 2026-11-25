@@ -90,6 +90,10 @@ class ProtocolSummary:
     beacon_profiles: List[Dict[str, object]] = field(default_factory=list)
     role_inversion_profiles: List[Dict[str, object]] = field(default_factory=list)
     false_positive_context: List[str] = field(default_factory=list)
+    # When the traffic starts and ends: -summarize spans them (a duration
+    # alone could only be added up, as if the captures never overlapped).
+    first_seen: float | None = None
+    last_seen: float | None = None
 
 
 def _build_protocol_enrichment(
@@ -183,6 +187,13 @@ def _build_protocol_enrichment(
         "deterministic_checks": {k: list(dict.fromkeys(v)) for k, v in checks.items()},
     }
 
+def _ranked(counter: Counter, limit: int) -> list[tuple[str, int]]:
+    """Top ``limit`` by count, ties by name: Counter.most_common breaks ties
+    by insertion order, which differs between a capture and a -summarize
+    merge (and between captures named in another order)."""
+    return sorted(counter.items(), key=lambda kv: (-kv[1], str(kv[0])))[:limit]
+
+
 def merge_protocols_summaries(
     summaries: List[ProtocolSummary]
     | Tuple[ProtocolSummary, ...]
@@ -239,8 +250,6 @@ def merge_protocols_summaries(
         total_packets += summary.total_packets
         duration += float(summary.duration or 0.0)
         _merge_node(hierarchy, summary.hierarchy)
-        conversations.extend(summary.conversations)
-        anomalies.extend(summary.anomalies)
         errors.extend(summary.errors)
 
         for name, count in summary.top_protocols:
@@ -268,9 +277,17 @@ def merge_protocols_summaries(
                 existing.bytes_recv += endpoint.bytes_recv
                 existing.protocols.update(endpoint.protocols)
 
-    top_protocols = top_counter.most_common(10)
-    port_protocols = port_counter.most_common(10)
-    ethertype_protocols = eth_counter.most_common(10)
+    # A row or string seen in several captures is listed once, its counts added.
+    from .rollup import merge_records, merge_undirected
+
+    # Conversations are keyed by their endpoints either way round (as the
+    # analyzer keys them): another capture may hold A<->B as B->A.
+    conversations = merge_undirected([list(summary.conversations or []) for summary in summary_list])
+    anomalies = merge_records([list(summary.anomalies or []) for summary in summary_list])
+
+    top_protocols = _ranked(top_counter, 10)
+    port_protocols = _ranked(port_counter, 12)  # as the analyzer keeps
+    ethertype_protocols = _ranked(eth_counter, 12)  # as the analyzer keeps
 
     context = _build_protocol_enrichment(
         total_packets=total_packets,
@@ -283,7 +300,7 @@ def merge_protocols_summaries(
         ethertype_protocols=ethertype_protocols,
     )
 
-    return ProtocolSummary(
+    merged = ProtocolSummary(
         path=Path("ALL_PCAPS"),
         total_packets=total_packets,
         duration=duration,
@@ -317,6 +334,10 @@ def merge_protocols_summaries(
             str(v) for v in list(context.get("false_positive_context", []) or [])
         ],
     )
+    from .rollup import merge_window
+
+    merge_window(merged, summary_list)
+    return merged
 
 
 # --- Analysis ---
@@ -1283,9 +1304,9 @@ def analyze_protocols(
 
     conversations = list(convs.values())
     endpoints = list(eps.values())
-    top_protocols = layer_counts.most_common(10)
-    port_protocols = port_protocol_counts.most_common(12)
-    ethertype_protocols = ethertype_protocol_counts.most_common(12)
+    top_protocols = _ranked(layer_counts, 10)
+    port_protocols = _ranked(port_protocol_counts, 12)
+    ethertype_protocols = _ranked(ethertype_protocol_counts, 12)
     context = _build_protocol_enrichment(
         total_packets=pkt_idx,
         duration=duration,
@@ -1301,6 +1322,8 @@ def analyze_protocols(
         path=path,
         total_packets=pkt_idx,
         duration=duration,
+        first_seen=start_ts or None,
+        last_seen=end_ts or None,
         hierarchy=hierarchy,
         conversations=conversations,
         endpoints=endpoints,

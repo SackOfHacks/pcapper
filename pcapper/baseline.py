@@ -266,7 +266,7 @@ def _merge_ot_commands(
         fast_mode=fast_mode,
         fast_notes=list(dict.fromkeys(fast_notes)),
         detections=detections,
-        errors=sorted({err for err in errors if err}),
+        errors=list(dict.fromkeys(err for err in errors if err)),
         pair_commands=pair_commands,
         pair_command_times=pair_command_times,
     )

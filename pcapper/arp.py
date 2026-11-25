@@ -89,6 +89,10 @@ class ArpAnomaly:
 class ArpSummary:
     path: Path
     duration: float = 0.0
+    # When the traffic starts and ends: -summarize spans them (a duration
+    # alone could only be added up, as if the captures never overlapped).
+    first_seen: float | None = None
+    last_seen: float | None = None
     total_packets: int = 0
     arp_packets: int = 0
     arp_requests: int = 0
@@ -438,6 +442,7 @@ def analyze_arp(
 
     if start_ts is not None and end_ts is not None:
         summary.duration = max(0.0, end_ts - start_ts)
+        summary.first_seen, summary.last_seen = start_ts, end_ts
 
     summary.plaintext_observed = Counter({k: v for k, v in plain.most_common(25)})
     summary.files_discovered = sorted(files)[:50]
@@ -1028,6 +1033,7 @@ def merge_arp_summaries(summaries: Iterable[ArpSummary]) -> ArpSummary:
     merged = ArpSummary(path=Path("ALL_PCAPS"))
     deterministic_checks: dict[str, list[str]] = defaultdict(list)
     seen_check_values: dict[str, set[str]] = defaultdict(set)
+    gateway_macs: dict[str, Counter[str]] = {}
 
     for item in summary_list:
         merged.duration += float(item.duration or 0.0)
@@ -1059,11 +1065,6 @@ def merge_arp_summaries(summaries: Iterable[ArpSummary]) -> ArpSummary:
         for key, value in (item.victim_conflicts or {}).items():
             merged.victim_conflicts.setdefault(key, Counter()).update(value)
 
-        merged.conversations.extend(item.conversations)
-        merged.sessions.extend(item.sessions)
-        merged.artifacts.extend(item.artifacts)
-        merged.timeline.extend(item.timeline)
-        merged.anomalies.extend(item.anomalies)
         merged.proxy_arp_candidates.extend(item.proxy_arp_candidates)
         merged.files_discovered.extend(item.files_discovered)
         merged.errors.extend(item.errors)
@@ -1086,10 +1087,7 @@ def merge_arp_summaries(summaries: Iterable[ArpSummary]) -> ArpSummary:
                 merged.reply_latency_summary = dict(item.reply_latency_summary)
 
         if item.gateway_ip and item.gateway_ip != "0.0.0.0":
-            if not merged.gateway_ip:
-                merged.gateway_ip = item.gateway_ip
-            if item.gateway_ip == merged.gateway_ip:
-                merged.gateway_mac_candidates.update(item.gateway_mac_candidates)
+            gateway_macs.setdefault(item.gateway_ip, Counter()).update(item.gateway_mac_candidates)
 
         for check_key, values in (item.deterministic_checks or {}).items():
             for value in values or []:
@@ -1098,6 +1096,15 @@ def merge_arp_summaries(summaries: Iterable[ArpSummary]) -> ArpSummary:
                     continue
                 seen_check_values[check_key].add(text)
                 deterministic_checks[check_key].append(text)
+
+    # A row or string seen in several captures is listed once, its counts added.
+    from .rollup import merge_records
+
+    merged.conversations = merge_records([list(item.conversations or []) for item in summary_list])
+    merged.sessions = merge_records([list(item.sessions or []) for item in summary_list])
+    merged.artifacts = merge_records([list(item.artifacts or []) for item in summary_list])
+    merged.timeline = merge_records([list(item.timeline or []) for item in summary_list])
+    merged.anomalies = merge_records([list(item.anomalies or []) for item in summary_list])
 
     merged.conversations = sorted(
         merged.conversations, key=lambda row: row.packets, reverse=True
@@ -1126,5 +1133,15 @@ def merge_arp_summaries(summaries: Iterable[ArpSummary]) -> ArpSummary:
     merged.deterministic_checks = {
         key: values[:120] for key, values in deterministic_checks.items()
     }
+    # Captures from several segments have several gateways. The rollup names
+    # the one with the most ARP evidence (ties: the lowest address), with its
+    # own MACs only: pooling another gateway's MACs would read as the gateway
+    # mapping changing -- a poisoning signal that never happened.
+    if gateway_macs:
+        merged.gateway_ip = min(gateway_macs, key=lambda ip: (-sum(gateway_macs[ip].values()), ip))
+        merged.gateway_mac_candidates = Counter(gateway_macs[merged.gateway_ip])
 
+    from .rollup import merge_window
+
+    merge_window(merged, summary_list)
     return merged

@@ -157,6 +157,10 @@ class IdentityInfo:
 class ENIPAnalysis:
     path: Path
     duration: float = 0.0
+    # When the traffic starts and ends: -summarize spans them (a duration
+    # alone could only be added up, as if the captures never overlapped).
+    start_ts: float | None = None
+    end_ts: float | None = None
     total_packets: int = 0
     enip_packets: int = 0
     total_bytes: int = 0
@@ -276,7 +280,6 @@ def merge_enip_summaries(summaries: list[ENIPAnalysis]) -> ENIPAnalysis:
         merged.tag_reads.update(summary.tag_reads)
         merged.tag_writes.update(summary.tag_writes)
         merged.error_status_counts.update(summary.error_status_counts)
-        merged.first_seen.update(summary.first_seen)
         merged.cip_success += summary.cip_success
         merged.cip_errors += summary.cip_errors
         merged.connections.extend(summary.connections)
@@ -313,6 +316,14 @@ def merge_enip_summaries(summaries: list[ENIPAnalysis]) -> ENIPAnalysis:
 
     merged.packet_size_buckets = merge_size_buckets(packet_bucket_lists)
     merged.payload_size_buckets = merge_size_buckets(payload_bucket_lists)
+    from .rollup import earliest_per_key, merge_stats_by_key, sum_per_key
+
+    merged.first_seen = earliest_per_key(s.first_seen for s in summaries)
+    merged.rtt_by_server = merge_stats_by_key(s.rtt_by_server for s in summaries)
+    merged.pairing = sum_per_key(s.pairing for s in summaries)
+    from .rollup import merge_window
+
+    merge_window(merged, summaries)
     return merged
 
 
@@ -1501,6 +1512,7 @@ def analyze_enip(
 
     if start_time is not None and last_time is not None:
         analysis.duration = last_time - start_time
+        analysis.start_ts, analysis.end_ts = start_time, last_time
 
     analysis.packet_size_buckets = _bucketize(packet_sizes)
     analysis.payload_size_buckets = _bucketize(payload_sizes)

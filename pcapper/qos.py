@@ -687,10 +687,6 @@ def merge_qos_summaries(summaries: Iterable[QosSummary]) -> QosSummary:
         wlan_src_counts.update(getattr(item, "wlan_src_counts", Counter()))
         wlan_dst_counts.update(getattr(item, "wlan_dst_counts", Counter()))
         service_counts.update(item.service_counts)
-        flow_rows.extend(item.flow_rows)
-        wlan_flow_rows.extend(getattr(item, "wlan_flow_rows", []))
-        plaintext_hits.extend(item.plaintext_hits)
-        detections.extend(item.detections)
         errors.extend(item.errors)
         for key, values in (item.deterministic_checks or {}).items():
             for value in values or []:
@@ -705,6 +701,15 @@ def merge_qos_summaries(summaries: Iterable[QosSummary]) -> QosSummary:
             last_seen = (
                 item.last_seen if last_seen is None else max(last_seen, item.last_seen)
             )
+
+    # A row several captures share is listed once, its counts added; a claim
+    # of absence stands only when every capture makes it.
+    from .rollup import merge_records
+
+    flow_rows = merge_records([list(item.flow_rows or []) for item in items])
+    wlan_flow_rows = merge_records([list(getattr(item, "wlan_flow_rows", []) or []) for item in items])
+    plaintext_hits = merge_records([list(item.plaintext_hits or []) for item in items])
+    detections = merge_records([list(item.detections or []) for item in items])
 
     duration = (
         (last_seen - first_seen)
@@ -736,7 +741,7 @@ def merge_qos_summaries(summaries: Iterable[QosSummary]) -> QosSummary:
         plaintext_hits=plaintext_hits,
         detections=detections,
         deterministic_checks={k: list(dict.fromkeys(v)) for k, v in checks.items()},
-        errors=sorted(set(errors)),
+        errors=list(dict.fromkeys(e for e in errors if e)),
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration,

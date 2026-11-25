@@ -6,14 +6,12 @@ verbatim, only its location changed.
 
 from __future__ import annotations
 from collections import Counter, defaultdict
-from pathlib import Path
 from typing import Iterable
 from ..udp import UdpConversation, UdpSummary
 from ._transport import SIZE, http_counters, transport_report
 
 from ._common import (
     _apply_verbose_limit,
-    _limit_value,
 )
 
 
@@ -72,51 +70,6 @@ def _udp_bucket_ranges() -> list[tuple[str, int, int]]:
     ]
 
 
-def _approx_hist_stats(hist: Counter[str]) -> dict[str, float]:
-    if not hist:
-        return {"min": 0.0, "max": 0.0, "avg": 0.0, "p50": 0.0, "p95": 0.0}
-
-    ranges = _udp_bucket_ranges()
-    total = sum(hist.values())
-    if total <= 0:
-        return {"min": 0.0, "max": 0.0, "avg": 0.0, "p50": 0.0, "p95": 0.0}
-
-    min_val = 0.0
-    max_val = 0.0
-    for range_label, low, high in ranges:
-        if hist.get(range_label, 0) > 0:
-            min_val = float(low)
-            break
-    for range_label, low, high in reversed(ranges):
-        if hist.get(range_label, 0) > 0:
-            max_val = float(high)
-            break
-
-    def _quantile(target_pct: float) -> float:
-        target = total * (target_pct / 100.0)
-        running = 0
-        for range_label, low, high in ranges:
-            running += hist.get(range_label, 0)
-            if running >= target:
-                if range_label == ">9000":
-                    return float(low)
-                return float((low + high) / 2)
-        return max_val
-
-    weighted_sum = 0.0
-    for range_label, low, high in ranges:
-        mid = float(low) if range_label == ">9000" else float((low + high) / 2)
-        weighted_sum += mid * hist.get(range_label, 0)
-
-    return {
-        "min": min_val,
-        "max": max_val,
-        "avg": weighted_sum / total,
-        "p50": _quantile(50.0),
-        "p95": _quantile(95.0),
-    }
-
-
 def render_udp_rollup(
     summaries: Iterable[UdpSummary], limit: int = 12, verbose: bool = False
 ) -> str:
@@ -163,9 +116,6 @@ def render_udp_rollup(
     )
 
     detections: dict[tuple[str, str], dict[str, object]] = {}
-    artifact_counts: Counter[str] = Counter()
-
-    services_agg: dict[tuple[str, str, int, str], dict[str, object]] = {}
 
     for item in summary_list:
         client_counts.update(
@@ -253,38 +203,6 @@ def render_udp_rollup(
                 continue
             detections.setdefault((summary_text, details), det)
 
-        for artifact in item.artifacts:
-            artifact_counts[artifact] += 1
-
-        for svc in item.services:
-            service = str(svc.get("service", "-"))
-            endpoint = str(svc.get("endpoint", "-"))
-            port = int(svc.get("port", 0)) if str(svc.get("port", "")).isdigit() else 0
-            proto = str(svc.get("proto", "UDP"))
-            key = (service, endpoint, port, proto)
-            entry = services_agg.setdefault(
-                key,
-                {
-                    "service": service,
-                    "endpoint": endpoint,
-                    "port": port,
-                    "proto": proto,
-                    "count": 0,
-                    "client_count": 0,
-                    "clients": set(),
-                },
-            )
-            entry["count"] = int(entry["count"]) + int(svc.get("count", 0) or 0)
-            entry["client_count"] = int(entry["client_count"]) + int(
-                svc.get("client_count", 0) or 0
-            )
-            clients_text = str(svc.get("clients", "-"))
-            if clients_text and clients_text != "-":
-                for part in clients_text.split(","):
-                    value = part.strip()
-                    if value:
-                        entry["clients"].add(value)
-
         if item.first_seen is not None:
             if first_seen is None or item.first_seen < first_seen:
                 first_seen = item.first_seen
@@ -311,61 +229,38 @@ def render_udp_rollup(
             )
         )
 
-    services: list[dict[str, object]] = []
-    for entry in services_agg.values():
-        clients_list = sorted(entry["clients"])[: _limit_value(5)]
-        services.append(
-            {
-                "service": entry["service"],
-                "endpoint": entry["endpoint"],
-                "port": entry["port"],
-                "proto": entry["proto"],
-                "count": entry["count"],
-                "client_count": entry["client_count"],
-                "clients": ", ".join(clients_list) if clients_list else "-",
-            }
-        )
+    errors = list(dict.fromkeys(err for err in errors if err))
 
-    services.sort(key=lambda value: int(value.get("count", 0)), reverse=True)
-    errors = sorted({err for err in errors if err})
+    # Every field by the generic rules (verdict, checks, profiles, context
+    # included -- this rollup used to leave fifteen of them empty), then the
+    # ones merged better here: conversations by flow,
+    # size statistics weighted by each capture's UDP packets.
+    from dataclasses import replace as _replace
 
-    rollup = UdpSummary(
-        path=Path("ALL_PCAPS"),
+    from ..rollup import merge_generic_rollup_summaries, merge_sample_stats, rollup_path
+
+    base = merge_generic_rollup_summaries(summary_list) or summary_list[0]
+    weights = [item.udp_packets for item in summary_list]
+    rollup = _replace(
+        base,
+        path=rollup_path(len(summary_list)),
         total_packets=total_packets,
         total_bytes=total_bytes,
         udp_packets=udp_packets,
         udp_bytes=udp_bytes,
         udp_payload_bytes=udp_payload_bytes,
         conversations=sorted(
-            conversation_rows, key=lambda item: item.packets, reverse=True
+            conversation_rows, key=lambda item: (-item.packets, item.src_ip, item.dst_ip, item.src_port, item.dst_port)
         ),
-        client_counts=client_counts,
-        client_bytes=client_bytes,
-        server_counts=server_counts,
-        server_bytes=server_bytes,
-        port_counts=port_counts,
-        port_destinations=port_destinations,
-        endpoint_packets=endpoint_packets,
-        endpoint_bytes=endpoint_bytes,
-        packet_size_hist=packet_size_hist,
-        payload_size_hist=payload_size_hist,
-        packet_size_stats=_approx_hist_stats(packet_size_hist),
-        payload_size_stats=_approx_hist_stats(payload_size_hist),
+        packet_size_stats=merge_sample_stats([item.packet_size_stats for item in summary_list], weights),
+        payload_size_stats=merge_sample_stats([item.payload_size_stats for item in summary_list], weights),
         zero_payload_packets=zero_payload_packets,
-        http_requests=sum(item.http_requests for item in summary_list),
-        http_responses=sum(item.http_responses for item in summary_list),
-        http_methods=http_methods,
-        http_statuses=http_statuses,
-        http_urls=http_urls,
-        http_user_agents=http_user_agents,
-        http_files=http_files,
-        file_artifacts=file_artifacts,
-        services=services,
+        # services: the generic merge's, record by record (a service several
+        # captures share is one row; its clients recounted, not added up)
         detections=list(detections.values()),
-        artifacts=[
-            f"{name} ({count})"
-            for name, count in artifact_counts.most_common(_limit_value(20))
-        ],
+        # Artifacts already carry their counts ("Client: 10.4.14.102 (122)"):
+        # one line each, not another "(1)".
+        artifacts=list(dict.fromkeys(a for item in summary_list for a in (item.artifacts or []))),
         errors=errors,
         first_seen=first_seen,
         last_seen=last_seen,
