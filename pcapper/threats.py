@@ -81,6 +81,7 @@ from .s7 import analyze_s7
 from .safety import SAFETY_PORTS
 from .smb import analyze_smb
 from .snmp import analyze_snmp
+from .socks import analyze_socks
 from .ftp import analyze_ftp
 from .nfs import analyze_nfs
 from .malware import analyze_malware
@@ -3324,6 +3325,7 @@ def analyze_threats(
     quic_summary = _analyze(analyze_quic, show_status=show_status)
     edns_summary = _analyze(analyze_encrypted_dns, show_status=show_status)
     vpn_summary = _analyze(analyze_vpn, show_status=show_status)
+    socks_summary = _analyze(analyze_socks, show_status=show_status)
     smb_summary = _analyze(analyze_smb, show_status=show_status)
     rdp_summary = _analyze(analyze_rdp, show_status=show_status)
     winrm_summary = _analyze(analyze_winrm, show_status=show_status)
@@ -3464,6 +3466,7 @@ def analyze_threats(
     _append_detection_items(detections, "QUIC", quic_summary.detections)
     _append_detection_items(detections, "Encrypted DNS", edns_summary.detections)
     _append_detection_items(detections, "VPN", vpn_summary.detections)
+    _append_detection_items(detections, "SOCKS", socks_summary.detections)
     _append_detection_items(detections, "RDP", rdp_summary.detections)
     _append_detection_items(detections, "WinRM", winrm_summary.detections)
     _append_detection_items(detections, "WMIC", wmic_summary.detections)
@@ -3614,6 +3617,7 @@ def analyze_threats(
     errors.extend(quic_summary.errors)
     errors.extend(edns_summary.errors)
     errors.extend(vpn_summary.errors)
+    errors.extend(socks_summary.errors)
     errors.extend(smb_summary.errors)
     errors.extend(rdp_summary.errors)
     errors.extend(winrm_summary.errors)
