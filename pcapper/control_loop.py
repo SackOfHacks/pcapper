@@ -407,5 +407,5 @@ def merge_control_loop_summaries(
         source_counts=source_counts,
         destination_counts=destination_counts,
         detections=detections,
-        errors=sorted({err for err in errors if err}),
+        errors=list(dict.fromkeys(err for err in errors if err)),
     )

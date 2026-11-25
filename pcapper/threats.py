@@ -257,6 +257,12 @@ class ThreatSummary:
     benign_context: list[str] = None  # type: ignore[assignment]
 
 
+def _top_peers(counter: Counter, limit: int = 10) -> list[tuple[str, int]]:
+    """Busiest OT peers, ties by address: the same list for a capture and for
+    a -summarize merge (Counter.most_common breaks ties by insertion order)."""
+    return sorted(counter.items(), key=lambda kv: (-kv[1], str(kv[0])))[:limit]
+
+
 def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
     if not summaries:
         return ThreatSummary(
@@ -293,15 +299,12 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
     ot_peer_external: Counter[str] = Counter()
     risk_scores: list[int] = []
     risk_findings: list[str] = []
-    storyline: list[str] = []
     suricata_event_counts: Counter[str] = Counter()
     suricata_checks: dict[str, list[str]] = defaultdict(list)
     suricata_pcaps_scanned = 0
     deterministic_checks: dict[str, list[str]] = defaultdict(list)
     threat_hypotheses: list[dict[str, object]] = []
-    benign_context: list[str] = []
     for summary in summaries:
-        merged_detections.extend(summary.detections)
         merged_errors.extend(summary.errors)
         total_packets += summary.total_packets
         if summary.first_seen is not None:
@@ -327,8 +330,6 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
             risk_scores.append(summary.ot_risk_score)
         if summary.ot_risk_findings:
             risk_findings.extend(summary.ot_risk_findings)
-        if summary.storyline:
-            storyline.extend(summary.storyline)
         if summary.suricata_event_counts:
             suricata_event_counts.update(summary.suricata_event_counts)
         if summary.suricata_checks:
@@ -345,10 +346,13 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
             for item in summary.threat_hypotheses:
                 if isinstance(item, dict):
                     threat_hypotheses.append(dict(item))
-        if summary.benign_context:
-            benign_context.extend(str(v) for v in summary.benign_context)
 
-    deduped_errors = sorted(set(merged_errors))
+    # A finding several captures report is one finding (its counts added).
+    from .rollup import merge_records
+
+    merged_detections = merge_records([list(summary.detections or []) for summary in summaries])
+
+    deduped_errors = list(dict.fromkeys(e for e in merged_errors if e))
     duration = None
     if first_seen is not None and last_seen is not None:
         duration = max(0.0, last_seen - first_seen)
@@ -404,7 +408,25 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
         if len(deduped_hypotheses) >= 20:
             break
 
-    deduped_benign = _dedupe_evidence(benign_context, limit=10)
+    # Benign claims hold for the merge only when every capture makes them: a
+    # quiet capture's "no credential abuse burst" next to another capture's
+    # credential abuse was a contradiction.
+    from .rollup import merge_benign_claims
+
+    deduped_benign = _dedupe_evidence(merge_benign_claims([list(s.benign_context or []) for s in summaries]), limit=10)
+    merged_risk_findings = _dedupe_evidence(risk_findings, limit=6)
+    merged_risk_score = max(risk_scores) if risk_scores else 0
+    # One story of the merged detections, told as for one capture: the
+    # captures' stories concatenated and cut at six lines lost their middle.
+    merged_storyline = [] if not any(s.storyline for s in summaries) else _threats_storyline(
+        merged_detections,
+        dict(ot_protocol_counts),
+        merged_risk_score,
+        merged_risk_findings,
+        first_seen=first_seen,
+        last_seen=last_seen,
+        duration_seconds=duration,
+    )
 
     return ThreatSummary(
         path=Path("ALL_PCAPS"),
@@ -416,11 +438,11 @@ def merge_threats_summaries(summaries: list[ThreatSummary]) -> ThreatSummary:
         duration=duration,
         ot_protocol_counts=dict(ot_protocol_counts),
         public_ot_pairs=public_ot_pairs,
-        ot_peer_internal=ot_peer_internal.most_common(10),
-        ot_peer_external=ot_peer_external.most_common(10),
-        ot_risk_score=max(risk_scores) if risk_scores else 0,
-        ot_risk_findings=_dedupe_evidence(risk_findings, limit=6),
-        storyline=_dedupe_evidence(storyline, limit=6),
+        ot_peer_internal=_top_peers(ot_peer_internal),
+        ot_peer_external=_top_peers(ot_peer_external),
+        ot_risk_score=merged_risk_score,
+        ot_risk_findings=merged_risk_findings,
+        storyline=merged_storyline,
         suricata_metadata=merged_suricata_metadata,
         suricata_checks=merged_suricata_checks,
         suricata_event_counts=dict(suricata_event_counts),
@@ -5157,8 +5179,8 @@ def analyze_threats(
         duration=duration_seconds,
         ot_protocol_counts=dict(ot_protocol_counts),
         public_ot_pairs=sorted(public_ot_pairs),
-        ot_peer_internal=ot_peer_internal.most_common(10),
-        ot_peer_external=ot_peer_external.most_common(10),
+        ot_peer_internal=_top_peers(ot_peer_internal),
+        ot_peer_external=_top_peers(ot_peer_external),
         ot_risk_score=risk_score,
         ot_risk_findings=risk_findings,
         storyline=storyline,

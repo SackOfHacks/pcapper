@@ -986,11 +986,16 @@ def merge_powershell_summaries(
         ad_queries.update(summary.ad_queries)
         network_discovery.update(summary.network_discovery)
         plaintext_strings.update(summary.plaintext_strings)
-        detections.extend(summary.detections)
-        anomalies.extend(summary.anomalies)
-        artifacts.extend(summary.artifacts)
-        conversations.extend(summary.conversations)
         errors.extend(summary.errors)
+
+    # A row or string seen in several captures is listed once, its counts added.
+    from .rollup import merge_records
+
+    detections = merge_records([list(summary.detections or []) for summary in summary_list])
+    anomalies = merge_records([list(summary.anomalies or []) for summary in summary_list])
+    artifacts = merge_records([list(summary.artifacts or []) for summary in summary_list])
+    conversations = merge_records([list(summary.conversations or []) for summary in summary_list])
+    total_sessions = len(conversations)  # as the analyzer counts them
 
     duration_seconds = None
     if first_seen is not None and last_seen is not None:

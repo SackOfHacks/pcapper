@@ -184,7 +184,7 @@ def render_smb_summary(summary: SmbSummary, verbose: bool = False) -> str:
 
     # ---- reference (-v) --------------------------------------------------
     cmds = sorted(set(summary.requests) | set(summary.responses),
-                  key=lambda c: summary.requests.get(c, 0) + summary.responses.get(c, 0), reverse=True)
+                  key=lambda c: (-(summary.requests.get(c, 0) + summary.responses.get(c, 0)), str(c)))
     rep.section("Requests and responses", st.table(
         ["Command", "Requests", "Responses"],
         [[c, st.count(summary.requests.get(c, 0)), st.count(summary.responses.get(c, 0))] for c in cmds],

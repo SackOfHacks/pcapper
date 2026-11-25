@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from .utils import is_public_ip as _is_public_ip, extract_ascii_strings as _extract_ascii_strings
 from .utils import extract_utf16le_strings as _extract_utf16le_strings
+import hashlib
 import os
 import re
 from collections import Counter, defaultdict
@@ -114,6 +115,11 @@ class StringArtifact:
     count: int
 
 
+def string_digest(text: str) -> int:
+    """A stable 8-byte digest of ``text`` (``hash()`` differs per process)."""
+    return int.from_bytes(hashlib.blake2b(text.encode("utf-8", "surrogatepass"), digest_size=8).digest(), "big")
+
+
 @dataclass(frozen=True)
 class StringsSummary:
     path: Path
@@ -138,6 +144,14 @@ class StringsSummary:
     # How many distinct values each ranking had (urls/emails/domains keep
     # their top and their true bottom; top/bottom_strings 20 each).
     ranking_totals: Dict[str, int] = field(default_factory=dict)
+    # How many strings each listed host had in all: what hosts are ranked by.
+    client_string_totals: Dict[str, int] = field(default_factory=dict)
+    server_string_totals: Dict[str, int] = field(default_factory=dict)
+    # Every distinct string, as an 8-byte digest: -summarize counts the
+    # strings the captures have between them (adding unique counts counted
+    # each recurring string once per capture). Not exported.
+    string_digests: frozenset = field(default_factory=frozenset, repr=False, compare=False,
+                                      metadata={"export": False})
 
 
 def _get_ip_pair(pkt: Packet) -> Tuple[str, str]:
@@ -302,18 +316,14 @@ def analyze_strings(
         items = sorted(counter.items(), key=lambda kv: (kv[1], kv[0]))[:limit]
         return [StringArtifact(value=k, count=v) for k, v in items]
 
-    client_strings = {
-        ip: _top_artifacts(counter, 8)
-        for ip, counter in sorted(
-            client_map.items(), key=lambda item: sum(item[1].values()), reverse=True
-        )[:5]
-    }
-    server_strings = {
-        ip: _top_artifacts(counter, 8)
-        for ip, counter in sorted(
-            server_map.items(), key=lambda item: sum(item[1].values()), reverse=True
-        )[:5]
-    }
+    # Hosts with the most strings, ties by address; the totals ranked by are
+    # kept so a rollup ranks the hosts the same way.
+    client_ranked = sorted(client_map.items(), key=lambda item: (-sum(item[1].values()), item[0]))[:5]
+    client_strings = {ip: _top_artifacts(counter, 8) for ip, counter in client_ranked}
+    client_string_totals = {ip: sum(counter.values()) for ip, counter in client_ranked}
+    server_ranked = sorted(server_map.items(), key=lambda item: (-sum(item[1].values()), item[0]))[:5]
+    server_strings = {ip: _top_artifacts(counter, 8) for ip, counter in server_ranked}
+    server_string_totals = {ip: sum(counter.values()) for ip, counter in server_ranked}
 
     suspicious_details: List[Dict[str, object]] = []
     for value, count in suspicious_counter.most_common(20):
@@ -501,6 +511,7 @@ def analyze_strings(
         total_packets=total_packets,
         strings_found=sum(string_counter.values()),
         unique_strings=len(string_counter),
+        string_digests=frozenset(string_digest(text) for text in string_counter),
         top_strings=_top_artifacts(string_counter, 20),
         bottom_strings=_bottom_artifacts(string_counter, 20),
         suspicious_strings=_top_artifacts(suspicious_counter, 20),
@@ -512,6 +523,8 @@ def analyze_strings(
                         "strings": len(string_counter)},
         client_strings=client_strings,
         server_strings=server_strings,
+        client_string_totals=client_string_totals,
+        server_string_totals=server_string_totals,
         anomalies=anomalies,
         deterministic_checks=deterministic_checks,
         threat_hypotheses=threat_hypotheses,
@@ -556,7 +569,12 @@ def merge_strings_summaries(summaries: List[StringsSummary]) -> StringsSummary:
 
     total_packets = sum(item.total_packets for item in summaries)
     strings_found = sum(item.strings_found for item in summaries)
-    unique_strings = sum(item.unique_strings for item in summaries)
+    # Distinct strings across the captures, from their digests; the largest
+    # capture's count when a summary carries none.
+    if all(item.string_digests or not item.unique_strings for item in summaries):
+        unique_strings = len(frozenset().union(*(item.string_digests for item in summaries)))
+    else:
+        unique_strings = max(item.unique_strings for item in summaries)
 
     top_counter: Counter[str] = Counter()
     bottom_counter: Counter[str] = Counter()
@@ -566,6 +584,8 @@ def merge_strings_summaries(summaries: List[StringsSummary]) -> StringsSummary:
     domain_counter: Counter[str] = Counter()
     client_counters: Dict[str, Counter[str]] = defaultdict(Counter)
     server_counters: Dict[str, Counter[str]] = defaultdict(Counter)
+    client_totals: Counter[str] = Counter()
+    server_totals: Counter[str] = Counter()
 
     detail_map: Dict[str, Dict[str, object]] = {}
     anomalies: List[str] = []
@@ -590,8 +610,10 @@ def merge_strings_summaries(summaries: List[StringsSummary]) -> StringsSummary:
 
         for ip, items in summary.client_strings.items():
             client_counters[ip].update(_counter_from_artifacts(items))
+            client_totals[ip] += int((summary.client_string_totals or {}).get(ip, sum(a.count for a in items)))
         for ip, items in summary.server_strings.items():
             server_counters[ip].update(_counter_from_artifacts(items))
+            server_totals[ip] += int((summary.server_string_totals or {}).get(ip, sum(a.count for a in items)))
 
         for item in summary.suspicious_details:
             value = str(item.get("value", ""))
@@ -692,22 +714,12 @@ def merge_strings_summaries(summaries: List[StringsSummary]) -> StringsSummary:
             }
         )
 
-    client_strings = {
-        ip: _to_artifacts(counter, 8)
-        for ip, counter in sorted(
-            client_counters.items(),
-            key=lambda item: sum(item[1].values()),
-            reverse=True,
-        )[:5]
-    }
-    server_strings = {
-        ip: _to_artifacts(counter, 8)
-        for ip, counter in sorted(
-            server_counters.items(),
-            key=lambda item: sum(item[1].values()),
-            reverse=True,
-        )[:5]
-    }
+    # Hosts ranked by all their strings across the captures, as the analyzer
+    # ranks them (the listed top eight alone ranked them differently).
+    client_hosts = sorted(client_counters, key=lambda ip: (-client_totals[ip], ip))[:5]
+    server_hosts = sorted(server_counters, key=lambda ip: (-server_totals[ip], ip))[:5]
+    client_strings = {ip: _to_artifacts(client_counters[ip], 8) for ip in client_hosts}
+    server_strings = {ip: _to_artifacts(server_counters[ip], 8) for ip in server_hosts}
 
     threat_hypotheses = sorted(
         threat_rollup.values(),
@@ -720,8 +732,12 @@ def merge_strings_summaries(summaries: List[StringsSummary]) -> StringsSummary:
         total_packets=total_packets,
         strings_found=strings_found,
         unique_strings=unique_strings,
+        string_digests=frozenset().union(*(item.string_digests for item in summaries)),
         top_strings=_to_artifacts(top_counter, 20),
-        bottom_strings=_to_artifacts(bottom_counter, 20),
+        # The rarest 20, rarest first, as the analyzer keeps them (most_common
+        # picked the most common of the captures' rare strings, in reverse).
+        bottom_strings=[StringArtifact(value=k, count=v)
+                        for k, v in sorted(bottom_counter.items(), key=lambda kv: (kv[1], kv[0]))[:20]],
         suspicious_strings=_to_artifacts(suspicious_counter, 20),
         suspicious_details=suspicious_details,
         urls=[StringArtifact(value=k, count=v) for k, v in ranked_slice(url_counter.most_common(), 5000)],
@@ -735,6 +751,8 @@ def merge_strings_summaries(summaries: List[StringsSummary]) -> StringsSummary:
         },
         client_strings=client_strings,
         server_strings=server_strings,
+        client_string_totals={ip: client_totals[ip] for ip in client_hosts},
+        server_string_totals={ip: server_totals[ip] for ip in server_hosts},
         anomalies=anomalies,
         deterministic_checks=deterministic_checks,
         threat_hypotheses=threat_hypotheses,

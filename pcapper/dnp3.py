@@ -622,6 +622,10 @@ class Dnp3Anomaly:
 class Dnp3Analysis:
     path: Path
     duration: float = 0.0
+    # When the traffic starts and ends: -summarize spans them (a duration
+    # alone could only be added up, as if the captures never overlapped).
+    first_seen: float | None = None
+    last_seen: float | None = None
     total_packets: int = 0
     dnp3_packets: int = 0
 
@@ -1661,6 +1665,8 @@ def analyze_dnp3(
     return Dnp3Analysis(
         path=path,
         duration=duration,
+        first_seen=start_time,
+        last_seen=last_time,
         total_packets=total_packets,
         dnp3_packets=dnp3_packets,
         func_counts=func_counts,

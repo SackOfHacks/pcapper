@@ -129,7 +129,7 @@ def merge_safety_summaries(summaries: list[SafetySummary]) -> SafetySummary:
         destination_counts=destination_counts,
         service_counts=service_counts,
         detections=detections,
-        errors=sorted({err for err in errors if err}),
+        errors=list(dict.fromkeys(err for err in errors if err)),
         tristation_frames=frames,
         tristation_timeline=timeline[:_MAX_TIMELINE],
         command_events=events[:_MAX_TIMELINE],

@@ -20,7 +20,7 @@ __all__ = ["__version__"]
 # the banner still said 2.1.0, because the banner reads this attribute and the
 # wheel metadata read pyproject. tests/test_version.py fails if a second copy
 # is ever reintroduced.
-__version__ = "3.2.0"
+__version__ = "3.5.0"
 
 
 # --- Scapy/cryptography deprecation noise (always on) ------------------------
@@ -123,7 +123,12 @@ def _stable_most_common(self: Counter, n: int | None = None):  # type: ignore[ov
     if n >= len(items):
         items.sort(key=lambda item: (-_sort_key(item)[0], _sort_key(item)[1]))
         return items[:n]
-    return heapq.nlargest(n, items, key=_sort_key)
+    # The same order as the sort above -- most first, ties by key ascending.
+    # nlargest on (count, key) ranked ties by key *descending*, so a top-N cut
+    # from a larger counter ordered (and chose) its ties unlike the same
+    # entries ranked whole: a capture's top strings and a rollup of them
+    # disagreed.
+    return heapq.nsmallest(n, items, key=lambda item: (-_sort_key(item)[0], _sort_key(item)[1]))
 
 
 if os.environ.get("PCAPPER_DETERMINISTIC", "1") != "0":

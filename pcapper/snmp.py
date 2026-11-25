@@ -874,10 +874,6 @@ def merge_snmp_summaries(summaries: Iterable[SnmpSummary]) -> SnmpSummary:
                 continue
             det_seen.add(key)
             detections.append(item)
-        for item in summary.anomalies:
-            anomalies.append(item)
-        for item in summary.artifacts:
-            artifacts.append(item)
         for err in summary.errors:
             if err in err_seen:
                 continue
@@ -905,6 +901,12 @@ def merge_snmp_summaries(summaries: Iterable[SnmpSummary]) -> SnmpSummary:
                 current["last_seen"] is None or conv.last_seen > current["last_seen"]
             ):
                 current["last_seen"] = conv.last_seen
+
+    # A row or string seen in several captures is listed once, its counts added.
+    from .rollup import merge_records
+
+    anomalies = merge_records([list(summary.anomalies or []) for summary in summary_list])
+    artifacts = merge_records([list(summary.artifacts or []) for summary in summary_list])
 
     conversations = [
         SnmpConversation(

@@ -132,7 +132,7 @@ def merge_carve_summaries(summaries: list[CarveSummary]) -> CarveSummary:
         hits=hits[:DEFAULT_CARVE_LIMIT],
         extracted=extracted,
         detections=detections,
-        errors=sorted({err for err in errors if err}),
+        errors=list(dict.fromkeys(err for err in errors if err)),
     )
 
 

@@ -36,7 +36,7 @@ def render_ssh_summary(summary: SshSummary, limit: int = 12, verbose: bool = Fal
     outcomes = st.table(
         ["Client", "Failures", "Successes"],
         [[ip, st.count(fails.get(ip, 0)), st.count(oks.get(ip, 0))]
-         for ip in sorted(set(fails) | set(oks), key=lambda ip: fails.get(ip, 0), reverse=True)],
+         for ip in sorted(set(fails) | set(oks), key=lambda ip: (-fails.get(ip, 0), ip))],
         align="lrr", noun="client", max_rows=st.TOP_ROWS, tail=st.TOP_ROWS,
     )
     hassh = [["client", h, st.count(n), summary.client_hassh_strings.get(h, "")] for h, n in summary.client_hassh.most_common()]

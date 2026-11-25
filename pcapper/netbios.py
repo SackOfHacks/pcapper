@@ -341,6 +341,10 @@ class NetbiosSession:
 class NetbiosAnalysis:
     path: Path
     duration: float = 0.0
+    # When the traffic starts and ends: -summarize spans them (a duration
+    # alone could only be added up, as if the captures never overlapped).
+    first_seen: float | None = None
+    last_seen: float | None = None
     total_bytes: int = 0
     total_packets: int = 0
     hosts: Dict[str, NetbiosHost] = field(default_factory=dict)  # Keyed by IP
@@ -1379,6 +1383,7 @@ def analyze_netbios(
 
     if start_time is not None and last_time is not None:
         analysis.duration = max(0.0, last_time - start_time)
+        analysis.first_seen, analysis.last_seen = start_time, last_time
 
     # Post detections
     for src_ip, names in src_nbns_names.items():

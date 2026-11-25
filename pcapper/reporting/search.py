@@ -49,7 +49,7 @@ def render_search_summary(summary: SearchSummary) -> str:
 
 def render_search_rollup(summaries: Iterable[SearchSummary], limit: int = 20) -> str:
     items = list(summaries)
-    rep = st.Report("Search", f"ALL PCAPS ({len(items)})")
+    rep = st.Report("Search", f"ALL_PCAPS_{len(items)}")
     if not items:
         return rep.absent("search summaries to aggregate")
     queries = Counter(s.query for s in items)

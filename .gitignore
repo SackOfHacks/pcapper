@@ -54,7 +54,10 @@
 !tests/data/voip_attack.pcap
 !tests/data/voip_multiproto.pcap
 
-# 6. Belt and braces. Everything below is already ignored by rule 1; these
+# 6. Developer tools: Python only (pyproject ships the pcapper package alone).
+!tools/*.py
+
+# 7. Belt and braces. Everything below is already ignored by rule 1; these
 #    rules exist so that a future, too-broad allow entry (say `!tests/data/*`)
 #    still cannot commit key material, evidence or build output. Later rules
 #    win, so keep this block last — and never add a pattern here that matches

@@ -1642,7 +1642,7 @@ def merge_wlan_summaries(summaries: Iterable[WlanSummary]) -> WlanSummary:
         discovered_secrets=all_discovered_secrets,
         transfer_channels=all_transfer_channels,
         recovered_ip_artifacts=all_recovered_ip_artifacts,
-        errors=sorted(set(errors)),
+        errors=list(dict.fromkeys(e for e in errors if e)),
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration,

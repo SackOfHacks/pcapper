@@ -2525,9 +2525,6 @@ def merge_email_summaries(summaries: Iterable[EmailSummary]) -> EmailSummary:
             seen_detections.add(key)
             detections.append(det)
 
-        anomalies.extend(summary.anomalies)
-        artifacts.extend(summary.artifacts)
-        timeline_events.extend(summary.timeline_events)
 
         for key, values in (summary.deterministic_checks or {}).items():
             for value in values:
@@ -2565,6 +2562,13 @@ def merge_email_summaries(summaries: Iterable[EmailSummary]) -> EmailSummary:
             ):
                 current["last_seen"] = conv.last_seen
 
+    # A row or string seen in several captures is listed once, its counts added.
+    from .rollup import merge_records
+
+    anomalies = merge_records([list(summary.anomalies or []) for summary in summary_list])
+    artifacts = merge_records([list(summary.artifacts or []) for summary in summary_list])
+    timeline_events = merge_records([list(summary.timeline_events or []) for summary in summary_list])
+
     conversations = [
         EmailConversation(
             client_ip=key[0],
@@ -2580,8 +2584,8 @@ def merge_email_summaries(summaries: Iterable[EmailSummary]) -> EmailSummary:
     ]
     conversations.sort(key=lambda c: c.packets, reverse=True)
 
-    timeline_events.sort(
-        key=lambda item: (item.ts is None, item.ts or 0.0, item.packet or 0)
+    timeline_events = sorted(
+        timeline_events, key=lambda item: (item.ts is None, item.ts or 0.0, item.packet or 0)
     )
 
     # The rolled-up duration is the window the merged report spans (min

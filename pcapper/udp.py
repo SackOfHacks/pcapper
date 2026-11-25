@@ -583,10 +583,13 @@ def analyze_udp(
         if name:
             file_artifacts[str(name)] += 1
 
+    _CLIENT_LIST_LIMIT = 2000
     service_rows = []
-    for asset in getattr(services_summary, "assets", [])[:10]:
-        if asset.protocol.upper() != "UDP":
-            continue
+    # This protocol's ten busiest services. (The first ten assets of any
+    # protocol, by IP string, could leave none of these in the table.)
+    own_assets = [a for a in getattr(services_summary, "assets", []) if a.protocol.upper() == "UDP"]
+    own_assets.sort(key=lambda a: (-int(a.packets or 0), str(a.ip), int(a.port or 0)))
+    for asset in own_assets[:10]:
         clients_preview = ", ".join(sorted(asset.clients)[:5]) if asset.clients else "-"
         service_rows.append(
             {
@@ -597,6 +600,9 @@ def analyze_udp(
                 "endpoint": asset.ip,
                 "clients": clients_preview,
                 "client_count": len(asset.clients),
+                # Every client (to 2,000): a rollup counts the ones the captures
+                # share once; the preview above shows five.
+                "client_list": sorted(asset.clients)[:_CLIENT_LIST_LIMIT],
             }
         )
 
@@ -655,14 +661,13 @@ def analyze_udp(
 
     amp_hits = []
     for (client, server, port), volumes in amp_flows.items():
-        client_bytes = volumes.get("client", 0)
-        server_bytes = volumes.get("server", 0)
-        if server_bytes >= 10000 and (
-            client_bytes == 0 or server_bytes / max(client_bytes, 1) >= 5
-        ):
-            amp_hits.append(
-                f"{client} -> {server}:{port} ({server_bytes}/{client_bytes} bytes)"
-            )
+        # Not client_bytes/server_bytes: those names are the per-host byte
+        # counters of the summary, which this loop used to overwrite with
+        # the last flow's two integers.
+        sent = volumes.get("client", 0)
+        returned = volumes.get("server", 0)
+        if returned >= 10000 and (sent == 0 or returned / max(sent, 1) >= 5):
+            amp_hits.append(f"{client} -> {server}:{port} ({returned}/{sent} bytes)")
     if amp_hits:
         detections.append(
             {

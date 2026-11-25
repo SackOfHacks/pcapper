@@ -267,8 +267,8 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
     rtt = getattr(summary, "rtt_by_server", {}) or {}
     rep.section("Response times", st.table(
         ["Server", "Min ms", "p50 ms", "p95 ms", "Max ms"],
-        [[ip, f"{v.get('min', 0):.0f}", f"{v.get('p50', 0):.0f}", f"{v.get('p95', 0):.0f}", f"{v.get('max', 0):.0f}"]
-         for ip, v in sorted(rtt.items(), key=lambda kv: -kv[1].get("p95", 0))],
+        [[ip, st.stat(v, "min"), st.stat(v, "p50"), st.stat(v, "p95"), st.stat(v, "max")]
+         for ip, v in sorted(rtt.items(), key=lambda kv: (-kv[1].get("p95", 0), kv[0]))],
         align="lrrrr", max_rows=None,
     ), detail=True)
 
@@ -304,8 +304,8 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
                                f"{sparkline(series)}  " + ", ".join(f"{b}:{hist.get(b, 0)}" for b in _SIZE_BUCKETS)))
             if stats:
                 size_pairs.append((f"{label_text} stats",
-                                   f"min {stats.get('min', 0):.0f} / p50 {stats.get('p50', 0):.0f} / "
-                                   f"p95 {stats.get('p95', 0):.0f} / max {stats.get('max', 0):.0f}"))
+                                   f"min {st.stat(stats, 'min')} / p50 {st.stat(stats, 'p50')} / "
+                                   f"p95 {st.stat(stats, 'p95')} / max {st.stat(stats, 'max')}"))
     rep.section("Sizes", st.kv(size_pairs), detail=True)
 
     durations: list[tuple[str, str]] = []
@@ -319,15 +319,19 @@ def render_modbus_summary(summary: "ModbusAnalysis", verbose: bool = False) -> s
     return rep.render()
 
 
-def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
+def merge_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> "ModbusAnalysis | None":
     """Modbus across several captures (-summarize): the per-capture data merged
     into one summary and rendered exactly like a single capture."""
     from dataclasses import replace
     from pathlib import Path
 
+    from ..rollup import earliest_per_key, merge_sample_stats, merge_stats_by_key
+
+    from ..rollup import merge_records
+
     summary_list = [s for s in summaries if s]
     if not summary_list:
-        return ""
+        return None
 
     def _merged_counter(name: str) -> Counter:
         total: Counter = Counter()
@@ -346,14 +350,14 @@ def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
         for key, counter in (item.flow_duration_buckets or {}).items():
             flow_duration_buckets[key].update(counter)
         for key, rec in (getattr(item, "register_map", {}) or {}).items():
-            register_map[f"{item.path.name}:{key}"] = rec
+            register_map[key] = _merge_register_record(register_map.get(key), rec)
         pairing.update(getattr(item, "pairing", {}) or {})
         errors += [e for e in item.errors if e not in errors]
 
     first = summary_list[0]
     merged = replace(
         first,
-        path=Path(f"ALL PCAPS ({len(summary_list)})"),
+        path=Path(f"ALL_PCAPS_{len(summary_list)}"),
         duration=sum(s.duration for s in summary_list),
         total_packets=sum(s.total_packets for s in summary_list),
         modbus_packets=sum(s.modbus_packets for s in summary_list),
@@ -372,18 +376,74 @@ def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
         service_endpoints=dict(service_endpoints),
         packet_size_hist=_merged_counter("packet_size_hist"),
         payload_size_hist=_merged_counter("payload_size_hist"),
-        packet_size_stats={},  # percentiles do not merge
-        payload_size_stats={},
+        packet_size_stats=merge_sample_stats([s.packet_size_stats for s in summary_list],
+                                             [s.modbus_packets for s in summary_list]),
+        payload_size_stats=merge_sample_stats([s.payload_size_stats for s in summary_list],
+                                              [s.modbus_packets for s in summary_list]),
         flow_duration_buckets=dict(flow_duration_buckets),
         register_map=register_map,
-        session_cadence=[c for s in summary_list for c in (s.session_cadence or [])],
-        rtt_by_server={},  # percentiles do not merge
+        session_cadence=merge_records([list(s.session_cadence or []) for s in summary_list]),
+        rtt_by_server=merge_stats_by_key(s.rtt_by_server for s in summary_list),
         pairing=dict(pairing),
-        messages=[m for s in summary_list for m in s.messages],
-        artifacts=[a for s in summary_list for a in s.artifacts],
-        anomalies=[a for s in summary_list for a in s.anomalies],
-        value_changes=[c for s in summary_list for c in (s.value_changes or [])],
-        write_targets=[w for s in summary_list for w in (getattr(s, "write_targets", None) or [])],
+        messages=merge_records([list(s.messages) for s in summary_list]),
+        artifacts=merge_records([list(s.artifacts) for s in summary_list]),
+        anomalies=merge_records([list(s.anomalies) for s in summary_list]),
+        value_changes=merge_records([list(s.value_changes or []) for s in summary_list]),
+        write_targets=merge_records([list(getattr(s, "write_targets", None) or []) for s in summary_list]),
         errors=errors,
+        first_seen=earliest_per_key(s.first_seen for s in summary_list),
+        register_ranges=_merge_register_ranges(summary_list),
     )
-    return render_modbus_summary(merged)
+    from ..rollup import merge_window
+
+    merge_window(merged, summary_list)
+    return merged
+
+
+def _merge_register_record(current: dict | None, rec: dict) -> dict:
+    """One server/unit's register activity in two captures as one row: reads
+    and writes added, ranges widened, hot addresses added up. A distinct
+    address count is at least each capture's and the hot addresses seen."""
+    if current is None:
+        return dict(rec)
+    out = dict(current)
+    for name in ("read_count", "write_count"):
+        out[name] = int(current.get(name, 0) or 0) + int(rec.get(name, 0) or 0)
+    for name, pick in (("read_min", min), ("write_min", min), ("read_max", max), ("write_max", max)):
+        values = [v for v in (current.get(name), rec.get(name)) if v is not None]
+        out[name] = pick(values) if values else None
+    for hot, distinct in (("read_hot", "distinct_read_addrs"), ("write_hot", "distinct_write_addrs")):
+        counts: Counter = Counter()
+        for entries in (current.get(hot) or [], rec.get(hot) or []):
+            for address, count in entries:
+                counts[address] += int(count)
+        out[hot] = counts.most_common(5)
+        out[distinct] = max(int(current.get(distinct, 0) or 0), int(rec.get(distinct, 0) or 0), len(counts))
+    return out
+
+
+def _merge_register_ranges(summary_list: list) -> dict:
+    """Register value ranges of several captures: min and max with the
+    time each was first seen, sample counts summed."""
+    merged: dict = {}
+    for item in summary_list:
+        for key, entry in (getattr(item, "register_ranges", None) or {}).items():
+            low, high, count = entry[0], entry[1], entry[2]
+            low_ts = entry[3] if len(entry) > 3 else 0.0
+            high_ts = entry[4] if len(entry) > 4 else 0.0
+            current = merged.get(key)
+            if current is None:
+                merged[key] = [low, high, count, low_ts, high_ts]
+                continue
+            if low < current[0] or (low == current[0] and low_ts and (not current[3] or low_ts < current[3])):
+                current[0], current[3] = low, low_ts
+            if high > current[1] or (high == current[1] and high_ts and (not current[4] or high_ts < current[4])):
+                current[1], current[4] = high, high_ts
+            current[2] += count
+    return merged
+
+
+def render_modbus_rollup(summaries: Iterable["ModbusAnalysis"]) -> str:
+    """Modbus across several captures (-summarize), rendered like one capture."""
+    merged = merge_modbus_rollup(summaries)
+    return render_modbus_summary(merged) if merged is not None else ""

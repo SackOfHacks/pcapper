@@ -4,7 +4,7 @@
 ![CI](https://github.com/SackOfHacks/pcapper/actions/workflows/ci.yml/badge.svg)
 ![Tests](https://img.shields.io/badge/tests-1141%20passing-1B5E20)
 ![Analyzers](https://img.shields.io/badge/analyzers-120%2B-3D5A80)
-![Version](https://img.shields.io/badge/release-v3.2.0-7C3AED)
+![Version](https://img.shields.io/badge/release-v3.5.0-7C3AED)
 ![License](https://img.shields.io/badge/license-MIT-6C757D)
 ![CLI](https://img.shields.io/badge/cli-incident--grade-1B5E20)
 ![OT/ICS](https://img.shields.io/badge/ot%2Fics-ready-3D5A80)
@@ -391,7 +391,9 @@ CRIT  Pivot    IT->OT pivot: remote access then OT command  45.137.21.9(1)  10.0
   source) and subsequently issued a Modbus command to 10.0.0.20.   [ATT&CK T0859 / T0855]
 ```
 
-## Current Release: v3.2.0
+## Current Release: v3.5.0
+
+v3.5.0 makes `-summarize` say what the captures say together. Conversations, hosts, services and findings that several captures share are listed once with their traffic added; hosts, flows, unique strings and a service's clients are counted over the captures, not once per capture; durations span the captures; and a rollup no longer depends on the order the captures were named in. A capture without the traffic changes nothing, and a capture merged with its own copy lists every row once -- checked over every analysis by the new `tools/rollup_check.py`. Along the way, a report no longer depends on the run (tied rows came out in a different order each time), and the TCP and UDP services tables list each protocol's busiest services. See the [changelog](CHANGELOG.md).
 
 v3.2.0 makes `--baseline-diff` read like an incident report. Deviations are correlated per actor into incidents -- a rogue OT master and the register values it changed, adversary-in-the-middle attributed to the IP behind the intruding MAC, remote access to an OT asset -- each with when it ran, its ATT&CK for ICS techniques, the evidence and the pcapper command to run next. A timeline orders every deviation by first sighting, and broadcast/multicast/link-local chatter is kept out of the way (`-v` shows it). On the public Coimbra Modbus captures the lead incident is the attack, and its span matches the documented 5-minute attack window. See the [changelog](CHANGELOG.md).
 

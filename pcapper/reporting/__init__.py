@@ -447,7 +447,6 @@ from .tls import (
     render_tls_summary,
 )
 from .udp import (
-    _approx_hist_stats,
     _udp_bucket_ranges,
     render_udp_rollup,
     render_udp_summary,

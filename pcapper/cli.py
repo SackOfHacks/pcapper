@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import atexit
-import copy
 import dataclasses
 import functools
 import difflib
@@ -15,7 +14,6 @@ import os
 import re
 import sys
 import tempfile
-from collections import Counter
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -139,6 +137,7 @@ from .ot_commands import OtControlConfig, analyze_ot_commands, load_ot_control_c
 from . import progress
 from .progress import display_session
 from .pcap_cache import (
+    capture_start_time,
     clear_forced_packet_view,
     estimated_packets,
     fits_in_memory,
@@ -150,7 +149,15 @@ from .pcap_cache import (
     max_cache_packets,
     set_forced_packet_view,
 )
-from .industrial_helpers import merge_size_buckets
+from .rollup import (  # noqa: F401 - the underscored names are imported from here by tests
+    merge_generic_rollup_summaries,
+    rollup_fix_duration as _rollup_fix_duration,
+    rollup_numeric_kind as _rollup_numeric_kind,
+    rollup_path,
+    rollup_set as _rollup_set,
+    rollup_time_mode as _rollup_time_mode,
+    tag_capture_records as _tag_capture_records,
+)
 from .pcapmeta import analyze_pcapmeta
 from .pccc import analyze_pccc
 from .pcworx import analyze_pcworx
@@ -652,94 +659,6 @@ _SIMPLE_STEP_ANALYZERS: dict[str, tuple[str, ...]] = {
     "wmic": ("analyze_wmic",),
     "yokogawa": ("analyze_yokogawa",),
 }
-
-
-_ROLLUP_MIN_FIELDS = ("first_seen", "first_ts", "first_time", "start_ts", "start_time", "earliest")
-_ROLLUP_MAX_FIELDS = ("last_seen", "last_ts", "last_time", "end_ts", "end_time", "latest")
-
-
-def _rollup_time_mode(field_name: str | None) -> str | None:
-    """'min'/'max' for fields holding a first/last timestamp (or a map of
-    them): merging rollups must keep the earliest/latest, not add times up."""
-    name = str(field_name or "")
-    if name in _ROLLUP_MIN_FIELDS:
-        return "min"
-    if name in _ROLLUP_MAX_FIELDS:
-        return "max"
-    return None
-
-
-# Numeric fields that are not counts: adding them across captures gives
-# nonsense (two link-type-1 captures became "LINKTYPE_2", a snaplen doubled).
-_ROLLUP_MAX_SEGMENTS = frozenset({
-    "linktype", "snaplen", "version", "ratio", "rate", "score", "avg", "average", "mean", "median",
-    "percent", "pct", "confidence", "ttl", "mtu", "unique", "max", "peak", "level", "entropy",
-})
-
-
-def _rollup_numeric_kind(field_name: str | None) -> str:
-    """How a rollup combines a numeric field: "sum" for counts, "max" for
-    values that are not additive, "min" for minimums."""
-    segments = set(str(field_name or "").lower().split("_"))
-    if ("min" in segments or "minimum" in segments) and "per" not in segments:  # not "..._per_min"
-        return "min"
-    if segments & _ROLLUP_MAX_SEGMENTS or str(field_name or "").lower().endswith("_port"):
-        return "max"
-    return "sum"
-
-
-def _rollup_set(obj: object, name: str, value: object) -> None:
-    """Set a field on a rollup's merged copy, frozen dataclasses included: the
-    copy belongs to the rollup, and a silently refused setattr used to send
-    every frozen summary (DNS, TLS, CTF, the OT protocols ...) to the generic
-    rollup instead of its own report."""
-    try:
-        setattr(obj, name, value)
-    except (AttributeError, TypeError):
-        object.__setattr__(obj, name, value)
-
-
-def _tag_capture_records(summary: object) -> object:
-    """Mark each per-capture record (a dict in a list field) of a summary
-    copy with its capture's name, so merged rows such as CTF candidates keep
-    saying where their packet numbers come from."""
-    name = str(getattr(getattr(summary, "path", None), "name", "") or "")
-    if not name or not hasattr(summary, "__dict__"):
-        return summary
-    for value in vars(summary).values():
-        if isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    item.setdefault("capture", name)
-    return summary
-
-
-def _rollup_fix_duration(summary: object) -> None:
-    """Duration of a merged summary from its merged first/last times: the
-    span the captures cover, not the sum of their durations. Summaries pair
-    their time fields with either duration name (CTF keeps first_seen /
-    last_seen with duration_seconds), so the span goes to whichever exists."""
-    for start_name, end_name in (
-        ("start_ts", "end_ts"),
-        ("first_seen", "last_seen"),
-        ("start_time", "end_time"),
-        ("first_ts", "last_ts"),
-    ):
-        start = getattr(summary, start_name, None)
-        end = getattr(summary, end_name, None)
-        if not (isinstance(start, (int, float)) and isinstance(end, (int, float))):
-            continue
-        if isinstance(start, bool) or isinstance(end, bool):
-            continue
-        span = max(0.0, float(end) - float(start))
-        for duration_name in ("duration_seconds", "duration"):
-            current = getattr(summary, duration_name, False)
-            if current is None or (isinstance(current, (int, float)) and not isinstance(current, bool)):
-                try:
-                    _rollup_set(summary, duration_name, span)
-                except Exception:
-                    pass
-        return
 
 
 # --split: one large capture analysed as N byte windows in N processes, each
@@ -1347,15 +1266,14 @@ def _quote_of_the_day() -> str:
 
 
 def _build_run_header() -> str:
-    """The lines an analysis run starts with: the name and version, and the
-    quote of the day under them (the ASCII-art banner stays for `pcapper`
-    without arguments and for -h)."""
+    """The line an analysis run starts with: the name and version. The quote
+    of the day is shown only on the full ASCII-art banner (`pcapper` without
+    arguments, and -h)."""
     from .coloring import ANSI_CYAN, colorize
 
     product = colorize("PCAPPER", ANSI_CYAN, bold=True)
     rest = colorize(f"v{__version__} · PCAP forensics and threat hunting for IT and OT/ICS", "\x1b[37m", dim=True)
-    quote = colorize(f'Quote of the day: "{_quote_of_the_day()}"', "\x1b[37m", dim=True)
-    return f"{product} {rest}\n{quote}"
+    return f"{product} {rest}"
 
 
 def _build_banner() -> str:
@@ -2992,6 +2910,17 @@ def _handle_help_request(
     return True
 
 
+def _stamp_rollup(merged: object, count: int) -> object:
+    """Name a merged summary after its capture count ("all captures (n)")."""
+    path = getattr(merged, "path", None)
+    if path is not None and str(getattr(path, "name", path)).startswith("ALL_PCAPS"):
+        try:
+            _rollup_set(merged, "path", rollup_path(count))
+        except Exception:  # noqa: BLE001 - the plain name still renders
+            pass
+    return merged
+
+
 def _finish_baselines(
     parts: list[CaptureParts],
     *,
@@ -3253,6 +3182,9 @@ def _analyze_paths(
     # Keep single-pcap behavior identical with/without -summarize.
     # Rollup rendering is only meaningful when multiple pcaps are supplied.
     summarize_rollups = summarize and len(paths) > 1
+    if summarize_rollups:
+        starts = {str(p): capture_start_time(p) for p in paths}
+        paths = sorted(paths, key=lambda p: (starts[str(p)] is None, starts[str(p)] or 0.0, Path(p).name))
     # --baseline / --baseline-diff alone print their own report, not the
     # capture summary a bare run falls back to.
     baseline_requested = baseline_out is not None or bool(baseline_ref)
@@ -5139,157 +5071,6 @@ def _analyze_paths(
             merged_base = merge_pcap_summaries(base_rollups)
             print(render_summary(merged_base, protocol_limit=protocol_limit))
 
-        def _dedupe_sequence(values: list[object]) -> list[object]:
-            deduped: list[object] = []
-            seen: set[tuple[str, str]] = set()
-            for value in values:
-                try:
-                    key = ("hash", str(hash(value)))
-                except Exception:
-                    key = ("repr", repr(value))
-                if key in seen:
-                    continue
-                seen.add(key)
-                deduped.append(value)
-            return deduped
-
-        def _merge_generic_rollup_value(
-            left: object, right: object, field_name: str | None = None
-        ) -> object:
-            if right is None:
-                return left
-            if left is None:
-                return copy.deepcopy(right)
-
-            if isinstance(left, Counter) and isinstance(right, Counter):
-                merged_counter = Counter(left)
-                merged_counter.update(right)
-                return merged_counter
-
-            time_mode = _rollup_time_mode(field_name)
-            if isinstance(left, dict) and isinstance(right, dict):
-                merged_dict = copy.deepcopy(left)
-                for key, value in right.items():
-                    # Values under a first_seen/last_seen map keep its min/max
-                    # rule; anything else merges by its own key.
-                    nested = field_name if time_mode else str(key)
-                    if key in merged_dict:
-                        merged_dict[key] = _merge_generic_rollup_value(
-                            merged_dict[key], value, nested
-                        )
-                    else:
-                        merged_dict[key] = copy.deepcopy(value)
-                return merged_dict
-
-            if isinstance(left, list) and isinstance(right, list):
-                if str(field_name or "").endswith("size_buckets"):
-                    try:
-                        return merge_size_buckets([left, right])
-                    except Exception:
-                        pass
-                merged_list = list(left) + list(right)
-                if field_name in {
-                    "errors",
-                    "warnings",
-                    "notes",
-                    "benign_context",
-                    "indicators",
-                }:
-                    return _dedupe_sequence(merged_list)
-                return merged_list
-
-            if (
-                time_mode
-                and isinstance(left, (int, float))
-                and isinstance(right, (int, float))
-                and not isinstance(left, bool)
-                and not isinstance(right, bool)
-            ):
-                return min(left, right) if time_mode == "min" else max(left, right)
-
-            if isinstance(left, set) and isinstance(right, set):
-                return set(left) | set(right)
-
-            if isinstance(left, bool) and isinstance(right, bool):
-                return bool(left) or bool(right)
-
-            if (
-                isinstance(left, (int, float))
-                and isinstance(right, (int, float))
-                and not isinstance(left, bool)
-                and not isinstance(right, bool)
-            ):
-                kind = _rollup_numeric_kind(field_name)
-                if kind == "min":
-                    return min(left, right)
-                if kind == "max":
-                    return max(left, right)
-                return left + right
-
-            if isinstance(left, str) and isinstance(right, str):
-                return left if left else right
-
-            if hasattr(left, "__dict__") and hasattr(right, "__dict__"):
-                merged_object = copy.deepcopy(left)
-                if _merge_generic_rollup_object(merged_object, right):
-                    return merged_object
-                return left
-
-            return left
-
-        def _merge_generic_rollup_object(left_obj: object, right_obj: object) -> bool:
-            if not hasattr(left_obj, "__dict__") or not hasattr(right_obj, "__dict__"):
-                return False
-            try:
-                right_fields = vars(right_obj)
-            except Exception:
-                return False
-            for field_name, right_value in right_fields.items():
-                if field_name == "path":
-                    continue
-                try:
-                    left_value = getattr(left_obj, field_name, None)
-                    merged_value = _merge_generic_rollup_value(
-                        left_value, right_value, field_name
-                    )
-                    _rollup_set(left_obj, field_name, merged_value)
-                except Exception:
-                    continue
-            return True
-
-        def _merge_generic_rollup_summaries(values: list[object]) -> object | None:
-            if not values:
-                return None
-            if len(values) == 1:
-                merged_single = copy.deepcopy(values[0])
-                if hasattr(merged_single, "path"):
-                    try:
-                        _rollup_set(merged_single, "path", Path("ALL_PCAPS"))
-                    except Exception:
-                        pass
-                return merged_single
-            merged = _tag_capture_records(copy.deepcopy(values[0]))
-            for item in values[1:]:
-                if not _merge_generic_rollup_object(merged, _tag_capture_records(copy.deepcopy(item))):
-                    return None
-            if hasattr(merged, "path"):
-                try:
-                    _rollup_set(merged, "path", Path("ALL_PCAPS"))
-                except Exception:
-                    pass
-            if hasattr(merged, "errors"):
-                try:
-                    errors = list(getattr(merged, "errors", []) or [])
-                    _rollup_set(merged, "errors", _dedupe_sequence(errors))
-                except Exception:
-                    pass
-            _rollup_fix_duration(merged)
-            if len(values) > 1:
-                merged_path_name = str(getattr(getattr(merged, "path", None), "name", ""))
-                if merged_path_name != "ALL_PCAPS":
-                    return None
-            return merged
-
         rollup_renderer_aliases = {
             "lldp": "render_lldp_dcp_summary",
         }
@@ -5617,9 +5398,20 @@ def _analyze_paths(
                         _spec, s, verbose=verbose
                     ),
                 )
-        ordered_rollups = [step for step in ordered_steps if rollups.get(step)]
+        # Every rollup in the order its step was asked for, as the
+        # single-capture reports print: Modbus, DNP3 and VLAN used to come
+        # after all the others.
+        own_lists = {"modbus": modbus_rollups if show_modbus else [], "dnp3": dnp3_rollups if show_dnp3 else []}
+        ordered_rollups = [step for step in ordered_steps if rollups.get(step) or own_lists.get(step)]
         for step in ordered_rollups:
-            if step in ("modbus", "dnp3", "vlan"):
+            if step == "vlan":
+                print(render_vlan_rollup(rollups["vlan"], verbose=verbose))
+                continue
+            if step == "modbus":
+                print(render_modbus_rollup(modbus_rollups))
+                continue
+            if step == "dnp3":
+                print(render_dnp3_rollup(dnp3_rollups))
                 continue
             if rollups.get(step):
                 if step == "search":
@@ -5632,10 +5424,10 @@ def _analyze_paths(
                     print(render_udp_rollup(rollups[step], verbose=verbose))
                 elif step in merge_handlers:
                     merge_fn, render_fn = merge_handlers[step]
-                    merged = merge_fn(rollups[step])
+                    merged = _stamp_rollup(merge_fn(rollups[step]), len(rollups[step]))
                     print(render_fn(merged))
                 else:
-                    merged = _merge_generic_rollup_summaries(rollups[step])
+                    merged = merge_generic_rollup_summaries(rollups[step])
                     if merged is not None:
                         fallback_merged_rollups[step] = merged
                         rendered = _render_auto_rollup(step, merged)
@@ -5654,28 +5446,39 @@ def _analyze_paths(
                             )
                         )
         # Each report opens with its own blank line: no separators here.
-        if rollups.get("vlan"):
-            print(render_vlan_rollup(rollups["vlan"], verbose=verbose))
-        if show_modbus and modbus_rollups:
-            print(render_modbus_rollup(modbus_rollups))
-        if show_dnp3 and dnp3_rollups:
-            print(render_dnp3_rollup(dnp3_rollups))
         if export_json_path or export_csv_path or export_sqlite_path:
             merged_summaries: dict[str, object] = {}
             if base_rollups:
                 merged_summaries["base"] = merge_pcap_summaries(base_rollups)
             for key, values in rollups.items():
-                if key in plugin_lookup and plugin_lookup[key].merge:
+                if key == "pcapmeta":
+                    # File metadata describes each capture (as printed
+                    # above): exported per capture, never blended.
+                    merged_summaries[key] = list(values)
+                elif key in plugin_lookup and plugin_lookup[key].merge:
                     spec = plugin_lookup[key]
                     merged_summaries[spec.export_key or spec.name] = spec.merge(values)
                 elif key in merge_handlers:
                     merge_fn, _render_fn = merge_handlers[key]
-                    merged_summaries[key] = merge_fn(values)
+                    merged_summaries[key] = _stamp_rollup(merge_fn(values), len(values))
                 elif key in fallback_merged_rollups:
                     merged_summaries[key] = fallback_merged_rollups[key]
                 else:
-                    merged = _merge_generic_rollup_summaries(values)
+                    merged = merge_generic_rollup_summaries(values)
                     merged_summaries[key] = merged if merged is not None else values
+            # Modbus and DNP3 keep their own rollup lists (above); without
+            # these the merged export silently lacked both.
+            from .reporting.dnp3 import merge_dnp3_rollup
+            from .reporting.modbus import merge_modbus_rollup
+
+            if show_modbus and modbus_rollups:
+                merged_modbus = merge_modbus_rollup(modbus_rollups)
+                if merged_modbus is not None:
+                    merged_summaries["modbus"] = merged_modbus
+            if show_dnp3 and dnp3_rollups:
+                merged_dnp3 = merge_dnp3_rollup(dnp3_rollups)
+                if merged_dnp3 is not None:
+                    merged_summaries["dnp3"] = merged_dnp3
             if rules_rollups:
                 merged_summaries["rules"] = merge_rules_summaries(rules_rollups)
             if correlation_summary:

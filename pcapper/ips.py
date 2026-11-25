@@ -592,10 +592,6 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
             count = int(item.get("count", 0) or 0)
             rep_hits[(rep_type, fp, label)] += count
 
-        tls_cert_risks.extend(summary.tls_cert_risks)
-        suspicious_port_profiles.extend(summary.suspicious_port_profiles)
-        lateral_movement_scores.extend(summary.lateral_movement_scores)
-        intel_findings.extend(summary.intel_findings)
 
         for detection in summary.detections:
             # A per-capture share says nothing about the merged traffic;
@@ -686,6 +682,15 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
             ):
                 entry["last_seen"] = conv.last_seen
 
+    # A row several captures share is listed once, its counts added; a claim
+    # of absence stands only when every capture makes it.
+    from .rollup import merge_records
+
+    tls_cert_risks = merge_records([list(summary.tls_cert_risks or []) for summary in summary_list])
+    suspicious_port_profiles = merge_records([list(summary.suspicious_port_profiles or []) for summary in summary_list])
+    lateral_movement_scores = merge_records([list(summary.lateral_movement_scores or []) for summary in summary_list])
+    intel_findings = merge_records([list(summary.intel_findings or []) for summary in summary_list])
+
     endpoint_rows: list[IpEndpoint] = []
     for ip_text, data in endpoint_map.items():
         endpoint_rows.append(
@@ -724,6 +729,11 @@ def merge_ips_summaries(summaries: Iterable[IpSummary]) -> IpSummary:
     concentration = _concentration_detection(endpoint_rows, total_bytes)
     if concentration is not None:
         detections.append(concentration)
+    # "No IP traffic detected" from a quiet capture is not true of the merge.
+    from .rollup import drop_partial_absences
+
+    keep = {id(d) for d in drop_partial_absences([list(s.detections) for s in summary_list])}
+    detections = [d for d in detections if not d.get("absence") or id(d) in keep]
 
     ipv4_count = 0
     ipv6_count = 0
@@ -2007,6 +2017,7 @@ def analyze_ips(
                 "severity": "info",
                 "summary": "No IP traffic detected",
                 "details": "No IPv4/IPv6 packets observed in capture.",
+                "absence": True,
             }
         )
     else:

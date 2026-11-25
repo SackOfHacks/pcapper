@@ -332,5 +332,5 @@ def merge_rules_summaries(summaries: Iterable[RulesSummary]) -> RulesSummary:
         total_rules=total_rules,
         total_matches=total_matches,
         hits=hits,
-        errors=sorted({err for err in errors if err}),
+        errors=list(dict.fromkeys(err for err in errors if err)),
     )

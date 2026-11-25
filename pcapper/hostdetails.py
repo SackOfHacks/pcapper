@@ -30,6 +30,8 @@ from .webrequests import analyze_webrequests
 _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _SEVERITY_WEIGHT = {"critical": 8, "high": 5, "warning": 3, "medium": 3, "info": 1}
 
+_NO_OS_EVIDENCE = "no reliable passive OS indicators observed"
+
 
 def _detection_pair_ips(detection: dict[str, object], field: str) -> list[str]:
     out: list[str] = []
@@ -437,7 +439,7 @@ def _infer_operating_system(
             _add_evidence(f"hostname:{hostname} -> network/appliance marker")
 
     if not os_scores:
-        return "Unknown", ["no reliable passive OS indicators observed"]
+        return "Unknown", [_NO_OS_EVIDENCE]
 
     # If OT/ICS/embedded indicators exist and no strong desktop/server OS dominates,
     # prefer the OT-oriented classification for operationally useful triage.
@@ -727,7 +729,9 @@ def merge_hostdetails_summaries(
         for row in summary.evidence_anchors or []:
             if row not in evidence_anchors:
                 evidence_anchors.append(dict(row))
-        if int(summary.host_verdict_score or 0) > host_verdict_score:
+        # The first capture's own assessment is the baseline (its wording and
+        # reasons), replaced by any capture that scores higher.
+        if summary is summary_list[0] or int(summary.host_verdict_score or 0) > host_verdict_score:
             host_verdict_score = int(summary.host_verdict_score or 0)
             host_verdict = str(summary.host_verdict or host_verdict)
             host_confidence = str(summary.host_confidence or host_confidence)
@@ -854,7 +858,9 @@ def merge_hostdetails_summaries(
         port_filter=port_filter,
         search_query=search_query,
         operating_system=os_counter.most_common(1)[0][0] if os_counter else "Unknown",
-        os_evidence=os_evidence[:10],
+        # A quiet capture's "no reliable passive OS indicators" is not true
+        # of the merge once another capture had some.
+        os_evidence=[e for e in os_evidence if e != _NO_OS_EVIDENCE or len(os_evidence) == 1][:10],
         total_packets=total_packets,
         relevant_packets=relevant_packets,
         packets_sent=packets_sent,

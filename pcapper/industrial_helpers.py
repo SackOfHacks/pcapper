@@ -124,6 +124,10 @@ class IndustrialCommandEvent:
 class IndustrialAnalysis:
     path: Path
     duration: float = 0.0
+    # When the capture's traffic starts and ends: -summarize spans them (a
+    # duration alone could only be added up, as if the captures never overlapped).
+    first_seen: float | None = None
+    last_seen: float | None = None
     total_packets: int = 0
     protocol_packets: int = 0
     total_bytes: int = 0
@@ -168,6 +172,8 @@ def cleared_analysis(analysis: IndustrialAnalysis) -> IndustrialAnalysis:
     return IndustrialAnalysis(
         path=analysis.path,
         duration=analysis.duration,
+        first_seen=analysis.first_seen,
+        last_seen=analysis.last_seen,
         total_packets=analysis.total_packets,
         total_bytes=analysis.total_bytes,
         errors=list(analysis.errors),
@@ -902,6 +908,7 @@ def _industrial_steps(
         )
     if start_time is not None and last_time is not None:
         analysis.duration = last_time - start_time
+        analysis.first_seen, analysis.last_seen = start_time, last_time
 
     if enable_enrichment:
         analysis.packet_size_buckets = _bucketize(packet_sizes)

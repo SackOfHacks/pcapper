@@ -98,6 +98,10 @@ class DomainAnalysis:
     campaign_indicators: List[Dict[str, object]] = field(default_factory=list)
     baseline_anomalies: List[Dict[str, object]] = field(default_factory=list)
     benign_context: List[str] = field(default_factory=list)
+    # When the traffic starts and ends: -summarize spans them (a duration
+    # alone could only be added up, as if the captures never overlapped).
+    first_seen: float | None = None
+    last_seen: float | None = None
     # Passive domain intelligence from Browser (MS-BRWS) announcements — works
     # even with no Kerberos/LDAP traffic (e.g. OT/DCS segments).
     netbios_domains: Counter = field(default_factory=Counter)
@@ -1261,6 +1265,8 @@ def analyze_domain(
     return DomainAnalysis(
         path=path,
         duration=duration,
+        first_seen=first_seen,
+        last_seen=last_seen,
         total_packets=total_packets,
         domains=domains,
         dc_hosts=dc_hosts,

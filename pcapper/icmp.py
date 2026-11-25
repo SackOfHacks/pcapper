@@ -601,6 +601,7 @@ def analyze_icmp(
                 "severity": "info",
                 "summary": "No ICMP traffic detected",
                 "details": "ICMP/ICMPv6 not observed in capture.",
+                "absence": True,
             }
         )
     else:

@@ -164,7 +164,12 @@ def transport_report(
           st.top(port_dsts.get(p, Counter()) or Counter(), 4)] for p, n in port_counts.most_common()],
         align="lrrl", max_rows=st.TOP_ROWS, tail=st.TOP_ROWS, noun="port",
     ))
-    services = list(getattr(summary, "services", None) or [])
+    # Busiest first, as a capture's and a rollup's are ranked alike.
+    services = sorted(
+        list(getattr(summary, "services", None) or []),
+        key=lambda s: (-int(s.get("count", 0) or 0), str(s.get("endpoint", "")), str(s.get("port", "")),
+                       str(s.get("service", ""))),
+    )
     rep.section("Services", st.table(
         ["Service", "Endpoint", "Port", "Clients", "Count"],
         [[s.get("service", "-"), s.get("endpoint", "-"), s.get("port", "-"),
@@ -191,7 +196,7 @@ def transport_report(
         if hist:
             size_lines.append((label_text, f"{st.sparkline_of([hist.get(b, 0) for b in _BUCKETS])}  {', '.join(_BUCKETS)}"))
             size_lines.append((f"{label_text} (min/p50/p95/max)",
-                               f"{stats.get('min', 0):.0f} / {stats.get('p50', 0):.0f} / {stats.get('p95', 0):.0f} / {stats.get('max', 0):.0f}"))
+                               f"{st.stat(stats, 'min')} / {st.stat(stats, 'p50')} / {st.stat(stats, 'p95')} / {st.stat(stats, 'max')}"))
     zero = getattr(summary, "zero_payload_packets", 0)
     rep.section("Traffic", st.kv([
         ("Packets", f"{packets} {name} of {capture_packets} ({packets / capture_packets:.1%})" if capture_packets else str(packets)),

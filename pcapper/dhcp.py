@@ -172,6 +172,10 @@ class DhcpAnomaly:
 class DhcpSummary:
     path: Path
     duration: float = 0.0
+    # When the traffic starts and ends: -summarize spans them (a duration
+    # alone could only be added up, as if the captures never overlapped).
+    first_seen: float | None = None
+    last_seen: float | None = None
     total_packets: int = 0
     dhcp_packets: int = 0
     conversations: list[DhcpConversation] = field(default_factory=list)
@@ -1067,6 +1071,7 @@ def analyze_dhcp(
 
     if start_ts is not None and end_ts is not None:
         summary.duration = max(0.0, end_ts - start_ts)
+        summary.first_seen, summary.last_seen = start_ts, end_ts
 
     summary.plaintext_observed = Counter(
         {item: count for item, count in strings_counter.most_common(30)}
@@ -1453,11 +1458,11 @@ def analyze_dhcp(
     summary.server_policy_profiles.sort(key=lambda item: str(item.get("server", "")))
     summary.client_abuse_profiles.sort(
         key=lambda item: (
-            int(item.get("requests", 0) or 0),
-            int(item.get("requested_ip_count", 0) or 0),
-            int(item.get("xid_count", 0) or 0),
+            -int(item.get("requests", 0) or 0),
+            -int(item.get("requested_ip_count", 0) or 0),
+            -int(item.get("xid_count", 0) or 0),
+            str(item.get("client_mac", "")),  # profiles are built from a set: ties by MAC
         ),
-        reverse=True,
     )
     summary.deterministic_checks = {
         key: values[:50] for key, values in deterministic_checks.items()
@@ -1528,22 +1533,7 @@ def merge_dhcp_summaries(summaries: Iterable[DhcpSummary]) -> DhcpSummary:
                     known.append(name)
         for mac, fingerprint in (item.os_fingerprints or {}).items():
             merged.os_fingerprints.setdefault(mac, fingerprint)
-        merged.host_leases.extend(item.host_leases)
 
-        merged.conversations.extend(item.conversations)
-        merged.sessions.extend(item.sessions)
-        merged.policy_tampering.extend(item.policy_tampering)
-        merged.transaction_violations.extend(item.transaction_violations)
-        merged.lease_conflicts.extend(item.lease_conflicts)
-        merged.relay_anomalies.extend(item.relay_anomalies)
-        merged.server_policy_profiles.extend(item.server_policy_profiles)
-        merged.client_abuse_profiles.extend(item.client_abuse_profiles)
-        merged.timeline.extend(item.timeline)
-        merged.artifacts.extend(item.artifacts)
-        merged.anomalies.extend(item.anomalies)
-        merged.errors.extend(item.errors)
-        merged.files_discovered.extend(item.files_discovered)
-        merged.benign_context.extend(item.benign_context)
 
         for check_key, values in (item.deterministic_checks or {}).items():
             for value in values or []:
@@ -1552,6 +1542,25 @@ def merge_dhcp_summaries(summaries: Iterable[DhcpSummary]) -> DhcpSummary:
                     continue
                 seen_check_values[check_key].add(text)
                 deterministic_checks[check_key].append(text)
+
+    # A row or string seen in several captures is listed once, its counts added.
+    from .rollup import merge_benign_claims, merge_records
+
+    merged.host_leases = merge_records([list(item.host_leases or []) for item in summary_list])
+    merged.conversations = merge_records([list(item.conversations or []) for item in summary_list])
+    merged.sessions = merge_records([list(item.sessions or []) for item in summary_list])
+    merged.policy_tampering = merge_records([list(item.policy_tampering or []) for item in summary_list])
+    merged.transaction_violations = merge_records([list(item.transaction_violations or []) for item in summary_list])
+    merged.lease_conflicts = merge_records([list(item.lease_conflicts or []) for item in summary_list])
+    merged.relay_anomalies = merge_records([list(item.relay_anomalies or []) for item in summary_list])
+    merged.server_policy_profiles = merge_records([list(item.server_policy_profiles or []) for item in summary_list])
+    merged.client_abuse_profiles = merge_records([list(item.client_abuse_profiles or []) for item in summary_list])
+    merged.timeline = merge_records([list(item.timeline or []) for item in summary_list])
+    merged.artifacts = merge_records([list(item.artifacts or []) for item in summary_list])
+    merged.anomalies = merge_records([list(item.anomalies or []) for item in summary_list])
+    merged.errors = list(dict.fromkeys(e for item in summary_list for e in (item.errors or []) if e))
+    merged.files_discovered = merge_records([list(item.files_discovered or []) for item in summary_list])
+    merged.benign_context = merge_benign_claims([list(item.benign_context or []) for item in summary_list])
 
     merged.conversations = sorted(
         merged.conversations, key=lambda row: row.packets, reverse=True
@@ -1605,4 +1614,7 @@ def merge_dhcp_summaries(summaries: Iterable[DhcpSummary]) -> DhcpSummary:
         key: values[:120] for key, values in deterministic_checks.items()
     }
 
+    from .rollup import merge_window
+
+    merge_window(merged, summary_list)
     return merged

@@ -72,7 +72,8 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
     os_by_ip = getattr(summary, "ip_os", {}) or {}
     host_rows = []
     ranked_ips = sorted(set(summary.ip_mac_counts) | set(endpoints),
-                        key=lambda ip: -(endpoints[ip].bytes_total if ip in endpoints else 0))
+                        # ties by address: a set's order changes from run to run
+                        key=lambda ip: (-(endpoints[ip].bytes_total if ip in endpoints else 0), ip))
     for ip in ranked_ips:
         external = _is_public_ip(ip)
         role = _short_browser_role(roles.get(ip, [])) or ("scanner" if ip in scanners else "server" if confirmed.get(ip) else "client")

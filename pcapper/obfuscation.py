@@ -864,13 +864,17 @@ def merge_obfuscation_summaries(
         hit_kind_counts.update(summary.hit_kind_counts)
         ioc_counts.update(summary.ioc_counts)
         attack_counts.update(summary.attack_counts)
-        detections.extend(summary.detections)
         errors.extend(summary.errors)
         total_sessions += summary.total_sessions
         suspicious_sessions += summary.suspicious_sessions
         session_stats.extend(_scope_session(summary.path, item) for item in summary.session_stats)
         artifacts.extend(_scope_artifact(summary.path, item) for item in summary.artifacts)
 
+    # The same finding from several captures is listed once (flow rows stay
+    # scoped to their capture: flow ids are numbered per capture).
+    from .rollup import merge_records
+
+    detections = merge_records([list(summary.detections or []) for summary in summaries])
     session_stats = sorted(
         session_stats,
         key=lambda item: (
@@ -908,7 +912,7 @@ def merge_obfuscation_summaries(
         session_stats=session_stats,
         artifacts=artifacts,
         detections=detections,
-        errors=sorted({err for err in errors if err}),
+        errors=list(dict.fromkeys(err for err in errors if err)),
     )
 
 

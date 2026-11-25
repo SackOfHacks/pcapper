@@ -632,7 +632,7 @@ def merge_aim_summaries(summaries: Iterable[AimSummary]) -> AimSummary:
         artifacts=artifacts,
         conversations=conversations,
         detections=detections,
-        errors=sorted(set(errors)),
+        errors=list(dict.fromkeys(e for e in errors if e)),
         first_seen=first_seen,
         last_seen=last_seen,
         duration_seconds=duration,
