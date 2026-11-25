@@ -853,15 +853,12 @@ def merge_socks_summaries(summaries: list[SocksSummary]) -> SocksSummary:
         target_counts.update(item.target_counts)
         reply_status_counts.update(item.reply_status_counts)
         artifact_correlations.update(item.artifact_correlations)
-        credential_items.extend(item.credential_items)
         cleartext_cred_count += int(item.cleartext_cred_count)
         failed_auth_count += int(item.failed_auth_count)
         reverse_flow_count += int(item.reverse_flow_count)
         udp_associate_count += int(item.udp_associate_count)
         threat_counts.update(item.threat_counts)
         anomaly_counts.update(item.anomaly_counts)
-        detections.extend(item.detections)
-        errors.extend(item.errors)
         if item.first_seen is not None:
             first_seen = item.first_seen if first_seen is None else min(first_seen, item.first_seen)
         if item.last_seen is not None:
@@ -872,6 +869,13 @@ def merge_socks_summaries(summaries: list[SocksSummary]) -> SocksSummary:
         if first_seen is not None and last_seen is not None
         else None
     )
+    # A credential or finding several captures share is listed once; errors
+    # once each, in the order found.
+    from .rollup import merge_records
+
+    credential_items = merge_records([list(item.credential_items or []) for item in summaries])
+    detections = merge_records([list(item.detections or []) for item in summaries])
+    errors = list(dict.fromkeys(err for item in summaries for err in (item.errors or []) if err))
     return SocksSummary(
         path=Path("ALL_PCAPS"),
         total_packets=total_packets,

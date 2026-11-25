@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from scapy.all import Ether, IP, Raw, TCP, wrpcap
 
-from pcapper.socks import analyze_socks
+from pcapper.socks import analyze_socks, merge_socks_summaries
 
 PROXY = "10.0.0.2"
 CLIENT = "10.0.0.1"
@@ -110,3 +110,24 @@ def test_reverse_socks_is_detected_from_the_syn(tmp_path) -> None:
     assert summary.flows == 1
     assert summary.reverse_flow_count == 1
     assert summary.threat_counts["Reverse SOCKS proxy (server-initiated tunnel)"] == 1
+
+
+def test_a_rollup_lists_a_credential_several_captures_share_once(tmp_path) -> None:
+    """-summarize of two captures holding the same proxy login: the credential
+    and its finding are listed once, the exchanges counted twice."""
+    auth = b"\x01\x08testuser\x08testpass"
+
+    def login(name, port):
+        return analyze_socks(_write(tmp_path, name, [
+            _seg(CLIENT, PROXY, port, 1080, b"\x05\x01\x02"),
+            _seg(PROXY, CLIENT, 1080, port, b"\x05\x02"),
+            _seg(CLIENT, PROXY, port, 1080, auth),
+            _seg(PROXY, CLIENT, 1080, port, b"\x01\x00"),
+        ]), show_status=False)
+
+    first, second = login("a.pcap", 40002), login("b.pcap", 40002)
+    merged = merge_socks_summaries([first, second])
+    assert merged.cleartext_cred_count == 2
+    assert len(merged.credential_items) == 1
+    titles = [d["summary"] for d in merged.detections]
+    assert len(titles) == len(set(titles)) == len(first.detections)
