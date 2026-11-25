@@ -147,6 +147,21 @@ def _summary_frames() -> list:
     return [Ether(raw) for raw in out]
 
 
+
+def _v6_family(cls) -> int:  # type: ignore[no-untyped-def]
+    """The loopback family value scapy dissects as IPv6 on this platform."""
+    for fields, payload in cls.payload_guess:
+        if payload is IPv6 and "type" in fields:
+            return int(fields["type"])
+    return int(socket.AF_INET6)
+
+
+def _other_family(cls) -> int:  # type: ignore[no-untyped-def]
+    """A BSD IPv6 family value scapy does not bind here (dissected as Raw)."""
+    bound = {int(fields["type"]) for fields, _ in cls.payload_guess if "type" in fields}
+    return next(v for v in (28, 30, 24) if v not in bound)
+
+
 def _write_captures(tmp_path: Path) -> list[Path]:
     edge = tmp_path / "edge.pcap"
     frames = [*_it_frames(), *_summary_frames()]
@@ -187,9 +202,13 @@ def _write_captures(tmp_path: Path) -> list[Path]:
     for name, linktype, frames in (
         ("cooked.pcap", 113, [CookedLinux(proto=0x86DD if IPv6 in p else 0x0800) / p for p in l3s()]),
         ("cooked2.pcap", 276, [CookedLinuxV2(proto=0x86DD if IPv6 in p else 0x0800, ifindex=i) / p for i, p in zip((7, 0, 0x80000001, 7, 7, 7, 7, 9, 9), l3s())]),
-        # scapy binds this platform's AF_INET6 to IPv6 (another BSD value: Raw).
-        ("loopback.pcap", 0, [Loopback(type=socket.AF_INET6 if IPv6 in p else 2) / p for p in l3s()] + [Loopback(type=28) / l3s()[-1]]),
-        ("loopback_openbsd.pcap", 108, [LoopbackOpenBSD(type=socket.AF_INET6 if IPv6 in p else 2) / p for p in l3s()] + [LoopbackOpenBSD(type=28) / l3s()[-1]]),
+        # scapy binds one loopback family value to IPv6 -- not always this
+        # platform's AF_INET6 (Windows: AF_INET6 is 23, scapy binds 24) -- and
+        # leaves any other BSD value as Raw.
+        ("loopback.pcap", 0, [Loopback(type=_v6_family(Loopback) if IPv6 in p else 2) / p for p in l3s()]
+         + [Loopback(type=_other_family(Loopback)) / l3s()[-1]]),
+        ("loopback_openbsd.pcap", 108, [LoopbackOpenBSD(type=_v6_family(LoopbackOpenBSD) if IPv6 in p else 2) / p for p in l3s()]
+         + [LoopbackOpenBSD(type=_other_family(LoopbackOpenBSD)) / l3s()[-1]]),
         ("rawip.pcap", 101, l3s()),
         ("rawip12.pcap", 12, l3s()),
         ("ipv4.pcap", 228, l3s(v6_ok=False)),

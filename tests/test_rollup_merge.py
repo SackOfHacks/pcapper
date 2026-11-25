@@ -62,3 +62,61 @@ def test_ctf_rollup_uses_the_ctf_report(tmp_path) -> None:
     text = re.sub(r"\x1b\[[0-9;]*m", "", out)
     assert "CTF · all captures" in text and "ROLLUP" not in text
     assert "flag{r0llup_m3rg3d}" in text and "one.pcap" in text
+
+
+def test_rollup_details_do_not_sum_ip_octets_or_percentages() -> None:
+    from pcapper.utils import collapse_detection_details
+
+    details = [
+        "192.168.121.2 accounts for 100.0% of IP bytes.",
+        "192.168.122.2 accounts for 100.0% of IP bytes.",
+        "10.82.40.105 accounts for 100.0% of IP bytes.",
+    ]
+    merged = collapse_detection_details(details)
+    assert "394" not in merged and "300" not in merged
+    assert "192.168.121.2" in merged and "+1 additional detail variant" in merged
+    # Same host and share in every capture: identical text, nothing to sum.
+    same = collapse_detection_details(["10.0.0.1 accounts for 60.0% of IP bytes."] * 3)
+    assert same == "10.0.0.1 accounts for 60.0% of IP bytes."
+
+
+def test_rollup_details_still_sum_standalone_counts() -> None:
+    from pcapper.utils import collapse_detection_details
+
+    merged = collapse_detection_details([
+        "10.0.0.1 received traffic from 4 unique peers.",
+        "10.0.0.1 received traffic from 6 unique peers.",
+    ])
+    assert merged.startswith("10.0.0.1 received traffic from 10 unique peers.")
+    # The IP differs, so the counts must not be summed under one host.
+    split = collapse_detection_details([
+        "10.0.0.1 received traffic from 4 unique peers.",
+        "10.0.0.2 received traffic from 6 unique peers.",
+    ])
+    assert "10 unique" not in split
+
+
+def test_self_addressed_traffic_share_is_at_most_100_percent(tmp_path) -> None:
+    from pcapper.ips import analyze_ips
+
+    path = _write(tmp_path, "self.pcap", [_tcp("10.0.0.5", "10.0.0.5", 40000, 2404, b"x" * 20) for _ in range(5)])
+    summary = analyze_ips(path, show_status=False)
+    details = [d["details"] for d in summary.detections if d.get("summary") == "Traffic concentration on a single host"]
+    assert details == ["10.0.0.5 accounts for 100.0% of IP bytes."]
+
+
+def test_rollup_concentration_is_recomputed_on_merged_traffic(tmp_path) -> None:
+    """Three single-host captures: each host is 100% of its own capture, but
+    a third of the merged bytes, so the rollup must not claim concentration."""
+    from pcapper.ips import analyze_ips, merge_ips_summaries
+
+    summaries = []
+    for host in ("10.0.0.1", "10.0.0.2", "10.0.0.3"):
+        pkts = [_tcp(host, host, 40000, 2404, b"x" * 20) for _ in range(5)]
+        summaries.append(analyze_ips(_write(tmp_path, f"{host}.pcap", pkts), show_status=False))
+    merged = merge_ips_summaries(summaries)
+    assert [d for d in merged.detections if d.get("summary") == "Traffic concentration on a single host"] == []
+    # Self-addressed bytes count once in a host's total.
+    for endpoint in merged.endpoints:
+        assert endpoint.bytes_sent == endpoint.bytes_recv == endpoint.bytes_self
+        assert endpoint.bytes_total == endpoint.bytes_sent

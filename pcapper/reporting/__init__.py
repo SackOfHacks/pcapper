@@ -79,6 +79,7 @@ from .bacnet import (
 )
 from .baseline_delta import (
     render_baseline_delta,
+    render_baseline_profile,
 )
 from .beacon import (
     _BEACON_SEV_RANK,

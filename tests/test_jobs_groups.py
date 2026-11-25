@@ -147,7 +147,10 @@ def test_the_plan_knows_what_each_analysis_reads(tmp_path: Path) -> None:
     plan = sharedpass.discover(path, [(analyze_compromised, (), {})])
     assert len(plan.reads) == len(plan)
     reads = dict(zip((call[0].__module__.rsplit(".", 1)[-1] for call in plan.calls), plan.reads))
-    assert reads["domain"] == reads["hosts"] == "packets"
+    assert reads["domain"] == "packets"
+    # The host inventory's own pass (OS fingerprints) reads lightweight
+    # records: it dissects only the TCP SYNs it samples.
+    assert reads["hosts"] == "lite"
     assert reads["http"] == reads["creds"] == reads["dns"] == "lite"
     assert pcap_cache._READ_NOTE is None  # only while planning
     # Every analysis --threats and --overview start reads lightweight records:

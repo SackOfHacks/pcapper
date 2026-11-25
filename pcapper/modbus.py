@@ -196,6 +196,10 @@ class ModbusAnalysis:
     artifacts: List[ModbusArtifact] = field(default_factory=list)
     anomalies: List[ModbusAnomaly] = field(default_factory=list)
     value_changes: List[dict[str, object]] = field(default_factory=list)
+    # Observed value range per register: (server, unit, register type,
+    # address) -> [min, max, samples], from read responses paired with their
+    # request and from decoded write values. What --baseline profiles.
+    register_ranges: Dict[Tuple[str, int, str, int], List[int]] = field(default_factory=dict)
     # One record per (function, unit, master, server) write stream: count,
     # first/last time and the last request detail (target + values).
     write_targets: List[dict[str, object]] = field(default_factory=list)
@@ -274,6 +278,10 @@ def _bucketize_duration(duration: float) -> str:
         if low <= duration <= high:
             return label
     return ">30m"
+
+
+# Registers whose value range is kept (a large plant reads tens of thousands).
+MAX_REGISTER_RANGES = 50_000
 
 
 def _modbus_reg_type(func_code: int) -> Optional[str]:
@@ -642,6 +650,20 @@ def analyze_modbus(
     # so response register values land on real addresses (register map).
     pending_reads: Dict[Tuple[str, int, str, int, int], Tuple[int, int, int]] = {}
     read_register_values: Dict[Tuple[str, int, int], Dict[int, int]] = defaultdict(dict)
+    register_ranges: Dict[Tuple[str, int, str, int], List[int]] = {}
+
+    def _note_value(key: Tuple[str, int, str, int], value: int) -> None:
+        entry = register_ranges.get(key)
+        if entry is None:
+            if len(register_ranges) >= MAX_REGISTER_RANGES:
+                return
+            register_ranges[key] = [value, value, 1]
+            return
+        if value < entry[0]:
+            entry[0] = value
+        elif value > entry[1]:
+            entry[1] = value
+        entry[2] += 1
     rtt_samples: Dict[str, List[int]] = defaultdict(list)
     matched_tx = 0
     phantom_responses: Counter[str] = Counter()
@@ -1081,6 +1103,7 @@ def analyze_modbus(
                                 if original_func in {5, 6} and len(pdu) >= 5:
                                     value = int.from_bytes(pdu[3:5], "big")
                                     key = (dst_ip, unit_id, reg_type, addr)
+                                    _note_value(key, value)
                                     prev = last_values.get(key)
                                     if (
                                         prev is not None
@@ -1123,6 +1146,7 @@ def analyze_modbus(
                                                 reg_type,
                                                 target_idx,
                                             )
+                                            _note_value(key, value)
                                             prev = last_values.get(key)
                                             if (
                                                 prev is not None
@@ -1160,6 +1184,7 @@ def analyze_modbus(
                                             reg_type,
                                             target_idx,
                                         )
+                                        _note_value(key, value)
                                         prev = last_values.get(key)
                                         if (
                                             prev is not None
@@ -1226,9 +1251,12 @@ def analyze_modbus(
                             byte_count = pdu[1]
                             values = pdu[2:2 + byte_count]
                             regs = read_register_values[(src_ip, unit_id, read_req[0])]
+                            read_type = _modbus_reg_type(read_req[0]) or "register"
                             for index in range(min(read_req[2], len(values) // 2, 2000)):
+                                read_value = int.from_bytes(values[2 * index:2 * index + 2], "big")
                                 if len(regs) < 65536:
-                                    regs[read_req[1] + index] = int.from_bytes(values[2 * index:2 * index + 2], "big")
+                                    regs[read_req[1] + index] = read_value
+                                _note_value((src_ip, unit_id, read_type, read_req[1] + index), read_value)
                         req_ts = pending_tx.pop(resp_key, None)
                         if req_ts is not None:
                             matched_tx += 1
@@ -2003,6 +2031,7 @@ def analyze_modbus(
         artifacts=artifacts,
         anomalies=anomalies,
         value_changes=value_changes,
+        register_ranges=register_ranges,
         write_targets=write_targets,
         errors=errors,
     )

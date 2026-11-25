@@ -29,7 +29,17 @@ from .analyzer import analyze_pcap, merge_pcap_summaries
 from .packet_at import analyze_packet_at
 from .arp import analyze_arp, merge_arp_summaries
 from .bacnet import analyze_bacnet
-from .baseline import build_baseline, compare_baseline, load_baseline
+from .baseline import (
+    CaptureParts,
+    baseline_file_name,
+    build_baseline_from_parts,
+    collect_capture_parts,
+    compare_baseline,
+    is_baseline_file,
+    load_baseline,
+    write_baseline,
+)
+from .baseline_profile import analyze_baseline_profile
 from .beacon import analyze_beacons
 from .carving import analyze_carving, merge_carve_summaries
 from .certificates import analyze_certificates
@@ -160,6 +170,7 @@ from .reporting import (
     render_arp_summary,
     render_bacnet_summary,
     render_baseline_delta,
+    render_baseline_profile,
     render_beacon_summary,
     render_carve_summary,
     render_certificates_summary,
@@ -2327,19 +2338,40 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
         help="Only include packets at/before this time (epoch or ISO 8601).",
     )
     general.add_argument(
+        "--baseline",
+        metavar="PATH",
+        nargs="?",
+        const="",
+        help=(
+            "Record a baseline profile of the traffic (hosts, services, OT/ICS/IoT "
+            "conversations and polling cadence, commands per pair, L2 streams, "
+            "IP-MAC bindings) as JSON. Default name: X.pcap -> X.baseline.json "
+            "next to the capture; with -summarize one merged baseline named after "
+            "the captures' common prefix. PATH names the file (or a directory)."
+        ),
+    )
+    general.add_argument(
+        "--baseline-diff",
+        metavar="REF",
+        help=(
+            "Compare each capture (or, with -summarize, all of them merged) to REF: "
+            "a saved .baseline.json or a second capture, and report deviations as findings."
+        ),
+    )
+    general.add_argument(
         "--baseline-save",
         metavar="PATH",
-        help="Write baseline snapshot (services/OT commands) to PATH (JSON).",
+        help="Alias of --baseline PATH.",
     )
     general.add_argument(
         "--baseline-compare",
-        metavar="PATH",
-        help="Compare current run to baseline snapshot at PATH and report drift.",
+        metavar="REF",
+        help="Alias of --baseline-diff REF.",
     )
     general.add_argument(
         "--baseline-fast",
         action="store_true",
-        help="Use fast OT command scanning when building a baseline.",
+        help="Use fast OT command scanning (TCP/UDP control ports only) when building a baseline.",
     )
     general.add_argument(
         "--rules",
@@ -2960,6 +2992,76 @@ def _handle_help_request(
     return True
 
 
+def _finish_baselines(
+    parts: list[CaptureParts],
+    *,
+    baseline_out: str | None,
+    baseline_ref: str | None,
+    summarize: bool,
+    case_dir: Path | None,
+    resolve,
+    fast: bool,
+    config: object,
+    filtered: bool,
+) -> None:
+    """Write and/or compare the run's baselines: one per capture, or one for
+    all of them merged with -summarize."""
+    groups = [parts] if (summarize and len(parts) > 1) else [[p] for p in parts]
+
+    reference = None
+    if baseline_ref:
+        ref_path = resolve(Path(baseline_ref).expanduser())
+        try:
+            if not ref_path.exists():
+                raise ValueError(f"no such file: {ref_path}")
+            if is_baseline_file(ref_path):
+                reference = load_baseline(ref_path)
+            else:
+                ref_parts = collect_capture_parts(ref_path, fast=fast, config=config)
+                reference = build_baseline_from_parts(__version__, [ref_parts])
+                if filtered:
+                    reference.notes.append(
+                        f"The reference capture {ref_path.name} was profiled whole; "
+                        "--bpf/--time-start/--time-end applied to the current capture only."
+                    )
+        except Exception as exc:  # noqa: BLE001 - reported, the run stands
+            _print_error(f"Baseline diff error: {exc}")
+            reference = None
+            if baseline_out is None:
+                return
+
+    explicit = Path(baseline_out).expanduser() if baseline_out else None
+    if explicit is not None and len(groups) > 1 and explicit.suffix.lower() == ".json":
+        _print_error(
+            f"--baseline {baseline_out}: {len(groups)} captures make {len(groups)} baselines; "
+            "give a directory, or add -summarize for one merged baseline."
+        )
+        explicit = None
+        baseline_out = None
+
+    for group in groups:
+        snapshot = build_baseline_from_parts(__version__, group)
+        saved_to = None
+        if baseline_out is not None:
+            name = baseline_file_name([p.path for p in group])
+            if explicit is None:
+                target = (case_dir / name) if case_dir else (group[0].path.parent / name)
+            else:
+                target = resolve(explicit)
+                if target.is_dir() or len(groups) > 1 or not target.suffix:
+                    target = target / name
+            try:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                _warn_output_path(target.parent)
+                write_baseline(snapshot, target)
+                saved_to = target
+            except Exception as exc:  # noqa: BLE001
+                _print_error(f"Baseline save error: {exc}")
+            print(render_baseline_profile(snapshot, saved_to=saved_to))
+        if reference is not None:
+            print(render_baseline_delta(compare_baseline(snapshot, reference)))
+
+
 def _analyze_paths(
     paths: list[Path],
     protocol_limit: int,
@@ -3130,8 +3232,9 @@ def _analyze_paths(
     log_config: LogConfig | None = None,
     plugins: list[PluginSpec] | None = None,
     ruleset: list[Rule] | None = None,
-    baseline_save: Path | None = None,
-    baseline_compare: Path | None = None,
+    baseline_out: str | None = None,
+    baseline_ref: str | None = None,
+    baseline_fast: bool = False,
     decrypt_config: DecryptConfig | None = None,
     correlate_requested: bool = False,
     correlate_min: int = 2,
@@ -3150,15 +3253,15 @@ def _analyze_paths(
     # Keep single-pcap behavior identical with/without -summarize.
     # Rollup rendering is only meaningful when multiple pcaps are supplied.
     summarize_rollups = summarize and len(paths) > 1
-    render_base_summary = show_base or len(ordered_steps) == 0
+    # --baseline / --baseline-diff alone print their own report, not the
+    # capture summary a bare run falls back to.
+    baseline_requested = baseline_out is not None or bool(baseline_ref)
+    render_base_summary = show_base or (len(ordered_steps) == 0 and not baseline_requested)
     base_rollups = []
     modbus_rollups = []
     dnp3_rollups = []
     rollups: dict[str, list[object]] = {}
-    baseline_requested = bool(baseline_save or baseline_compare)
-    baseline_service_summaries: list[object] = []
-    baseline_ot_summaries: list[object] = []
-    baseline_host_summaries: list[object] = []
+    baseline_parts: list[CaptureParts] = []
     correlate_service_summaries: list[object] = []
     correlate_host_summaries: list[object] = []
     rules_rollups: list[object] = []
@@ -3532,6 +3635,10 @@ def _analyze_paths(
             # The host inventory a baseline compares and a correlation matches
             # (called before the steps, below).
             roots.append((analyze_hosts, (), {}))
+        if baseline_requested:
+            roots.append((analyze_services, (), {}))
+            roots.append((analyze_ot_commands, (), {"fast": baseline_fast, "config": ot_commands_config}))
+            roots.append((analyze_baseline_profile, (), {}))
         return roots
 
     for idx, path in enumerate(paths, start=1):
@@ -3692,20 +3799,29 @@ def _analyze_paths(
                 print(render_summary(summary, protocol_limit=protocol_limit))
             export_summaries["base"] = summary
 
-        if baseline_requested or correlate_requested:
+        if baseline_requested:
+            # Hosts, services, OT commands per pair and the communication
+            # profile, collected without printing their reports; each analysis
+            # is memoized, so a step also asked for is not run twice.
+            parts = collect_capture_parts(
+                path, fast=baseline_fast, config=ot_commands_config,
+                packets=packets, meta=meta, show_status=step_status,
+            )
+            for err in parts.errors:
+                _print_error(f"Baseline: {err}")
+            baseline_parts.append(parts)
+        if correlate_requested:
             # The host inventory (IPs, MACs, hostnames, OS, open ports) a
-            # baseline compares and a correlation matches across captures;
-            # without it both could only speak about services.
-            try:
-                host_summary = analyze_hosts(path, show_status=step_status, packets=packets, meta=meta)
-            except Exception as exc:  # noqa: BLE001 - the rest of the run stands
-                host_summary = None
-                _print_error(f"Host inventory for baseline/correlation failed on {path.name}: {exc}")
+            # correlation matches across captures; without it a correlation
+            # could only speak about services.
+            host_summary = baseline_parts[-1].hosts if baseline_requested else None
+            if host_summary is None:
+                try:
+                    host_summary = analyze_hosts(path, show_status=step_status, packets=packets, meta=meta)
+                except Exception as exc:  # noqa: BLE001 - the rest of the run stands
+                    _print_error(f"Host inventory for correlation failed on {path.name}: {exc}")
             if host_summary is not None:
-                if baseline_requested:
-                    baseline_host_summaries.append(host_summary)
-                if correlate_requested:
-                    correlate_host_summaries.append(host_summary)
+                correlate_host_summaries.append(host_summary)
         for step in ordered_steps:
             progress.capture_next_unit()
             if step == "search" and search_query:
@@ -4292,8 +4408,6 @@ def _analyze_paths(
                 else:
                     print(render_services_summary(svc_summary, verbose=verbose))
                 export_summaries["services"] = svc_summary
-                if baseline_requested:
-                    baseline_service_summaries.append(svc_summary)
                 if correlate_requested:
                     correlate_service_summaries.append(svc_summary)
             elif step == "smb" and show_smb:
@@ -4927,8 +5041,6 @@ def _analyze_paths(
                         )
                     )
                 export_summaries["ot_commands"] = summary
-                if baseline_requested:
-                    baseline_ot_summaries.append(summary)
             elif step == "iec101_103" and show_iec101_103:
                 summary = analyze_iec101_103(
                     path, show_status=step_status, packets=packets, meta=meta
@@ -5619,32 +5731,18 @@ def _analyze_paths(
             )
         )
 
-    if baseline_requested:
-        current_baseline = build_baseline(
-            __version__,
-            [str(item) for item in paths],
-            baseline_host_summaries,
-            baseline_service_summaries,
-            baseline_ot_summaries,
+    if baseline_requested and baseline_parts:
+        _finish_baselines(
+            baseline_parts,
+            baseline_out=baseline_out,
+            baseline_ref=baseline_ref,
+            summarize=summarize,
+            case_dir=case_dir,
+            resolve=_resolve_misc_path,
+            fast=baseline_fast,
+            config=ot_commands_config,
+            filtered=_has_packet_filters(bpf, time_start, time_end),
         )
-        if baseline_save:
-            out_path = _resolve_misc_path(Path(baseline_save).expanduser())
-            _warn_output_path(out_path.parent)
-            safe_write_text(
-                out_path,
-                json.dumps(current_baseline.to_dict(), indent=2),
-                encoding="utf-8",
-                context="baseline save",
-            )
-            print(f"Baseline saved to {out_path}")
-        if baseline_compare:
-            compare_path = _resolve_misc_path(Path(baseline_compare).expanduser())
-            try:
-                baseline_loaded = load_baseline(compare_path)
-                delta = compare_baseline(current_baseline, baseline_loaded)
-                print(render_baseline_delta(delta))
-            except Exception as exc:
-                _print_error(f"Baseline compare error: {exc}")
     if suricata_strict and suricata_scans:
         print(
             "Suricata strict mode summary: "
@@ -5743,14 +5841,11 @@ def main() -> int:
             cache_bytes = str(int(cache_mb) * 1024 * 1024)
             os.environ["PCAPPER_CACHE_MAX_BYTES"] = cache_bytes
             os.environ["PCAPPER_CACHE_FILE_MAX_BYTES"] = cache_bytes
-    baseline_save = getattr(args, "baseline_save", None)
-    baseline_compare = getattr(args, "baseline_compare", None)
-    baseline_requested = bool(baseline_save or baseline_compare)
-    if baseline_requested:
-        args.services = True
-        args.ot_commands = True
-        if getattr(args, "baseline_fast", False):
-            args.ot_commands_fast = True
+    # --baseline-save / --baseline-compare: the earlier spellings, kept as aliases.
+    baseline_out = getattr(args, "baseline", None)
+    if baseline_out is None:
+        baseline_out = getattr(args, "baseline_save", None)
+    baseline_ref = getattr(args, "baseline_diff", None) or getattr(args, "baseline_compare", None)
 
     correlate_requested = bool(getattr(args, "correlate", False))
     if correlate_requested:
@@ -6446,8 +6541,9 @@ def main() -> int:
                 log_config=log_config,
                 plugins=plugins,
                 ruleset=ruleset,
-                baseline_save=baseline_save,
-                baseline_compare=baseline_compare,
+                baseline_out=baseline_out,
+                baseline_ref=baseline_ref,
+                baseline_fast=getattr(args, "baseline_fast", False),
                 decrypt_config=decrypt_config,
                 correlate_requested=getattr(args, "correlate", False),
                 correlate_min=getattr(args, "correlate_min", 2),

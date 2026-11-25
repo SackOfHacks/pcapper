@@ -72,7 +72,7 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
     os_by_ip = getattr(summary, "ip_os", {}) or {}
     host_rows = []
     ranked_ips = sorted(set(summary.ip_mac_counts) | set(endpoints),
-                        key=lambda ip: -((endpoints[ip].bytes_sent + endpoints[ip].bytes_recv) if ip in endpoints else 0))
+                        key=lambda ip: -(endpoints[ip].bytes_total if ip in endpoints else 0))
     for ip in ranked_ips:
         external = _is_public_ip(ip)
         role = _short_browser_role(roles.get(ip, [])) or ("scanner" if ip in scanners else "server" if confirmed.get(ip) else "client")
@@ -89,7 +89,7 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
         host_rows.append([
             st.bad(ip) if external and ip in scanners else ip, f"{'ext' if external else 'int'}/{role}", name_text,
             geo_text or ("-" if external else "internal"), ",".join(str(p) for p in confirmed.get(ip, [])[:8]) or "-",
-            f"{st.size(ep.bytes_sent + ep.bytes_recv)} ({ep.packets_sent}/{ep.packets_recv} pkts)" if ep else "-",
+            f"{st.size(ep.bytes_total)} ({ep.packets_sent}/{ep.packets_recv} pkts)" if ep else "-",
         ] + ([macs] if st.verbose() else []))
     rep.section("Hosts", st.table(
         ["IP", "Class/role", "Hostname", "Geo / ASN", "Serves", "Traffic"] + (["MACs"] if st.verbose() else []), host_rows,
@@ -149,10 +149,10 @@ def render_ips_summary(summary: IpSummary, limit: int = 12, verbose: bool = Fals
         counter_line("JA4", getattr(summary, "ja4_counts", None), None),
         counter_line("JA4S", getattr(summary, "ja4s_counts", None), None),
     ]), detail=True)
-    eps = sorted(summary.endpoints, key=lambda e: e.bytes_sent + e.bytes_recv, reverse=True)
+    eps = sorted(summary.endpoints, key=lambda e: e.bytes_total, reverse=True)
     rep.section("Endpoints", st.table(
         ["IP", "Sent", "Received", "Total", "Peers", "Ports", "Protocols", "Geo", "ASN", "First", "Last", "Duration"],
-        [[e.ip, st.size(e.bytes_sent), st.size(e.bytes_recv), st.size(e.bytes_sent + e.bytes_recv), len(e.peers),
+        [[e.ip, st.size(e.bytes_sent), st.size(e.bytes_recv), st.size(e.bytes_total), len(e.peers),
           ",".join(str(p) for p in e.ports) or "-", ",".join(e.protocols) or "-", e.geo or "-", e.asn or "-", format_ts(e.first_seen),
           format_ts(e.last_seen), format_duration(e.last_seen - e.first_seen) if e.first_seen is not None and e.last_seen is not None else "-"]
          for e in eps], align="lrrrrlllllll", max_rows=None,

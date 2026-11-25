@@ -600,7 +600,9 @@ def test_jobs_default_is_automatic(tmp_path: Path, monkeypatch: pytest.MonkeyPat
     assert 1 <= sharedpass.auto_jobs() <= sharedpass.AUTO_JOBS_MAX
     assert sharedpass.jobs_for(path) == (sharedpass.auto_jobs() if sharedpass.parallel_available() else 1)
     sharedpass.set_jobs(3)
-    assert sharedpass.jobs_for(path) == 3  # an explicit --jobs always wins
+    # An explicit --jobs always wins -- where processes can fork at all
+    # (Windows has no fork: every plan runs in one process).
+    assert sharedpass.jobs_for(path) == (3 if sharedpass.parallel_available() else 1)
 
 
 def test_simple_step_table_matches_step_loop() -> None:

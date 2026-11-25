@@ -570,13 +570,26 @@ def test_read_head_replays_then_continues(tmp_path: Path, monkeypatch: pytest.Mo
     assert not pcap_cache.primed(path)
 
 
+
+def _script_tool(path: Path, body: str) -> Path:
+    """An executable stand-in for an external tool, written in Python. POSIX
+    runs the script through its shebang; Windows cannot execute a shebang
+    file (WinError 193), so there the tool is a .cmd launcher for it."""
+    if os.name != "nt":
+        path.write_text(f"#!{sys.executable}\n" + body)
+        path.chmod(0o755)
+        return path
+    script = path.with_suffix(".py")
+    script.write_text(body)
+    launcher = path.with_suffix(".cmd")
+    launcher.write_text(f'@"{sys.executable}" "{script}" %*\r\n')
+    return launcher
+
 def _fake_suricata(tmp_path: Path) -> Path:
     """A stand-in Suricata: reads the capture it is given (``-r``) to its end
     and raises one alert naming the bytes it got and their SHA-256; logs the
     path it read to $FAKE_SURICATA_LOG."""
-    script = tmp_path / "fake-suricata"
-    script.write_text(
-        f"#!{sys.executable}\n"
+    return _script_tool(tmp_path / "fake-suricata", (
         "import hashlib, json, os, sys\n"
         "args = sys.argv[1:]\n"
         "if '--build-info' in args or '-V' in args:\n"
@@ -593,9 +606,7 @@ def _fake_suricata(tmp_path: Path) -> Path:
         "                   'signature_id': 1, 'severity': 1, 'category': 'test', 'action': 'allowed'}}\n"
         "with open(os.path.join(out, 'eve.json'), 'w') as handle:\n"
         "    handle.write(json.dumps(event) + '\\n')\n"
-    )
-    script.chmod(0o755)
-    return script
+    ))
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")
@@ -768,9 +779,7 @@ def _fake_tshark(tmp_path: Path) -> Path:
     logs what it did, the path and the bytes it got to $FAKE_TSHARK_LOG; lists
     two TLS streams, or prints a follow block per ``-z`` tap (last first, as
     tshark does)."""
-    script = tmp_path / "fake-tshark"
-    script.write_text(
-        f"#!{sys.executable}\n"
+    return _script_tool(tmp_path / "fake-tshark", (
         "import hashlib, os, sys\n"
         "args = sys.argv[1:]\n"
         "source = args[args.index('-r') + 1]\n"
@@ -788,9 +797,7 @@ def _fake_tshark(tmp_path: Path) -> Path:
         "for tap in reversed(taps):\n"
         "    proto, _fmt, stream = tap.split(',')[1:4]\n"
         "    print(f'\\n{rule}\\nFollow: {proto},ascii\\nFilter: tcp.stream eq {stream}\\nNode 0: a\\nNode 1: b\\npayload {stream}\\n{rule}')\n"
-    )
-    script.chmod(0o755)
-    return script
+    ))
 
 
 @pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="needs FIFOs")

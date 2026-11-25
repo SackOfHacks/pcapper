@@ -150,12 +150,53 @@ When using `--case-dir`, Pcapper writes `case.json` with analyst info, hashes, t
 
 ## Baselines
 
-Snapshot asset and command baselines, then compare for drift.
+Record what a network normally does, then report what deviates from it.
 
 ```bash
-python -m pcapper capture.pcap --baseline-save baseline.json
-python -m pcapper capture.pcap --baseline-compare baseline.json
+# Record: capture.pcap -> capture.baseline.json next to the capture
+python -m pcapper capture.pcap --baseline
+# Several captures, one merged baseline named after their common prefix
+# (site-1.pcap, site-2.pcap -> site.baseline.json); without -summarize, one per capture
+python -m pcapper -summarize site-*.pcap --baseline
+# Compare against a saved baseline, or straight against a known-good capture
+python -m pcapper today.pcap --baseline-diff capture.baseline.json
+python -m pcapper today.pcap --baseline-diff known-good.pcap
 ```
+
+`--baseline [PATH]` names the file, or a directory for one file per capture. `--baseline` and `--baseline-diff` together record the new baseline and compare it in one run. On their own they print only their report; add any analysis flag to see its report too (each analysis runs once either way). `--baseline-fast` scans OT commands on their TCP/UDP control ports only.
+
+A baseline (`schema_version` 2) records:
+
+| Section | What it holds |
+| --- | --- |
+| `flows` | Every conversation as client -> server on the service port, with its protocol, class (OT, IoT, IT, other), packets, bytes, time span, and request cadence: the median interval between client -> server data packets and its jitter (median absolute deviation / median). |
+| `pair_commands` | The commands each pair exchanges, reads and writes, from every OT/ICS/IoT analyzer `--ot-commands` runs (replies and confirmations left out). |
+| `l2_flows` | Layer-2 industrial streams between MAC addresses: GOOSE, SV, PROFINET RT, EtherCAT, PTP, LLDP. |
+| `ip_macs` | The MAC addresses each IP sent from (its own frames and ARP), with vendor. |
+| `registers` | Modbus register value ranges per server, unit, register type and address (min, max, samples), from read responses paired with their requests and from written values. |
+| `hosts`, `services` | The host and service inventories. |
+| `ot_commands`, `control_targets` | Write/control command totals per protocol and their targets. |
+
+`--baseline-diff` turns each difference into a finding, using fixed rules (thresholds in `pcapper/baseline.py`):
+
+| Severity | Deviation |
+| --- | --- |
+| HIGH | New OT communication pair, or a new OT protocol between known hosts |
+| HIGH | New writer to an OT device (the pair never wrote), new write/control command on a pair |
+| HIGH | Remote-access or file-transfer protocol (SMB, RDP, SSH, Telnet, VNC, FTP, TFTP, RPC, WinRM) to or from an OT host |
+| HIGH | An IP seen from a different MAC (or from an additional one: possible spoofing), unless both MACs are a gateway's |
+| HIGH | New layer-2 industrial stream (GOOSE, SV, PROFINET RT, EtherCAT) |
+| HIGH | A Modbus register constant throughout the baseline holds another value |
+| MED | A Modbus register value beyond its baseline range by more than 10% of the range (at least 1) |
+| HIGH / MED | New service (HIGH on an OT host) |
+| MED | New IoT pair; other IT protocol on an OT host; new host; OS or service software change |
+| MED | OT/IoT conversation absent although the capture spans 3 of its baseline polling intervals |
+| MED | Polling cadence changed by 1.5x or more (and by at least 50 ms); regular polling (jitter <= 0.10) became irregular (>= 0.30) |
+| MED | Traffic or write/control command rate changed by 3x or more |
+| LOW | New conversation between IT hosts; new OT read/diagnostic command; a register of a known server not seen in the baseline |
+| INFO | Absent hosts, commands and IT conversations |
+
+Rates are compared per minute of capture, and only when both captures span at least 30 s. Cadence needs at least 10 intervals on each side; requests less than 5 ms apart count as one poll. A register needs 5 samples on each side. A baseline written by an earlier `--baseline-save` (schema 1) still compares: hosts, services and OT command totals are diffed, and the profile sections are noted as not in the baseline. `--baseline-save PATH` and `--baseline-compare REF` remain as aliases.
 
 ## Rules
 
@@ -283,7 +324,9 @@ python -m pcapper --help
 ### General flags
 
 - `--base`
-- `--baseline-compare PATH`
+- `--baseline [PATH]`
+- `--baseline-compare REF`
+- `--baseline-diff REF`
 - `--baseline-fast`
 - `--baseline-save PATH`
 - `--bpf EXPR`
