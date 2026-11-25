@@ -130,6 +130,7 @@ flowchart LR
 | --- | --- |
 | Get immediate risk triage | `--threats --ips --health` |
 | Hunt C2 or beaconing behavior | `--beacon --dns --tls --quic` |
+| Hunt proxy/tunnel evasion (VPN, SOCKS) | `--vpn --socks` |
 | Map findings to ATT&CK | `--mitre` |
 | Corroborate with IDS alerts | `--suricata` |
 | Investigate data theft and transferred artifacts | `--exfil --files --ftp --http --aim --email` |
@@ -291,7 +292,7 @@ Built against a 331-challenge ICS/OT PCAP range, where every gap below was a cap
 
 **v2.4.0 is the "wrong rather than failing" release.** Every one of the 120-plus analyzers was read line by line in a two-day production-readiness review, and the pattern that kept turning up was a report that was confidently wrong: a server counted as its own busiest client, a window that spanned the whole capture, a padded frame read as protocol bytes, a heuristic that fired on healthy traffic. The suite grew from 255 to 572 tests, each new one built on a synthetic capture that reproduced the defect.
 
-- 🎭 **Roles are right everywhere.** UDP, TCP, SNMP, LDAP, Kerberos, NTLM, QUIC, DoT/DoQ, HTTP/2, WinRM, RDP, WMI, PowerShell, Telnet, VNC, TeamViewer, VPN, AIM, syslog, BGP, Modbus, DNP3, safety-system ports, IEC 101/103 (from the FT1.2 PRM bit) and OPC Classic (from the DCE/RPC PDU type) all had the sender as "client". The top-clients table on a normal capture used to list the directory server and the KDC.
+- 🎭 **Roles are right everywhere.** UDP, TCP, SNMP, LDAP, Kerberos, NTLM, QUIC, DoT/DoQ, HTTP/2, WinRM, RDP, WMI, PowerShell, Telnet, VNC, TeamViewer, VPN, SOCKS, AIM, syslog, BGP, Modbus, DNP3, safety-system ports, IEC 101/103 (from the FT1.2 PRM bit) and OPC Classic (from the DCE/RPC PDU type) all had the sender as "client". The top-clients table on a normal capture used to list the directory server and the KDC.
 - 🎫 **Kerberos AS-REP roasting is evidence-based.** It used to fire on "five AS-REPs and no pre-auth error", which every healthy domain logon satisfies. It now requires an AS-REP answering an AS-REQ with no pre-authentication data, names the roastable accounts, and points at `hashcat -m 18200`. Principal names and realms are read from the ASN.1 — the old SPN regexes only ever matched captures of tool output.
 - 📬 **`--ftp` no longer reports your mail.** Any `NNN text` line or `USER`/`PASS` on any port was FTP, so every SMTP and POP3 session appeared in the FTP report with its credentials. A flow off the control ports must now be confirmed by an FTP-specific command or reply.
 - 📈 **Brute force and UDP flood are rates**, not totals: twenty SMB sessions over a working day and a resolver's daily 5,000 datagrams are no longer attacks.

@@ -39,6 +39,18 @@ A deep check of every analysis under `-summarize` -- 125 steps on two composite 
 
 - **The quote of the day is shown only on the full ASCII-art banner** (`pcapper` without arguments, and `-h`). An analysis run starts with the one-line name and version header.
 
+## 3.3.0 — 2026-11-25
+
+### `--socks`: SOCKS proxy / tunnel detection
+
+A SOCKS proxy relays a client's traffic to a destination the client names in the handshake — a tunnel that moves traffic past egress controls, hides the real destination behind the proxy, and is the transport under many C2 implants. `--socks` reads the SOCKS4/4a/5 handshake off the wire and reports it in the same layout as `--vpn`.
+
+- **Structure, not port.** Detection reads the actual greeting / request / reply bytes, so it finds a proxy on 1080, on 9901, or on an ephemeral port alike. A conversation is reported only once a handshake is answered in both directions (greeting → method selection, or request → reply), which kept it to **zero false positives across 138 non-SOCKS captures** while flagging every SOCKS capture in the corpus.
+- **What it surfaces:** the proxy and its clients (roles inferred from the handshake), the version (SOCKS4/4a/5), the command (CONNECT / BIND / UDP ASSOCIATE), the **tunnelled target** `host:port` (the destination egress logs never see), the negotiated authentication, the reply status, offered auth methods, and artifact correlations.
+- **Hunt reads:** `HIGH` for a **reverse / server-initiated proxy** (the proxy-server role dials out first — the shape of a reverse-SOCKS implant; T1090.001); `MEDIUM` for **cleartext username/password auth** (surfaced like `--creds`, masked under `--redact`; T1090) and for a **tunnel to a sensitive service port** (RDP/SMB/SSH/DB/… — a pivot; T1090); `LOW` for failed-auth attempts, `No acceptable methods`, UDP ASSOCIATE relays, legacy SOCKS4/4a, non-standard proxy ports, and many-clients-to-few-proxies fan-out.
+- Feeds the consolidated `--threats` output and participates in `-summarize` roll-ups like every other analyzer.
+
+
 ## 3.2.0 — 2026-11-25
 
 ### `--baseline-diff` reads like an incident report

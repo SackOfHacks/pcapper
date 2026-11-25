@@ -273,6 +273,7 @@ from .reporting import (
     render_sizes_summary,
     render_smb_summary,
     render_snmp_summary,
+    render_socks_summary,
     render_srtp_summary,
     render_ssdp_summary,
     render_ssh_summary,
@@ -321,6 +322,7 @@ from .services import analyze_services, merge_services_summaries
 from .sizes import analyze_sizes
 from .smb import analyze_smb
 from .snmp import analyze_snmp, merge_snmp_summaries
+from .socks import analyze_socks, merge_socks_summaries
 from .srtp import analyze_srtp
 from .ssdp import analyze_ssdp
 from .ssh import analyze_ssh, merge_ssh_summaries
@@ -449,6 +451,7 @@ def _core_flag_map() -> dict[str, str]:
         "--encrypted-dns": "encrypted_dns",
         "--ntp": "ntp",
         "--ssdp": "ssdp",
+        "--socks": "socks",
         "--vpn": "vpn",
         "--opc-classic": "opc_classic",
         "--streams": "streams",
@@ -640,6 +643,7 @@ _SIMPLE_STEP_ANALYZERS: dict[str, tuple[str, ...]] = {
     "sizes": ("analyze_sizes",),
     "smb": ("analyze_quic", "analyze_smb",),
     "snmp": ("analyze_snmp",),
+    "socks": ("analyze_socks",),
     "srtp": ("analyze_srtp",),
     "ssdp": ("analyze_ssdp",),
     "ssh": ("analyze_ssh",),
@@ -2610,6 +2614,10 @@ def build_parser(plugins: list[PluginSpec] | None = None) -> argparse.ArgumentPa
             "Include SSDP/UPnP analysis (discovery artifacts, deterministic checks, threats, anomalies).",
         ),
         (
+            "--socks",
+            "Include SOCKS proxy/tunnel detection (SOCKS4/4a/5: targets, auth, reverse proxies, pivots).",
+        ),
+        (
             "--vpn",
             "Include VPN/tunnel detection (IKE, IPsec, OpenVPN, WireGuard, etc).",
         ),
@@ -3120,6 +3128,7 @@ def _analyze_paths(
     show_encrypted_dns: bool = False,
     show_ntp: bool = False,
     show_ssdp: bool = False,
+    show_socks: bool = False,
     show_vpn: bool = False,
     show_goose: bool = False,
     show_sv: bool = False,
@@ -4255,6 +4264,15 @@ def _analyze_paths(
                 else:
                     print(render_ssdp_summary(ssdp_summary, verbose=verbose))
                 export_summaries["ssdp"] = ssdp_summary
+            elif step == "socks" and show_socks:
+                socks_summary = analyze_socks(
+                    path, show_status=step_status, packets=packets, meta=meta
+                )
+                if summarize_rollups:
+                    rollups.setdefault("socks", []).append(socks_summary)
+                else:
+                    print(render_socks_summary(socks_summary))
+                export_summaries["socks"] = socks_summary
             elif step == "vpn" and show_vpn:
                 vpn_summary = analyze_vpn(
                     path, show_status=step_status, packets=packets, meta=meta
@@ -5234,6 +5252,7 @@ def _analyze_paths(
                 merge_qos_summaries,
                 lambda s: render_qos_summary(s, verbose=verbose),
             ),
+            "socks": (merge_socks_summaries, render_socks_summary),
             "vpn": (merge_vpn_summaries, render_vpn_summary),
             "wlan": (merge_wlan_summaries, render_wlan_summary),
             "snmp": (
@@ -5318,6 +5337,7 @@ def _analyze_paths(
             "encrypted_dns": "ENCRYPTED DNS ANALYSIS",
             "ntp": "NTP ANALYSIS",
             "ssdp": "SSDP ANALYSIS",
+            "socks": "SOCKS PROXY/TUNNEL ANALYSIS",
             "vpn": "VPN/TUNNEL ANALYSIS",
             "files": "FILE TRANSFER ANALYSIS",
             "overview": "STRATEGIC OVERVIEW",
@@ -6298,6 +6318,7 @@ def main() -> int:
                 show_encrypted_dns=getattr(args, "encrypted_dns", False),
                 show_ntp=getattr(args, "ntp", False),
                 show_ssdp=getattr(args, "ssdp", False),
+                show_socks=getattr(args, "socks", False),
                 show_vpn=getattr(args, "vpn", False),
                 show_goose=getattr(args, "goose", False),
                 show_sv=getattr(args, "sv", False),
