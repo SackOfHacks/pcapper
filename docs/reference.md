@@ -196,6 +196,13 @@ A baseline (`schema_version` 2) records:
 | LOW | New conversation between IT hosts; new OT read/diagnostic command; a register of a known server not seen in the baseline |
 | INFO | Absent hosts, commands and IT conversations |
 
+The drift report reads like an incident report:
+
+- **Headline**: the lead incident (worst first, then the best corroborated), and counts of deviations, informational changes and background changes.
+- **Incidents**: the deviations correlated per actor, with fixed rules in `pcapper/baseline.py` (`correlate_incidents`): a *rogue OT master* (control activity from a host that never acted as an OT client in the baseline, with the register values that changed on its targets as its impact), *new control activity* from a known master, *adversary-in-the-middle* (an IP sending from another device's MAC, attributed to the IP that owns that MAC), *remote access to an OT asset*, *process values changed with no new writer seen*, and *OT communication lost*. Each shows when it ran (first sighting to last activity, with duration), its ATT&CK for ICS techniques, the evidence, and the pcapper commands to run next (the protocol dissectors involved, `--arp`, `--control-loop`, `--hostdetails -ip`, `--timeline -ip`).
+- **Findings**: every deviation that fired, with its first sighting and technique. **Timeline**: the same, in time order. Then the evidence tables.
+- **Background chatter** (broadcast, multicast, link-local and unspecified addresses coming and going) and informational absences are counted but shown only with `-v`.
+
 Rates are compared per minute of capture, and only when both captures span at least 30 s. Cadence needs at least 10 intervals on each side; requests less than 5 ms apart count as one poll. A register needs 5 samples on each side. A baseline written by an earlier `--baseline-save` (schema 1) still compares: hosts, services and OT command totals are diffed, and the profile sections are noted as not in the baseline. `--baseline-save PATH` and `--baseline-compare REF` remain as aliases.
 
 ## Rules

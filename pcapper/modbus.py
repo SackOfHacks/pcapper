@@ -197,8 +197,9 @@ class ModbusAnalysis:
     anomalies: List[ModbusAnomaly] = field(default_factory=list)
     value_changes: List[dict[str, object]] = field(default_factory=list)
     # Observed value range per register: (server, unit, register type,
-    # address) -> [min, max, samples], from read responses paired with their
-    # request and from decoded write values. What --baseline profiles.
+    # address) -> [min, max, samples, first time of min, first time of max],
+    # from read responses paired with their request and from decoded write
+    # values. What --baseline profiles.
     register_ranges: Dict[Tuple[str, int, str, int], List[int]] = field(default_factory=dict)
     # One record per (function, unit, master, server) write stream: count,
     # first/last time and the last request detail (target + values).
@@ -652,17 +653,18 @@ def analyze_modbus(
     read_register_values: Dict[Tuple[str, int, int], Dict[int, int]] = defaultdict(dict)
     register_ranges: Dict[Tuple[str, int, str, int], List[int]] = {}
 
-    def _note_value(key: Tuple[str, int, str, int], value: int) -> None:
+    def _note_value(key: Tuple[str, int, str, int], value: int, when: Optional[float] = None) -> None:
+        stamp = float(when) if when else 0.0
         entry = register_ranges.get(key)
         if entry is None:
             if len(register_ranges) >= MAX_REGISTER_RANGES:
                 return
-            register_ranges[key] = [value, value, 1]
+            register_ranges[key] = [value, value, 1, stamp, stamp]
             return
         if value < entry[0]:
-            entry[0] = value
+            entry[0], entry[3] = value, stamp
         elif value > entry[1]:
-            entry[1] = value
+            entry[1], entry[4] = value, stamp
         entry[2] += 1
     rtt_samples: Dict[str, List[int]] = defaultdict(list)
     matched_tx = 0
@@ -1103,7 +1105,7 @@ def analyze_modbus(
                                 if original_func in {5, 6} and len(pdu) >= 5:
                                     value = int.from_bytes(pdu[3:5], "big")
                                     key = (dst_ip, unit_id, reg_type, addr)
-                                    _note_value(key, value)
+                                    _note_value(key, value, ts)
                                     prev = last_values.get(key)
                                     if (
                                         prev is not None
@@ -1146,7 +1148,7 @@ def analyze_modbus(
                                                 reg_type,
                                                 target_idx,
                                             )
-                                            _note_value(key, value)
+                                            _note_value(key, value, ts)
                                             prev = last_values.get(key)
                                             if (
                                                 prev is not None
@@ -1184,7 +1186,7 @@ def analyze_modbus(
                                             reg_type,
                                             target_idx,
                                         )
-                                        _note_value(key, value)
+                                        _note_value(key, value, ts)
                                         prev = last_values.get(key)
                                         if (
                                             prev is not None
@@ -1256,7 +1258,7 @@ def analyze_modbus(
                                 read_value = int.from_bytes(values[2 * index:2 * index + 2], "big")
                                 if len(regs) < 65536:
                                     regs[read_req[1] + index] = read_value
-                                _note_value((src_ip, unit_id, read_type, read_req[1] + index), read_value)
+                                _note_value((src_ip, unit_id, read_type, read_req[1] + index), read_value, ts)
                         req_ts = pending_tx.pop(resp_key, None)
                         if req_ts is not None:
                             matched_tx += 1

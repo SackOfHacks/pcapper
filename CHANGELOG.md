@@ -4,6 +4,21 @@ All notable changes to pcapper will be documented in this file.
 
 This project follows [Semantic Versioning](https://semver.org/).
 
+## 3.2.0 — 2026-11-25
+
+### `--baseline-diff` reads like an incident report
+
+The drift report listed every deviation; an analyst still had to assemble them into what happened. It now does that, the way `--compromised` reports hosts:
+
+- **Incidents** correlate the deviations per actor with fixed rules: a rogue OT master (with the register values it changed on its targets as the impact), new control activity from a known master, adversary-in-the-middle attributed to the IP that owns the intruding MAC, remote access to an OT asset, process values changed with no writer seen, OT communication lost. Each shows when it ran (first sighting to last activity), its ATT&CK for ICS techniques, the evidence, and the pcapper commands to run next.
+- **The headline names the lead incident**, e.g. `HIGH  Rogue OT master 172.27.224.50 writing to 172.27.224.250`.
+- **Every deviation carries its first sighting and, where it is the behaviour, its technique** (T0848 Rogue Master, T0855 Unauthorized Command Message, T0836 Modify Parameter, T0830 Adversary-in-the-Middle, T0886 Remote Services, T0831/T0832 Manipulation of Control/View, T0856, T0814, T0806); a **Timeline** orders them.
+- **Background chatter** -- broadcast, multicast, link-local and unspecified addresses coming and going -- is counted but kept out of the findings and evidence tables (`-v` shows it). On the Coimbra Modbus captures that was 10 of 16 deviations (ARP man-in-the-middle) and 20 of 26 (Modbus flood).
+- A rate 10x the baseline on an OT conversation is reported as `OT traffic flood` (T0814); write/control rates 10x as T0806.
+- Baselines now record when each pair command, IP-MAC binding and register extreme was first (and last) seen; `OtCommandSummary.pair_command_times`, `TrafficProfile.ip_mac_times`.
+
+On the Coimbra captures the incidents span 5m 00s (Modbus flood) and 5m 02s (ARP man-in-the-middle): the datasets' documented 5-minute attack windows.
+
 ## 3.1.0 — 2026-11-25
 
 ### Baselines: `--baseline` and `--baseline-diff`

@@ -1,12 +1,14 @@
 """Rendered output for --baseline (the profile just recorded) and
 --baseline-diff (what deviates from a saved baseline or a reference capture).
 
-The drift report leads with its findings, one per deviation rule that fired
-(pcapper.baseline.compare_baseline), worst first; the tables below are the
-evidence: new, absent and changed conversations, per-pair commands, layer-2
-streams, MAC bindings, hosts and services. Additions lead each table (a new
-pair, writer or MAC is the rogue-device / new-access cue); -v prints every
-row and the reference sections."""
+The drift report reads like an incident report. The headline names the lead
+incident; Incidents tell what happened per actor (who, to what, when, the
+ATT&CK for ICS technique, the evidence, and the pcapper command to run next);
+Findings list every deviation rule that fired, worst first; the Timeline
+orders them by first sighting; the tables below are the evidence. Background
+chatter (broadcast, multicast, link-local and unspecified addresses coming
+and going) and informational absences are counted in the headline and shown
+with -v."""
 
 from __future__ import annotations
 
@@ -89,30 +91,129 @@ def _flow_rows(flows: list, status: str, style=None) -> list[list[str]]:
     return rows
 
 
+def _capture_arg(sources: list) -> str:
+    """The capture to name in a suggested command."""
+    names = [Path(str(s)).name for s in sources or []]
+    if len(names) != 1:
+        return "<capture>"
+    name = names[0]
+    return f'"{name}"' if " " in name else name
+
+
+def _incident_lines(incidents: list, deviations: list, capture: str) -> list[str]:
+    lines: list[str] = []
+    pad = " " * (st.BADGE_W + 4)
+    shown = incidents if st.verbose() else incidents[:6]
+    width = None if st.verbose() else 150
+    for incident in shown:
+        attack = str(incident.get("attack") or "")
+        lines.append(f"  {st.badge(incident.get('severity'))}  {st.strong(str(incident.get('title', '')))}")
+        rows: list[tuple[str, str]] = []
+        first, last = incident.get("first_seen"), incident.get("last_seen")
+        if first:
+            span = float(last) - float(first) if last else 0.0
+            rows.append(("when", st.ts_range(first, last) + (f" ({st.duration(span)})" if span >= 1 else "")))
+        if attack:
+            # Whole techniques per line, never cut mid-name.
+            line_parts: list[str] = []
+            for technique in attack.split("; "):
+                if line_parts and len("; ".join(line_parts + [technique])) > 110:
+                    rows.append(("att&ck" if not any(r[0] == "att&ck" for r in rows) else "", "; ".join(line_parts)))
+                    line_parts = []
+                line_parts.append(technique)
+            rows.append(("att&ck" if not any(r[0] == "att&ck" for r in rows) else "", "; ".join(line_parts)))
+        members = [deviations[i] for i in incident.get("members") or [] if i < len(deviations)]
+        members.sort(key=lambda d: (-st.sev_rank(d.get("severity")), d.get("kind") == "register", str(d.get("summary"))))
+        evidence = [d for d in members if d.get("kind") != "register"]
+        impact = [d for d in members if d.get("kind") == "register"]
+        limit = None if st.verbose() else 3
+        for d in evidence[:limit]:
+            rows.append(("what", _member_text(d)))
+        for d in impact[:limit]:
+            rows.append(("impact", _member_text(d)))
+        hidden = (len(evidence) - 3 if len(evidence) > 3 else 0) + (len(impact) - 3 if len(impact) > 3 else 0)
+        if hidden and not st.verbose():
+            rows.append(("", f"+{hidden} more {'deviation' if hidden == 1 else 'deviations'} (-v)"))
+        pivots = incident.get("pivots") or []
+        for flags in pivots if st.verbose() else pivots[:2]:
+            rows.append(("next", f"pcapper {capture} {' '.join(flags)}"))
+        for label_text, value in rows:
+            lines.append(pad + st.dim(st.cut(f"{(label_text + ':').ljust(9) if label_text else ' ' * 9}{value}", width)))
+    if len(incidents) > len(shown):
+        lines.append(st.more(len(incidents) - len(shown), "incident"))
+    return lines
+
+
+def _member_text(d: dict) -> str:
+    details = str(d.get("details") or "")
+    where = ""
+    if d.get("src") and d.get("dst"):
+        where = f"{d['src']} -> {d['dst']}  "
+    elif d.get("src") or d.get("dst"):
+        where = f"{d.get('src') or d.get('dst')}  "
+    return f"{d.get('summary')}: {where}{details}".rstrip(": ").rstrip()
+
+
+def _timeline_rows(deviations: list) -> list[list[str]]:
+    rows = []
+    for d in sorted((d for d in deviations if d.get("ts") and not d.get("background")
+                     and st.sev_rank(d.get("severity")) >= 1), key=lambda d: (float(d["ts"]), str(d.get("summary")))):
+        flow = st.flow(d.get("src"), d.get("dst")) if d.get("src") and d.get("dst") else str(d.get("src") or d.get("dst") or "-")
+        rows.append([st.ts(d.get("ts")), st.badge(d.get("severity")), str(d.get("summary", "")), flow])
+    return rows
+
+
 def render_baseline_delta(delta) -> str:
     if not delta:
         return ""
+    from ..baseline import _background_ip
+
     rep = st.Report("Baseline drift", "baseline vs current")
-    findings = [st.finding(d) for d in (delta.deviations or [])]
-    material = [f for f in findings if st.sev_rank(f.severity) >= 1]
-    if material:
+    deviations = list(delta.deviations or [])
+    signal = [d for d in deviations if not d.get("background")]
+    background = [d for d in deviations if d.get("background")]
+    material = [d for d in signal if st.sev_rank(d.get("severity")) >= 1]
+    informational = [d for d in signal if st.sev_rank(d.get("severity")) < 1]
+    incidents = list(getattr(delta, "incidents", None) or [])
+    capture = _capture_arg(delta.current_sources)
+
+    if incidents:
+        severity = incidents[0].get("severity")
+        lead = str(incidents[0].get("title", ""))
+        text = lead if len(incidents) == 1 else f"{st.plural(len(incidents), 'incident')} · lead: {lead}"
+    elif material:
         severity, text = st.verdict(
-            material,
+            [st.finding(d) for d in material],
             high="new access or control activity since the baseline: review",
             medium="drift from the baseline: review",
             low="minor drift from the baseline",
         )
     else:
-        severity, text = None, "matches the baseline" + (" (absences only)" if findings else "")
-    rep.headline(severity, text)
+        severity, text = None, "matches the baseline" + (" (absences and background changes only)" if deviations else "")
+    rep.headline(severity, text, st.join([
+        st.plural(len(material), "deviation") if material else "",
+        f"{len(informational)} informational" if informational else "",
+        f"{len(background)} background" if background else "",
+    ]))
     rep.scope(f"baseline  {_sources(delta.baseline_sources)}  {st.join([_window(delta.baseline_capture), 'pcapper ' + (delta.baseline_version or '-')])}")
     rep.scope(f"current   {_sources(delta.current_sources)}  {st.join([_window(delta.current_capture), 'pcapper ' + (delta.current_version or '-')])}")
     for note in delta.notes or []:
         rep.note("NOTE", str(note))
 
-    rep.section("Findings", st.findings_block(findings))
+    rep.section("Incidents", _incident_lines(incidents, deviations, capture))
+    quiet = len(informational) + len(background)
+    rep.section("Findings", st.findings_block([st.finding(d) for d in material])
+                + ([st.dim(f"  + {quiet} informational and background changes (-v shows them)")] if quiet and not st.verbose() else []))
+    rep.section("Timeline", st.table(["First seen", "Severity", "Deviation", "Where"], _timeline_rows(deviations),
+                                     max_rows=12, noun="event"))
+    rep.section("Informational", st.findings_block([st.finding(d) for d in informational]), detail=True)
 
-    rows = (_flow_rows(delta.new_flows, "new", st.bad) + _flow_rows(delta.missing_flows, "absent"))
+    def _foreground(flow: dict) -> bool:
+        return not (_background_ip(flow.get("client")) or _background_ip(flow.get("server")))
+
+    new_flows = [f for f in delta.new_flows if st.verbose() or _foreground(f)]
+    missing_flows = [f for f in delta.missing_flows if st.verbose() or _foreground(f)]
+    rows = (_flow_rows(new_flows, "new", st.bad) + _flow_rows(missing_flows, "absent"))
     rep.section("Conversations", st.table(
         ["", "Flow", "Protocol", "Class", "Packets", "Cadence"], rows, align="llllrl", max_rows=12, noun="conversation"))
 
@@ -165,9 +266,12 @@ def render_baseline_delta(delta) -> str:
         mac_rows.append([str(change.get("ip", "")), was or "-", st.bad(now) if now else "-"])
     rep.section("MAC bindings", st.table(["IP", "Baseline MAC", "Current MAC"], mac_rows, max_rows=10, noun="address"))
 
-    rep.section("Hosts", st.kv([("New", st.bad(st.listing(delta.new_hosts)) if delta.new_hosts else ""),
-                                ("Absent", st.listing(delta.missing_hosts))])
-                + st.table(["Host", "Change"], [[i.get("ip", "-"), _host_change(i)] for i in delta.host_changes],
+    new_hosts = [h for h in delta.new_hosts if st.verbose() or not _background_ip(h)]
+    missing_hosts = [h for h in delta.missing_hosts if st.verbose() or not _background_ip(h)]
+    rep.section("Hosts", st.kv([("New", st.bad(st.listing(new_hosts)) if new_hosts else ""),
+                                ("Absent", st.listing(missing_hosts))])
+                + st.table(["Host", "Change"], [[i.get("ip", "-"), _host_change(i)] for i in delta.host_changes
+                                                if st.verbose() or not _background_ip(i.get("ip"))],
                            widths=(None, 100), max_rows=10, noun="host"))
     svc_rows = [[st.bad("new"), _service(i), i.get("service") or "-", i.get("software") or "-"] for i in delta.new_services]
     svc_rows += [["changed", _service(i), st.join([i.get("from_service"), i.get("from_software")], " ") + " -> "
@@ -185,6 +289,12 @@ def render_baseline_delta(delta) -> str:
         rep.section("Control targets", st.table(
             ["", "Target"], [[st.bad("new"), t] for t in delta.new_control_targets] + [["absent", t] for t in delta.missing_control_targets],
             max_rows=10, noun="target"))
+    rep.section("Background changes", st.table(
+        ["Change", "Where", "Detail"],
+        [[str(d.get("summary", "")).replace("Background chatter: ", ""),
+          st.flow(d.get("src"), d.get("dst")) if d.get("src") and d.get("dst") else str(d.get("src") or d.get("dst") or "-"),
+          str(d.get("details") or "-")] for d in background],
+        max_rows=None, noun="change"), detail=True)
     return rep.render()
 
 
