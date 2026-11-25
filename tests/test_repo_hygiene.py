@@ -41,7 +41,7 @@ def _classify(path: Path) -> str | None:
     if path.suffix == ".json":
         return None if path.parent == DATA_TABLE_DIR else "JSON outside the package data tables"
     if path.suffix == ".txt":
-        if path == Path("requirements.txt") or path.parent == GOLDEN_DIR:
+        if path.parent == GOLDEN_DIR:  # pyproject.toml is the only dependency manifest
             return None
         return "text file outside tests/data/golden"
     if path.suffix in {".pcap", ".pcapng"}:

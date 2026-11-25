@@ -358,7 +358,7 @@ def _record_bounded(counter: Counter[str], key: str, max_uniques: int) -> None:
 
 def _indicator_key(label: str, value: str) -> str:
     snippet = _safe_excerpt(value, limit=90)
-    digest = hashlib.sha1(value.encode("utf-8", errors="ignore")).hexdigest()[:10]
+    digest = hashlib.sha1(value.encode("utf-8", errors="ignore"), usedforsecurity=False).hexdigest()[:10]
     return f"{label}: {snippet} [sha1:{digest}]"
 
 

@@ -1,8 +1,10 @@
 """Deep checks of ``-summarize`` across every analysis -- a developer tool,
-not shipped with pcapper.
+not shipped with pcapper and not collected by pytest (it needs the ICS-pcaps
+collection, which the repository does not carry; tests/test_rollup_generic.py
+holds the same checks on the committed fixtures).
 
-    py -3 tools/rollup_check.py build DIR --ics ICS_PCAPS [--common DIR] [--pair A B ...]
-    py -3 tools/rollup_check.py {order,identity,self,seed,all} DIR [--step STEP ...] [--workers N]
+    python tests/rollup_check.py build DIR --ics ICS_PCAPS [--common DIR] [--pair A B ...]
+    python tests/rollup_check.py {order,identity,self,seed,all} DIR [--step STEP ...] [--workers N]
 
 ``build`` writes two composite captures into DIR, X.pcap and Y.pcap, each
 holding a different small capture of every protocol family it finds (the

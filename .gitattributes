@@ -1,3 +1,8 @@
+# Every text file is LF in every working tree -- Windows (core.autocrlf) and
+# macOS/Linux checkouts hold the same bytes, so a file edited on one machine
+# does not churn on the next. The rules below refine this.
+* text=auto eol=lf
+
 # Capture fixtures are binary. Without this, a checkout with core.autocrlf=true
 # rewrites 0x0A bytes inside the packet data and the fixture stops parsing.
 *.pcap binary
@@ -8,6 +13,12 @@
 # they must not pick up CRLF on a Windows checkout. (The test harness also
 # normalises line endings, but pinning them here keeps the diffs readable.)
 tests/data/golden/*.txt text eol=lf
+
+# The changelog is append-only: every change adds lines under "Unreleased".
+# Union merge keeps both sides' new lines instead of stopping on a conflict
+# when two branches (often from two machines) each added an entry. Review
+# the merged section; git cannot know the intended order.
+CHANGELOG.md merge=union
 
 # Source stays LF everywhere.
 *.py text eol=lf

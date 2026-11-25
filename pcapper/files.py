@@ -94,7 +94,7 @@ class FileArtifact:
         if self.payload and (self.sha256 is None or self.md5 is None):
             try:
                 self.sha256 = hashlib.sha256(self.payload).hexdigest()
-                self.md5 = hashlib.md5(self.payload).hexdigest()
+                self.md5 = hashlib.md5(self.payload, usedforsecurity=False).hexdigest()
             except Exception:
                 self.sha256 = self.sha256 or None
                 self.md5 = self.md5 or None
@@ -4794,7 +4794,7 @@ def _export_with_dpkt(
                         "dst_ip": art.dst_ip,
                         "packet_index": str(art.packet_index),
                         "sha256": art.sha256 or hashlib.sha256(art.payload).hexdigest(),
-                        "md5": art.md5 or hashlib.md5(art.payload).hexdigest(),
+                        "md5": art.md5 or hashlib.md5(art.payload, usedforsecurity=False).hexdigest(),
                         "imphash": _compute_imphash(art.payload) or "-",
                     }
                 )
@@ -4891,7 +4891,7 @@ def _export_with_scapy(
                         "dst_ip": art.dst_ip,
                         "packet_index": str(art.packet_index),
                         "sha256": art.sha256 or hashlib.sha256(art.payload).hexdigest(),
-                        "md5": art.md5 or hashlib.md5(art.payload).hexdigest(),
+                        "md5": art.md5 or hashlib.md5(art.payload, usedforsecurity=False).hexdigest(),
                         "imphash": _compute_imphash(art.payload) or "-",
                     }
                 )
@@ -5679,7 +5679,7 @@ def analyze_files(
             if requested not in str(art.filename).lower():
                 continue
             sha256_val = art.sha256 or hashlib.sha256(art.payload).hexdigest()
-            md5_val = art.md5 or hashlib.md5(art.payload).hexdigest()
+            md5_val = art.md5 or hashlib.md5(art.payload, usedforsecurity=False).hexdigest()
             key = (
                 str(art.filename),
                 str(art.protocol),

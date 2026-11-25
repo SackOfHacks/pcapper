@@ -1,8 +1,37 @@
 # Changelog
 
-All notable changes to pcapper will be documented in this file.
+All notable changes to pcapper, newest first. The project follows [Semantic Versioning](https://semver.org/).
 
-This project follows [Semantic Versioning](https://semver.org/).
+Every change adds its entry under **Unreleased**. A release adds its `## X.Y.Z — date` heading directly below that one, which moves those entries into the release and leaves Unreleased empty, and sets `__version__` in `pcapper/__init__.py` -- the only copy of the version.
+
+## Unreleased
+
+## 3.5.1 — 2026-11-25
+
+### Repository: fewer files, fewer conflicts
+
+PRs opened from two machines conflicted on the lines every release touched: the version in `requirements.txt`, the README badge and its "Current Release" section, the top of this file.
+
+- **The version is written once**, in `pcapper/__init__.py`; `tests/test_packaging.py` fails if a copy appears in the README, SECURITY.md, the docs, `pyproject.toml` or the workflows, and if the release directly below `## Unreleased` in this file is not that version.
+- **`requirements.txt` is gone.** It repeated `pyproject.toml`'s dependency list by hand (and needed a test to keep the copies agreeing); install with `pip install .`, or `pip install -e ".[dev]"` to develop. Dependabot reads `pyproject.toml`.
+- **CHANGELOG-archive.md is gone.** The notes for 2.0.2 and earlier are in this file as tagged [v2.0.2](https://github.com/SackOfHacks/pcapper/blob/v2.0.2/CHANGELOG.md).
+- **`tools/rollup_check.py` moved to `tests/rollup_check.py`**: one fewer top-level directory; pytest does not collect it.
+- **`.gitattributes`**: every text file is LF in every working tree (a Windows checkout no longer holds CRLF copies of `.gitignore` or `LICENSE`), and this file merges as a union, so two branches that each added an entry do not conflict.
+- **README rewritten** for the current tool: no version or test-count badges to keep current, no per-release notes (they are here), install with `pip install .`, and a section on running PRs from more than one machine.
+
+### Packaging
+- The license is declared as an SPDX expression (`license = "MIT"`, `license-files`), as current setuptools expects; the build requires setuptools 77 and no longer `wheel`. Python 3.14 is listed; project links include the changelog and the security policy.
+
+### Security
+- **Colour codes from a capture.** The terminal backstop behind every report kept any colour sequence, so packet text that a renderer forgot to escape could conceal, reverse or blank out what followed it. It now keeps only pcapper's own colours (black only on the yellow badge, where it is text on a background) and shows any other sequence escaped.
+
+### Fixed
+- **One VirusTotal key.** `-vt` lookups read `VT_API_KEY` and the `--ips` reputation lookup read `PCAPPER_VT_KEY`, so setting either one left the other half of the lookups skipped. Both names now work everywhere.
+- **FIPS-mode hosts.** MD5 and SHA-1 are used for JA3/HASSH fingerprints, file hashes and short ids, never for security; on a FIPS-mode system hashlib refused them and those analyses raised. Every call now says `usedforsecurity=False`.
+- The datastore service set listed Redis twice.
+
+### Docs
+- Network egress is documented in one place (`docs/reference.md`, *Notes*), and SECURITY.md says what pcapper sends off the machine: nothing, unless a lookup is configured.
 
 ## 3.5.0 — 2026-11-25
 
@@ -602,4 +631,4 @@ Every packet's *sender* used to be the "client" and its *receiver* the "server".
 
 ---
 
-Releases before 2.1.0 are in [CHANGELOG-archive.md](CHANGELOG-archive.md).
+Releases before 2.1.0 are in the changelog as tagged [v2.0.2](https://github.com/SackOfHacks/pcapper/blob/v2.0.2/CHANGELOG.md).

@@ -1,133 +1,68 @@
 # Pcapper
 
-![Python](https://img.shields.io/badge/python-3.9%20%E2%80%93%203.13-0B7285)
 ![CI](https://github.com/SackOfHacks/pcapper/actions/workflows/ci.yml/badge.svg)
-![Tests](https://img.shields.io/badge/tests-1141%20passing-1B5E20)
-![Analyzers](https://img.shields.io/badge/analyzers-120%2B-3D5A80)
-![Version](https://img.shields.io/badge/release-v3.5.0-7C3AED)
+![Python](https://img.shields.io/badge/python-3.9%2B-0B7285)
 ![License](https://img.shields.io/badge/license-MIT-6C757D)
-![CLI](https://img.shields.io/badge/cli-incident--grade-1B5E20)
 ![OT/ICS](https://img.shields.io/badge/ot%2Fics-ready-3D5A80)
-![SOC](https://img.shields.io/badge/designed%20for-SOC-0F766E)
-![DFIR](https://img.shields.io/badge/designed%20for-DFIR-7C3AED)
-![OT/ICS Defenders](https://img.shields.io/badge/designed%20for-OT%2FICS%20Defenders-0B7285)
-![Purple Team](https://img.shields.io/badge/designed%20for-Purple%20Team-1D4ED8)
 
 ```text
-  ____                                                    
- |  _ \  ___ __ _ _ __  _ __   ___ _ __                  
- | |_) |/ __/ _` | '_ \| '_ \ / _ \ '__|                 
- |  __/| (_| (_| | |_) | |_) |  __/ |                    
- |_|    \___\__,_| .__/| .__/ \___|_|                    
-                 |_|   |_|                              
+  ____
+ |  _ \  ___ __ _ _ __  _ __   ___ _ __
+ | |_) |/ __/ _` | '_ \| '_ \ / _ \ '__|
+ |  __/| (_| (_| | |_) | |_) |  __/ |
+ |_|    \___\__,_| .__/| .__/ \___|_|
+                 |_|   |_|
   PCAP triage for IT + OT/ICS, fast enough for the plant floor
 ```
 
-**Pcapper** is a modular PCAP/PCAPNG analysis CLI for fast triage and deep-dive protocol investigations across enterprise IT and ICS/OT traffic.
+**Pcapper** is a PCAP/PCAPNG forensics and threat-hunting CLI for enterprise IT and OT/ICS networks. It reads a capture once and runs any of 120+ analyses over it -- from a one-command overview to deep dives into Modbus, DNP3, IEC-104, S7, CIP and dozens of other protocols. Every report leads with a severity headline and its findings, and every finding carries its evidence, its ATT&CK technique and the next command to run.
 
-**OT/ICS READY** — plant-floor triage in minutes, not hours.
-
-Built for blue teams, DFIR responders, and OT defenders who need fast answers with evidence-rich outputs.
-
-> Install and run in under a minute: `pip install -r requirements.txt` then `python -m pcapper capture.pcap --threats --ips --timeline -ip 10.0.0.5`
+Built for SOC analysts, incident responders and OT defenders who need fast answers they can defend.
 
 ## Why you can put its output in a report
 
-A PCAP tool is only useful if what it prints is *true*. Every analyzer in pcapper now holds to four rules, each one pinned by a regression test on a synthetic capture:
+A PCAP tool is only useful if what it prints is *true*. Every analysis holds to these rules, each pinned by a regression test on a synthetic capture:
 
 | Rule | What it means in the report |
 | --- | --- |
-| **Roles come from the service port, not packet direction** | A server's replies never make it a "client"; a client's ephemeral port is never a "top port". A flow from ephemeral 389 to 443 is not LDAP. |
+| **Roles come from the service port, not packet direction** | A server's replies never make it a "client"; a client's ephemeral port is never a "top port". |
 | **Windows are per protocol** | A one-minute Kerberos exchange in an eight-hour capture reports a one-minute window, and every rate derived from it is right. |
-| **Padding is not payload** | Segment lengths come from the IP/TCP headers, so a padded pure ACK is zero bytes of data, not six NULs in your Telnet transcript or a phantom retransmission. |
-| **Same capture, same report** | Every sort has a total order. Two analysts running the same command get byte-identical output, whatever Python's hash seed did that day. |
+| **Padding is not payload** | Segment lengths come from the IP/TCP headers, so a padded pure ACK is zero bytes of data. |
+| **Same capture, same report** | Every sort has a total order: the same command prints byte-identical output on every run and machine. |
+| **Several captures, one story** | `-summarize` lists what the captures share once, counts distinct hosts and flows over all of them, and does not depend on the order they are named in. |
 
-And nothing internal leaves the box: reputation lookups (`-vt`, `--ip-geo`) only ever see public hostnames and routable addresses, only when you ask, and a config file planted in the evidence directory is never loaded.
+And nothing internal leaves the box: reputation lookups (`-vt`, `--ip-geo`) run only when you ask and configure them, only ever see public hostnames and routable addresses, and a config file planted in the evidence directory is never loaded.
 
-## Why Teams Pick Pcapper
-
-| You Need | Pcapper Delivers |
-| --- | --- |
-| Fast first-pass triage | One-pass summaries across hosts, services, protocols, and threats |
-| Forensic depth when needed | `-v` on any report: every row, exact timestamps, evidence behind each finding |
-| OT + IT in one workflow | Industrial protocol decoding plus enterprise threat-hunting views |
-| Output that can be actioned | Findings first, each with its flow, time, ATT&CK technique and the next command to run |
-
-## Built for Real Incidents
-
-- SOC triage for suspicious captures with immediate threat signal extraction.
-- IR/DFIR workflows where explainability and deterministic evidence matter.
-- OT/ICS incident response for control-plane visibility and safety-oriented context.
-- Purple-team and lab validation with ATT&CK mapping and IDS corroboration.
-
-## Product Highlights
-
-- **Reads a capture once, on every core**: every analysis of every flag comes from a single read of the capture -- in memory or one shared pass from disk -- and `--jobs` (automatic) spreads the work over processes that share it. `--overview` from disk: 9 reads → 1, 56 s → 23 s; `--threats` from disk on a 20k-packet slice 359 s → 47 s.
-- **Concise by default, complete with `-v`**: every report leads with a severity headline and its findings, folds repeats, and says what `-v` adds. Rankings (domains, hosts, URLs, user agents, fingerprints, commands ...) show the top 10 and the bottom 10, the rarest. While it works, pcapper shows one progress bar per capture; `-v` shows the processing detail instead (read-pass percentages, per-analysis timing, library warnings).
-- **`--dnsqueries`**: every DNS / LLMNR / mDNS lookup with the response observed (answers, NXDOMAIN, no response), per host with `-ip`, across captures with `-summarize`.
-- **MITRE ATT&CK mapping**: enterprise + ICS TTP alignment with technique heat and host-centric attack paths.
-- **Suricata integration**: local IDS execution with structured metadata, event coverage, and pivots.
-- **Protocol depth**: broad IT plus OT/ICS protocol coverage for mixed-network environments.
-- **Case-friendly exports**: JSON/CSV/SQLite plus case metadata and provenance artifacts.
-
-## 30-Second Quickstart
+## Install
 
 ```bash
-# 1) Install
-pip install -r requirements.txt
-
-# 2) Fast first-pass triage
-python -m pcapper capture.pcap --threats --ips --timeline -ip 10.0.0.5
-
-# 3) Deep-dive with ATT&CK + IDS corroboration
-python -m pcapper capture.pcap --mitre --suricata --services --protocols
-
-# 4) Export case-ready artifacts
-python -m pcapper capture.pcap --json out/results.json --sqlite out/results.db --case-dir case-001
+git clone https://github.com/SackOfHacks/pcapper.git
+cd pcapper
+pip install .            # or: pipx install .
+pcapper capture.pcap --overview
 ```
 
-## Top 5 Commands by Use Case
+Python 3.9 or newer. Optional external tools: `tshark` for `--decrypt`, `suricata` for `--suricata`, and Npcap (Windows) or libpcap for `--bpf` filtering.
+
+## Quickstart
 
 ```bash
-# 1) Fast triage (best first command)
-python -m pcapper capture.pcap --threats --ips --health
-
-# 2) Host-centric hunt timeline
-python -m pcapper capture.pcap --timeline -ip 10.0.0.5 --protocols --services
-
-# 3) ATT&CK + IDS corroboration
-python -m pcapper capture.pcap --mitre --suricata
-
-# 4) Exfiltration, file transfer, and messaging/email artifact hunt
-python -m pcapper capture.pcap --exfil --files --ftp --http --aim --email
-
-# 5) OT/ICS deep-dive
-python -m pcapper capture.pcap --modbus --dnp3 --iec104 --s7 --ot-commands --safety
+pcapper capture.pcap --overview                        # what is in this capture, and what to look at first
+pcapper capture.pcap --threats --ips --health          # fast risk triage
+pcapper capture.pcap --timeline -ip 10.0.0.5           # one host's story
+pcapper capture.pcap --mitre --suricata                # ATT&CK mapping and IDS corroboration
+pcapper capture.pcap --modbus --dnp3 --iec104 --s7 --ot-commands --safety   # OT/ICS deep dive
+pcapper -summarize day1.pcap day2.pcap day3.pcap --overview                 # several captures as one
+pcapper capture.pcap --threats --json out/results.json --sqlite out/results.db --case-dir case-001
 ```
 
-## Architecture At A Glance
+Add `-v` to any report for every row, exact timestamps and the evidence behind each finding.
 
-```mermaid
-flowchart LR
-  A[PCAP / PCAPNG Input] --> B[Packet Decode + Stream Reassembly]
-  B --> C[IT + OT/ICS Protocol Analyzers]
-  C --> D[Detections + Correlation]
-  D --> E[Severity headline + findings first]
-  E --> F[Reports + Exports]
+## Which flag should I use?
 
-  C --> C1[Enterprise: DNS/HTTP/TLS/SMB/LDAP/Kerberos]
-  C --> C2[Industrial: Modbus/DNP3/IEC104/S7/CIP/Profinet]
-  D --> D1[MITRE Mapping]
-  D --> D2[Suricata Corroboration]
-  F --> F1[CLI]
-  F --> F2[JSON/CSV/SQLite]
-  F --> F3[Case Metadata]
-```
-
-## Which Flag Should I Use?
-
-| If You Want To... | Start With |
+| If you want to... | Start with |
 | --- | --- |
+| See what is in a capture and what to look at first | `--overview` |
 | Get immediate risk triage | `--threats --ips --health` |
 | Hunt C2 or beaconing behavior | `--beacon --dns --tls --quic` |
 | Hunt proxy/tunnel evasion (VPN, SOCKS) | `--vpn --socks` |
@@ -141,9 +76,18 @@ flowchart LR
 | Find OT protocols on moved ports | `--overview` (auto-detects), or `--decode-as tcp/10203=s7` |
 | Compare against a known-good baseline | `--baseline` once, then `--baseline-diff X.baseline.json` (or a known-good `.pcap`) |
 | Building automation / metering | `--knx --lontalk --bacnet` / `--dlms --c1222` |
+| Analyze several captures together | `-summarize` with any of the above |
 | Build IR exports and evidence packs | `--json --csv --sqlite --case-dir` |
 
-## Sample Analyst Report
+## What it covers
+
+- **Triage and hunting:** threat correlation, beaconing, exfiltration, scanning, credential exposure, obfuscated payloads, TLS/JA3/JA4 and SSH fingerprints, DNS/LLMNR/mDNS lookups, SOCKS and VPN tunnels, ATT&CK mapping, Suricata corroboration.
+- **OT/ICS:** dedicated analyzers for Modbus, DNP3, IEC-104, IEC 61850 MMS/GOOSE/SV, S7, CIP/EtherNet/IP, PROFINET, BACnet, OPC UA/DA, FINS, MELSEC, HART-IP, C37.118 and more; control-command and write visibility, control-loop validation, safety-system (SIS) analysis, and OT protocols found on non-standard ports.
+- **Baselines:** `--baseline` records what an OT/ICS/IoT network normally does -- who talks to whom, at what polling cadence, with which commands, from which MACs -- and `--baseline-diff` reports deviations as incidents, with their span, ATT&CK techniques and next steps.
+- **Evidence:** file carving and extraction, TLS decryption with a key log (`--decrypt`), VoIP call audio, case metadata and provenance, JSON/CSV/SQLite exports.
+- **Scale:** one read of the capture serves every analysis; `--jobs` spreads the work over your cores and `--split N` reports N windows in parallel.
+
+## Sample report
 
 `pcapper 2017-11-02-Smoke-Loader-traffic.pcap --overview` (a public malware-traffic-analysis.net sample), the first sections:
 
@@ -164,418 +108,44 @@ Immediate leads ─────────────────────�
               evidence: Detections: 10 (critical/high: 3).
               next: pcapper <capture> --threats -v   (then --threats --mitre to map ATT&CK)
               check: Triage the underlying detections in --threats; verify before escalating.
-
-Deep dives (auto-run) ──────────────────────────────────────────────────────────
-  MODULE   RESULT                           TOP FINDING
-  threats  10 detections · 3 critical/high  -
-  scan     nothing found                    -
-  ctf      nothing found                    -
-  files    3 detections · 2 artifacts       File artifacts=2 across protocols: HTTP(2).
 ```
-
-The goal is actionable signal, not noisy packet dumps.
-
-## Before vs After Pcapper
-
-| Traditional PCAP Workflow | With Pcapper |
-| --- | --- |
-| Manually pivot protocol by protocol | Single command gives cross-protocol triage |
-| Every tool re-reads the capture | One read covers every analysis |
-| Raw packet dumps with limited context | Severity-ranked findings with their evidence |
-| Ad-hoc analyst notes for evidence | Built-in pivots and evidence-rich summaries |
-| Separate OT and IT tooling chains | Unified OT/ICS + enterprise workflow |
-| Time-consuming report assembly | Case-ready exports (JSON/CSV/SQLite + metadata) |
-
-## Who Uses Pcapper
-
-- SOC analysts triaging suspicious captures under time pressure.
-- Incident responders and DFIR teams building evidence-driven narratives.
-- OT/ICS defenders investigating control-network anomalies safely.
-- Purple teams validating detections and ATT&CK coverage.
-- Security engineering teams building repeatable PCAP triage runbooks.
-
-| Focus | What You Get |
-| --- | --- |
-| Speed | First-pass answers in minutes, not hours |
-| Depth | Protocol-aware summaries, artifacts, and anomalies |
-| OT/ICS | Control-plane context and safety-aware detections |
-
-```
-Capture -> Decoders -> Sessions -> Detections -> Reports
-   .pcap     300+       RDP/SSH      Beaconing   CLI/JSON/SQLite
-```
-
-Promotional highlights:
-- Remote-access session visibility (RDP/SSH/WinRM/VNC/TeamViewer/Telnet) with endpoints, timing, and data volume.
-- Phone-over-IP forensics (`--voip`): SIP/SDP, Skinny, MGCP, MEGACO, IAX2 and H.323 signalling; RTP/RTCP/SRTP and T.38 fax media; DTMF keypad digits; recovered credentials; and G.711 call audio to WAV.
-- OT-aware findings that call out control actions, safety signals, and protocol-specific risks.
-- Evidence-first reporting that surfaces context, not just counts.
-
-## What's New in v3.0.0 ⚡
-
-Two headlines: **pcapper now reads a capture once, whatever you ask of it, and spreads the work over your CPUs**, and **every report was rebuilt to be short by default and complete with `-v`**. Reports are unchanged in substance: the new code was checked byte for byte against the previous tree on every flag, in memory and from disk, with and without `--jobs`, and with 160 runs designed to provoke thread races.
-
-### Performance: one read, many cores
-
-Captures too large to keep in memory used to be read, and every packet dissected, once per analyzer (`--threats` made 96 full passes). Now every analysis of every step is computed from **one read** -- the capture held in memory when it fits, else one shared pass from disk -- and `--jobs` spreads that work over processes that share the read instead of repeating it.
-
-Reads of the capture per run (in file sizes, measured with strace, every process included):
-
-| Run | Before | Now |
-| --- | --- | --- |
-| `--overview` from disk (NM_2015-08-23, 20k packets) | 9.06 | **1.00** |
-| `--threats` from disk | 7.78 | **1.00** |
-| `--http --dns --tls --files` from disk | 7.69 | **1.00** |
-| `--hostdetails -ip` from disk | 8.67 | **1.00** |
-| `--overview` of a pcapng from disk (wannacry-20170516) | 15.86 | **1.00** |
-| `--suricata --http` from disk (`PCAPPER_SURICATA_FEED=1`) | 6.57 | **1.00** |
-| `--baseline-save` from disk | 19.81 | **1.00** |
-| `--decrypt`, 50 TLS streams (wannacry-20170516) | 56.07 | **2.00** |
-| `--split 4 --http` (asprox_24hr, 202k packets) | 10.25 | **2.21** |
-
-Wall-clock time:
-
-| Run | Before | Now |
-| --- | --- | --- |
-| `--threats` from disk (20k-packet slice) | 359 s | **47 s** |
-| `--overview` in memory (NM_2015-08-23) | 33.7 s | **14.3 s** (`--jobs` 8) |
-| `--overview` from disk (NM_2015-08-23) | 55.8 s | **23.3 s** |
-| `--overview` in memory (asprox_24hr) | 280 s | **151 s** |
-| `--threats` from disk (asprox_24hr) | 464 s | **229 s** (4 workers) |
-
-- **Read once, everywhere:** the hashes and a pcapng's interface details come from the same read; split captures (`X.pcap.part000.pcap` ...) and gzip-compressed captures read once too; so do BPF and time-window filters (tcpdump filters a copy of pcapper's read), baselines, `--correlate`, `--control-loop` and the `--files` extraction options.
-- **External tools can take a copy:** `PCAPPER_SURICATA_FEED=1` feeds Suricata a copy of pcapper's read through a FIFO; this is off by default because a slow feed can cost Suricata alerts. tshark's `--decrypt` stream listing reads a copy through a FIFO. `--decrypt` follows every stream in one tshark run that stops at the last frame it needs: 2N+1 reads became at most 2.
-- **`--jobs N`, automatic by default:** one process per usable CPU (at most 16) when the run is big enough to gain, never more than the plan has analyses, within available memory. In memory the processes share the packets; from disk they are copied the main process's read through pipes -- they read no file, split captures included.
-- **`--split N`** reports N windows of a capture in parallel (what `editcap -c` plus one run per part gives); the walk that finds the windows also computes the hashes.
-- **Lightweight packets and prefiltered reads:** the OT analyzers read records without full scapy dissection and skip packets they can never claim.
-- **Large-capture notice:** above ~1M packets pcapper says how many packets the capture holds, how long one read takes on this machine, and what makes it faster (with `-v`).
-
-### Output: concise, consistent, built to be read
-
-- **Short by default, complete with `-v`:** every report opens with a severity headline, then the findings with their flow, time and ATT&CK technique; aligned tables, repeats folded, and a note of what `-v` adds. Checked token by token: `-v` loses nothing the old output had.
-- **One progress bar per capture** while it works, and nothing else; `-v` shows the processing detail (pass percentages, per-analysis timing, library warnings).
-- **Top 10 and bottom 10:** ranked tables (domains, hosts, URLs, user agents, fingerprints, commands ...) show the most common and the rarest -- where the outliers hide.
-- **`--dnsqueries`:** every DNS / LLMNR / mDNS lookup with its observed answer (NXDOMAIN, no response), per host with `-ip`, across captures with `-summarize`.
-- **`--overview` is the briefing:** highlights, immediate leads and auto-run deep dives appear there, each once; protocol reports stay focused on their protocol.
-- **Same capture, same report:** ties sort by name and Suricata's examples are its earliest events, so two runs give identical output.
-
-### Fixed along the way
-
-- `--suricata` on a gzip-compressed capture found nothing (Suricata cannot read gzip); it now reads an inflated copy.
-- `--bpf` on a gzip-compressed capture silently fell back to the unfiltered capture; filtered runs now apply the filter to nested analyses too.
-- False positives removed from `--scan`, OT port detection and "OT risk" scores; missing detections added (DCSync without its bind, IS-IS over LLC, reverse VNC with its repeater ID, Schneider UMAS program reads).
-- `--files` extracts large HTTP downloads it used to miss and pairs filenames with the right responses.
-
-See [CHANGELOG.md](CHANGELOG.md) for every change, with its measurement.
-
-## What's New in v2.9.0 🏭
-
-Built against a 331-challenge ICS/OT PCAP range, where every gap below was a capture Pcapper reported as empty.
-
-- **Eight new OT analyzers:** `--knx` (KNXnet/IP + cEMI), `--xgt` (LS XGT FEnet), `--rocplus` (Emerson ROC Plus), `--ads` (Beckhoff ADS/AMS + TwinCAT AddRoute), `--dlms` (DLMS/COSEM), `--c1222` (ANSI C12.22), `--lontalk` (LonTalk over CN/IP), `--powerlink` (Ethernet POWERLINK). All feed `--overview`, `--threats`, `--ot-commands` and `--mitre`.
-- **OT protocols on moved ports:** `--decode-as tcp/10203=s7` (tshark's `tcp.port==10203,s7comm` works too), plus auto-detection that only accepts a port when the protocol's own length fields frame most of its packets exactly.
-- **TriStation decoded:** `--safety` names every Triconex function, the key switch and the project, and flags the TRITON sequence (logic upload, download change, run).
-- **OPC DA over DCOM:** `--opc-classic` follows DCE/RPC binds per connection, names `IOPCSyncIO::Write` and friends, and decodes item IDs and written/read/callback values.
-- **R-GOOSE:** IEC 61850-90-5 routable GOOSE on any UDP port is analysed as GOOSE, with session-layer replay and authentication checks.
-- **Capture input:** captures are recognised by header (no extension needed), modified pcap is readable, and `X.pcap.part000.pcap ...` splits are joined into one capture.
-
-## What's New in v2.5.0 📡
-
-**v2.5.0 is the third pass of the same review, aimed at the roll-ups, the beacon detector and the compromise assessment.**
-
-- 📡 **Reconnecting beacons are scored again.** Since 2.0.0 the flow key dropped the client port before the per-connection key was built, so an HTTP C2 that opens a fresh connection per check-in collapsed into one event and never reached the scorer. Heartbeats inside a single persistent socket (reverse shells, websocket C2) are now scored too, from the client's request cadence.
-- 🏭 **An HMI polling its PLCs is no longer the most likely compromised host.** The OT-baseline branch never fired (it read a port field that is empty for TCP), info-level context weighed like evidence, and the threat engine's own "baseline polling" downgrade came back as a warning, an incident and three Command and Control techniques in `--mitre`. Baseline periodicity is now context everywhere.
-- 🧾 **Roll-ups carry every section.** A merge check over every `merge_*` function found the `--hostdetails`, `--dhcp`, `--cip` and `--compromised` roll-ups dropping whole sections, and five roll-ups reporting the sum of durations instead of the window.
-- 📦 **Truncated downloads say so** (`TRUNCATED: 1552 of 5000 declared bytes`), sizes under a megabyte print in KB and bytes instead of `0.00 MB`, and numbers in a detection's own prose (`score 0.98`, `interval 90.00s`) are no longer domain IOCs that grouped unrelated hosts into phantom campaigns.
-
-## What's New in v2.4.0 🔍
-
-**v2.4.0 is the "wrong rather than failing" release.** Every one of the 120-plus analyzers was read line by line in a two-day production-readiness review, and the pattern that kept turning up was a report that was confidently wrong: a server counted as its own busiest client, a window that spanned the whole capture, a padded frame read as protocol bytes, a heuristic that fired on healthy traffic. The suite grew from 255 to 572 tests, each new one built on a synthetic capture that reproduced the defect.
-
-- 🎭 **Roles are right everywhere.** UDP, TCP, SNMP, LDAP, Kerberos, NTLM, QUIC, DoT/DoQ, HTTP/2, WinRM, RDP, WMI, PowerShell, Telnet, VNC, TeamViewer, VPN, SOCKS, AIM, syslog, BGP, Modbus, DNP3, safety-system ports, IEC 101/103 (from the FT1.2 PRM bit) and OPC Classic (from the DCE/RPC PDU type) all had the sender as "client". The top-clients table on a normal capture used to list the directory server and the KDC.
-- 🎫 **Kerberos AS-REP roasting is evidence-based.** It used to fire on "five AS-REPs and no pre-auth error", which every healthy domain logon satisfies. It now requires an AS-REP answering an AS-REQ with no pre-authentication data, names the roastable accounts, and points at `hashcat -m 18200`. Principal names and realms are read from the ASN.1 — the old SPN regexes only ever matched captures of tool output.
-- 📬 **`--ftp` no longer reports your mail.** Any `NNN text` line or `USER`/`PASS` on any port was FTP, so every SMTP and POP3 session appeared in the FTP report with its credentials. A flow off the control ports must now be confirmed by an FTP-specific command or reply.
-- 📈 **Brute force and UDP flood are rates**, not totals: twenty SMB sessions over a working day and a resolver's daily 5,000 datagrams are no longer attacks.
-- ⏱️ **Per-protocol windows** in 25 analyzers, and **padding-aware segment lengths** in Telnet (one keystroke per padded segment), the IT→OT pivot check, the beacon scorer, retransmission counting and the carver.
-- 🔒 **Nothing internal leaves the box.** VirusTotal/OTX/AbuseIPDB passes used to send `fileserver.corp`, `printer.local`, reverse-lookup zones and RFC 1918 addresses. Only public names go out, percent-encoded, under a time budget. A `pcapper.toml` in the evidence directory is no longer loaded, a non-capture with a `.pcap` extension is rejected instead of read as empty, `--decode` decompression is bounded, and recovered secrets are owner-only from the moment the file exists.
-- 🧩 **One packet loop, one home for shared helpers.** All 81 analyzers with a packet loop use `iter_packets()`; the 24 module-local copies of utils helpers are gone and a ratchet test keeps them gone; memoized results are shared rather than deep-copied.
-
-## What's New in v2.3.0 ☎️
-
-**v2.3.0 is the phone-over-IP release**, plus the packaging fix that made the
-previous one installable.
-
-- ☎️ **`--voip` (alias `--sip`) — the whole call path, not one protocol.** Signalling: SIP/SDP on any port over UDP/TCP/TLS, Cisco SCCP/Skinny, MGCP, MEGACO/H.248, IAX2 and H.323 (H.225 + RAS). Media: RTP, RTCP, SRTP and T.38 fax. Plus STUN/TURN/ICE, phone provisioning over TFTP/HTTP, and ENUM. A Cisco shop signals with Skinny, an Asterisk trunk uses IAX2, a video bridge still speaks H.323 — reading only SIP returns "no VoIP traffic" on a capture that is nothing but VoIP traffic.
-- 🔑 **Credentials, keys and keypad digits recovered.** SIP Digest emitted as ready `hashcat -m 11400` lines, IAX2 MD5 challenge/response pairs, plaintext IAX2 passwords, TURN long-term credentials. Cleartext SRTP master keys from `a=crypto ... inline:` — if the signalling was not itself encrypted, every "encrypted" call in the capture is decryptable. DTMF digits from all four carriers they use (RFC 4733 RTP, SIP INFO, Skinny `KeypadButton`, MGCP observed events): routinely IVR PINs, calling-card numbers and card data.
-- 🎧 **Call audio to WAV** with `--voip-out DIR` — G.711 decoded, written owner-only. `audioop` was removed from the stdlib in 3.13, so the codecs are hand-written and reference-checked.
-- 📦 **The wheel is installable again.** `pcapper/reporting/` became a subpackage in the reporting split, but `[tool.setuptools] packages` still listed only `pcapper`, so the built wheel shipped **zero renderers** and a pip-installed pcapper died on `import pcapper.cli`. `twine check` never opens the archive, so CI stayed green. CI now installs the wheel into a clean venv, imports every module and runs the CLI.
-- 🔢 **One version, not two.** `pcapper/__init__.py` and `pyproject.toml` each carried a literal and drifted — pip said 2.2.0 while the banner printed v2.1.0. `pyproject.toml` now derives the version from the package.
-- 🧱 **`reporting.py` split**: 29,989 lines in one module became 120, one per analyzer, verified byte-identical by source hashing and a 350-run CLI differential.
-- 🔁 **`--compromised` is reproducible.** Its host sort was not a total order, so ties fell through to hash randomisation and the same capture produced two different reports.
-
-## What's New in v2.2.0 🛡️
-
-**v2.2.0 is the correctness-and-assurance release.** No new analyzers — instead,
-the reassembly and decryption paths were audited, three silent failure modes were
-fixed, and the project gained the test suite and CI that would have caught them.
-
-- 🧵 **TCP sequence wraparound is handled.** Both the carving and stream-following reassemblers sorted segments by raw 32-bit sequence number, so any stream whose initial sequence number sat near `2**32` was mis-assembled once it wrapped — and carving then found nothing and reported nothing. Roughly 1 ISN in 43 on a 100 MB transfer, which is exactly the large-file-exfil case `--carve` exists for.
-- 🕳️ **A carve taken across a gap no longer carries a confident SHA-256.** Missing bytes used to be closed by concatenation, producing a spliced artifact with an authoritative-looking hash. Gaps are now zero-filled so offsets stay true to the stream, counted on every hit, and flagged in the rendered table, the note and the detection evidence.
-- ⏱️ **`--decrypt` cannot hang forever.** Every tshark call now has a timeout; a stalled stream is recorded and skipped instead of taking the run with it. Stream labelling was also rebuilt — it was inert (`-c 1` caps packets *read*, not matched) and mislabelled every IPv6 stream — and now costs one pass instead of two per stream, so `--decrypt` went from 2N+1 capture reads to N+1.
-- 🔐 **A filename off the wire no longer reaches the filesystem as a path.** Containment always held, but the probe itself was a problem: on Windows a UNC name in a capture turned an `exists()` check into an outbound SMB connection to a host the adversary named. Names are now reduced to a bare local component first.
-- 🔎 **`--smb` stopped dropping names with spaces** — `Domain Admins`, `Backup Operators`, `Program Files` and friends were being filtered out of client inventory previews.
-- ✅ **190 tests, and CI on Python 3.9 and 3.13**, with golden rendered output pinned per analyzer. The lint gate's first act was to find a Python 3.12-only f-string that had been breaking the package on 3.9–3.11.
-
-See [CHANGELOG.md](CHANGELOG.md) for the full detail.
-
-## What's New in v2.1.0 🔥
-
-**v2.1.0 is the identity, asset-intelligence & OT-accuracy release.** pcapper now reads the wire the way an analyst does — *who is this host, what does it announce itself as, and is this actually notable* — and it stops crying wolf on quiet industrial segments.
-
-- 🪪 **Full NetBIOS Browser (MS-BRWS) dissection** — the browser Mailslot is decoded, not counted. Every announcement hands you a host's **name, OS, server ROLES (Domain Controller / SQL / print / master browser), comment, and domain** — passive asset inventory + OS fingerprinting with zero probing. Plus a scored verdict and browser attack detections: **rogue master browser / forced-election takeover, PDC role conflict, NETLOGON user-enumeration** — mapped to **MITRE T1557 / T1046 / T1087** and rolled up in `--threats` and `--mitre`.
-- 🧠 **Browser intelligence wired into 8 analyzers** — hostname / OS / roles / domain / DC identity now light up `--hostdetails`, `--domain`, `--hostnames`, `--ips`, `--overview`, `--compromised`, `--threats`, and `--mitre`. `--domain` maps your Active Directory (domain + DC roster) **with no Kerberos or LDAP traffic at all**, and a compromised DC is escalated as a crown-jewel.
-- 🔬 **`--hostdetails` is now a full host-forensics dossier** — one `-ip` gives you identity + roles, usernames, services, web requests, **remote services out (with C2/remote-access flagging), remote access *in* (inbound RDP/SSH/VNC/WinRM/SMB with the connecting peer), authentication activity, TLS/JA3 fingerprints, SMB share access, email, peer geo/ASN/IOC intel**, DNS, and downloaded files with hashes.
-- 🎯 **Systematic OT/DCS false-positive kill** — a benign Foxboro-DCS baseline (broadcast ARP + browser Mailslot, two DCs, no TCP) used to trip nearly every verdict engine. `--scan`, `--arp`, `--beacon`, `--protocols`, `--overview`, `--threats`, and `--mitre` are now segment-hub-, broadcast/multicast-, and rate-aware — a gateway/DC ARPing its subnet is *baseline*, not an "Nmap sweep" or "CRITICAL C2 beacon."
-
-> Full detail in [CHANGELOG.md](CHANGELOG.md).
-
-### Preview: a host tells you exactly what it is
-
-```text
-$ python -m pcapper capture.pcap --netbios
-
-Announced Hosts & Roles (Browser / MS-BRWS)
-Host    IP            OS                                Domain  Roles                                       Comment
-0001DC  10.217.34.1   Windows 7 / Server 2008 R2 (6.1)  FOX     Server, Domain Controller (PDC), DFS Root   Domain Controller
-0002DC  10.217.34.2   Windows 7 / Server 2008 R2 (6.1)  FOX     Server, SQL Server, Backup DC, DFS Root     -
-
-$ python -m pcapper capture.pcap --hostdetails -ip 10.217.34.1
-
-Host Identity
-Hostname                 : 0001DC
-Inferred OS / Device     : Windows 7 / Server 2008 R2 (6.1)
-Announced Roles (Browser): Server, Domain Controller (PDC), Time Source, DFS Root, Terminal Server
-Domain / Workgroup       : FOX
-```
-
-## What's New in v2.0.0 🚀
-
-**v2.0.0 is the threat-hunt / incident-response release** — pcapper graduated from "PCAP analysis" to a full **threat-hunting, forensics, and IR/triage platform** for IT *and* OT/ICS. Every analyzer was reviewed function-by-function so it now reads like an analyst's notebook: a verdict, the evidence, and the ATT&CK technique — never a raw packet dump.
-
-- 🎯 **IT→OT pivot detection** — the #1 industrial intrusion pattern, caught automatically. A remote login (SSH/RDP/WinRM/…) that lands on a host which then issues an OT command to another device is flagged **CRITICAL** across `--threats`, `--overview`, `--compromised`, and shown inline on the `--timeline`.
-- 🛰️ **"Remote IN" timeline events** — inbound remote-access sessions to your focus host, colored by risk (external = CRITICAL, internal = HIGH), so the foothold shows up *before* the control action it enabled.
-- 🔐 **Encrypted-traffic hunting** — JA3/JA4 malware-fingerprint matching, Cobalt Strike default-cert IOCs, **DoH-over-TLS via resolver SNI**, and crackable **Net-NTLM hash** reconstruction (Hashcat-ready).
-- 🏭 **OT/ICS firepower** — ~15 new/expanded industrial analyzers (Synchrophasor/C37.118, BSAP, Genisys, EtherCAT, Modicon UMAS, MELSEC, …), accurate **ATT&CK-for-ICS** mapping with evidence, and full OT output by default.
-- 🧹 **Big correctness + FP audit** — revived several silently-dead detectors (PsExec admin-share/pipe, WMI persistence, Modicon CPU start/stop) and cut a swath of false positives, all validated against ground-truth captures.
-- ⚡ **Faster & leaner** — sub-analyzer memoization (~13%+ faster on OT captures, byte-identical output) and ~2,000 lines of de-duplication.
-
-> See the full breakdown in [CHANGELOG.md](CHANGELOG.md).
-
-### Preview: catching an IT→OT pivot
-
-```text
-$ python -m pcapper attack.pcap -ip 10.0.0.10 --timeline
-
-Activity Timeline
-Time                        | Category   | Summary
-2023-11-14T22:13:20.200000Z | Remote IN  | [CRITICAL] Inbound SSH remote access (external/public source)
-                            |            |   45.137.21.9 -> 10.0.0.10:22 (SSH) established
-2023-11-14T22:13:25.300000Z | Modbus     | [OT Control] Modbus Write Single Register
-                            |            |   10.0.0.10 -> 10.0.0.20:502 unit 1 Write Single Register
-
-$ python -m pcapper attack.pcap --threats
-
-Most Likely Scenarios
-Sev   Source   Detection                                    Top Source      Top Destination
-CRIT  Pivot    IT->OT pivot: remote access then OT command  45.137.21.9(1)  10.0.0.20(1)
-  Host 10.0.0.10 accepted inbound SSH remote access from 45.137.21.9 (external/public
-  source) and subsequently issued a Modbus command to 10.0.0.20.   [ATT&CK T0859 / T0855]
-```
-
-## Current Release: v3.5.0
-
-v3.5.0 makes `-summarize` say what the captures say together. Conversations, hosts, services and findings that several captures share are listed once with their traffic added; hosts, flows, unique strings and a service's clients are counted over the captures, not once per capture; durations span the captures; and a rollup no longer depends on the order the captures were named in. A capture without the traffic changes nothing, and a capture merged with its own copy lists every row once -- checked over every analysis by the new `tools/rollup_check.py`. Along the way, a report no longer depends on the run (tied rows came out in a different order each time), and the TCP and UDP services tables list each protocol's busiest services. See the [changelog](CHANGELOG.md).
-
-v3.3.0 adds `--socks`, SOCKS4/4a/5 proxy and tunnel detection. It reads the handshake off the wire, so it finds a proxy on any port, and reports the proxy and its clients, the version and command, the tunnelled target `host:port` (the destination egress logs never see), the authentication and the reply. It flags reverse (server-initiated) proxies -- the shape of a reverse-SOCKS implant -- cleartext proxy credentials and tunnels to sensitive service ports, and feeds `--threats`. Across 138 non-SOCKS captures it raised no false positives. See the [changelog](CHANGELOG.md).
-
-v3.2.0 makes `--baseline-diff` read like an incident report. Deviations are correlated per actor into incidents -- a rogue OT master and the register values it changed, adversary-in-the-middle attributed to the IP behind the intruding MAC, remote access to an OT asset -- each with when it ran, its ATT&CK for ICS techniques, the evidence and the pcapper command to run next. A timeline orders every deviation by first sighting, and broadcast/multicast/link-local chatter is kept out of the way (`-v` shows it). On the public Coimbra Modbus captures the lead incident is the attack, and its span matches the documented 5-minute attack window. See the [changelog](CHANGELOG.md).
-
-v3.1.0 adds baselines for OT/ICS/IoT networks. `--baseline` records what a network normally does: who talks to whom, at what polling cadence, with which read and write commands, from which MAC addresses, and the value range of every Modbus register. `--baseline-diff` compares a capture against that file, or straight against a known-good capture, and reports each deviation as a finding: a new OT pair or writer, a changed poll rate, an IP answering from another MAC (naming the spoofer's own IP), a register outside its range, remote access to an OT host. On the public Coimbra Modbus testbed captures it names the ARP man-in-the-middle and the Modbus flood, including the flood driving a PLC register to 0, and leaves the legitimate polling alone. Also: `-summarize` no longer adds up IP addresses and percentages in merged findings, self-addressed traffic counts once in `--ips`, and the host inventory is faster. See the [changelog](CHANGELOG.md).
-
-v3.0.2 makes scan-heavy captures fast: no analysis of `--creds`, `--threats` or `--overview` has scapy dissect every packet any more. Each one skips, from the packet's bytes, the packets its code would do nothing with -- 92% of maccdc2010's packets are scan segments without a payload -- and dissects the rest as before. maccdc2010 (10M packets): `--creds -v` 38.7 min → 6.4 min, `--overview` 69.6 min → 19.0 min. Reports are byte-identical. See the [changelog](CHANGELOG.md).
-
-v3.0.1 made `--jobs` use the machine: every analysis -- the heaviest, dependent ones included -- runs in a worker, which takes the results it needs from the others as they finish. `--overview` of 250,000 packets (maccdc2010) from disk: 212 s → 68 s; held in memory: 132 s → 62 s.
-
-Headline changes in v3.0.0:
-- **One read per run, whatever the flags** -- pcapng, split and gzip captures, filters, and `--decrypt`; Suricata can share the read when `PCAPPER_SURICATA_FEED=1` -- and **automatic `--jobs`** over processes that share it: `--overview` from disk 9.06 reads → 1, 55.8 s → 23.3 s.
-- **Every report rebuilt**: concise by default, complete with `-v`, findings first, top/bottom 10 rankings, one progress bar while it works.
-- **`--dnsqueries`**, gzip-compressed captures read directly, `--split N` parallel windows.
-
-Carried forward from v2.5.0:
-- **Beacon detection works for reconnecting and persistent C2 again**, and routine OT polling is context rather than compromise evidence in `--compromised` and `--mitre`.
-- **Every roll-up carries every section**, checked mechanically over every merge function; truncated downloads and sub-megabyte sizes are labelled honestly.
-- **Every analyzer reviewed for reports that were wrong rather than failing** — client/server roles, per-protocol windows, padding-aware lengths and total-order sorts across the board, each pinned by a test. 584 tests, CI on Python 3.9 and 3.13.
-- **Detection heuristics that fire on attacks, not on Tuesday** — evidence-based AS-REP roasting, FTP that ignores SMTP, brute force and UDP floods as rates, domain exposure limited to domain-control protocols, syslog that ignores HTML.
-- **Nothing internal leaves the box** — reputation lookups restricted to public names, percent-encoded and time-budgeted; no config from the evidence directory; bounded decompression; owner-only secrets.
-
-Carried forward from v2.3.0:
-- **`--voip` / `--sip`** — phone-over-IP forensics across SIP/SDP, SCCP, MGCP, MEGACO, IAX2, H.323, RTP/RTCP/SRTP, T.38 fax, STUN/TURN, provisioning and ENUM; recovered credentials, SRTP keys and DTMF digits; G.711 call audio to WAV via `--voip-out`.
-- **The distribution actually installs** — the wheel was shipping no `reporting` package at all; CI now installs and runs the built artifact rather than only checking its metadata.
-- **`reporting.py` split into 120 per-analyzer modules**, with no behaviour change.
-
-Carried forward from v2.2.0:
-- **Three silent failure modes in reassembly and decryption fixed** — sequence wraparound, gaps published with an authoritative hash, and an unbounded tshark call. See [CHANGELOG.md](CHANGELOG.md).
-- **A test suite and CI** — 190 tests with golden rendered output, run on Python 3.9 and 3.13.
-- **Wire-derived filenames are neutralised before touching the filesystem**, and a disclosure route exists in [SECURITY.md](SECURITY.md).
-
-Carried forward from v2.1.0:
-- **Full NetBIOS Browser (MS-BRWS) protocol dissection** in `--netbios` — announced host names, OS, server roles (DC/SQL/print/master browser), comments and domain, a scored verdict, and browser attack detections (rogue master browser, election storm, PDC conflict, NETLOGON enumeration) mapped to MITRE T1557 / T1046 / T1087.
-- **Browser-derived host intelligence propagated to 8 analyzers** (`--hostdetails`, `--domain`, `--hostnames`, `--ips`, `--overview`, `--compromised`, `--threats`, `--mitre`) — passive AD/DC discovery with no Kerberos/LDAP required.
-- **`--hostdetails` expanded into a full host dossier** — inbound + outbound remote access (with C2/remote-access flagging), authentication activity, TLS/JA3, SMB share access, email, and peer geo/ASN/IOC intelligence, alongside the existing identity/services/web/DNS/files.
-- **Systematic OT/DCS false-positive elimination** — a shared unicast/broadcast gate plus segment-hub-role and rate awareness across `--scan`, `--arp`, `--beacon`, `--protocols`, `--overview`, `--threats`, and `--mitre` so a gateway/DC's routine ARP and Mailslot broadcast reads as baseline, not recon or C2.
-- `--scan` and `--overview` now always render at full depth (no `-v` needed, no truncation footer); `--overview` "Notable Flows" is notability-aware instead of top-by-volume.
-
-*Previous milestone (v2.0.x):* IT→OT pivot detection and "Remote IN" timeline events, CIP/EtherNet-IP timeline entries, DoH-over-SNI detection, per-analyzer Analyst Verdict + ATT&CK mapping, revived dead detectors, and sub-analyzer memoization performance work.
-
-## OT/ICS Command Center
-
-Industrial networks are first-class here: deep protocol coverage, safety-conscious detections, and context that reads like an OT incident timeline instead of a raw packet dump.
-
-Signal > noise for substations, plants, and mixed IT/OT environments.
-
-What you get:
-- Dedicated OT protocol analyzers (IEC-104, DNP3, S7, Profinet, EtherNet/IP, MMS, and more).
-- OT-aware timing/jitter insights for control traffic.
-- Analyst-friendly outputs tuned for plant floors, substations, and mixed IT/OT environments.
-- Control-command visibility for safety/availability impacts (writes, downloads, starts/stops).
-- Control-loop validation on Modbus/DNP3 value changes (rate-of-change, oscillation, outliers).
-- Baselines (`--baseline`, `--baseline-diff`): record an OT/ICS/IoT network's normal (who talks to whom, at what polling cadence, with which read/write commands, from which MACs) and report deviations as findings: a new writer to a PLC, a changed poll rate, a PLC answering from a new MAC, SMB/RDP to an OT host.
-- Safety PLC/SIS analysis: TriStation decoded (functions, key switch, project) with TRITON-sequence detection.
-- OT/ICS-centric threat and anomaly rollups with evidence lines for fast triage.
-- Device fingerprinting across IT/OT/IoT traffic (vendor/model/OS/firmware/software) for asset-aware triage.
-- Remote-access session visibility (RDP/SSH/WinRM/VNC/TeamViewer/Telnet) with endpoints, timing, and data volume.
-- Phone-over-IP forensics (`--voip`): SIP/SDP, Skinny, MGCP, MEGACO, IAX2 and H.323 signalling; RTP/RTCP/SRTP and T.38 fax media; DTMF keypad digits; recovered credentials; and G.711 call audio to WAV.
-- Deeper OT protocol decoding for DNP3, IEC 61850 GOOSE/R-GOOSE/SV, Modbus, BACnet, OPC UA, OPC DA (DCOM), CoAP, MQTT, CIP/ENIP, KNXnet/IP, LonTalk, XGT FEnet, ROC Plus, Beckhoff ADS, DLMS/COSEM, ANSI C12.22 and POWERLINK.
-- OT protocols on non-standard ports: `--decode-as` and payload-structure auto-detection.
-- Routing protocol forensics (OSPF/BGP/IS-IS/PIM) with route-change, auth, and control-plane health visibility.
-
-## Install
-
-```bash
-pip install -r requirements.txt
-```
-
-For development (tests and lint):
-
-```bash
-pip install -e .[dev]
-ruff check pcapper tests
-pytest -q            # 584 tests; add -m "not slow" to skip the subprocess ones
-```
-
-The suite runs on synthetic captures generated by `tests/make_fixtures.py`; no real traffic is committed, and the repository's `.gitignore` is an allow-list so carved files, decrypted streams, key logs and case exports cannot be added by accident.
-
-### Platform Notes
-
-- `--bpf` filtering depends on libpcap. On Windows, install Npcap and ensure Scapy can access it. If BPF is unavailable, Pcapper will fall back to non-BPF packet parsing.
-- Colored output is enabled only for TTYs. Use `--no-color` or set `NO_COLOR=1` to disable ANSI colors.
 
 ## Usage
 
 ```bash
-python -m pcapper <target> [options]
+pcapper <target> [<target> ...] [options]        # or: python -m pcapper ...
 ```
 
-`target` accepts one or more values:
-- a single file (`capture.pcap`)
-- a directory (`~/Downloads/pcaps/`)
-- wildcard patterns (`~/Downloads/pcaps/Un*`)
-- multiple explicit targets (for example shell-expanded wildcards)
+A target is a capture file, a directory, or a wildcard pattern; several can be given. Each capture gets its own report, unless `-summarize` asks for one report across all of them (directories are searched recursively with `-r`).
 
-Examples:
-
-```bash
-python -m pcapper ~/Downloads/pcaps/MIME11.pcap --ips
-python -m pcapper ~/Downloads/pcaps/ --arp
-python -m pcapper ~/Downloads/pcaps/ --dhcp --no-status
-python -m pcapper ~/Downloads/pcaps/Un* --arp
-python -m pcapper "~/Downloads/pcaps/Un*" -summarize --ips
-python -m pcapper one.pcap two.pcapng ~/Downloads/pcaps/ -summarize --timeline -ip 10.182.207.28
-```
-
-Large captures (millions of packets) are read from disk with lightweight packet parsing in one shared pass, and pcapper says up front how long one full read takes on your machine. The analyses of a multi-flag or fan-out run go to one process per CPU (at most 16; `--jobs N` to choose) with an identical report; `--split N` reports N windows of the capture in parallel:
-
-```bash
-python -m pcapper big_ot_day.pcapng --ot-commands --modbus --dnp3
-python -m pcapper big_ot_day.pcapng --threats --split 16
-```
-
-See [Large Captures](docs/reference.md#large-captures) for how each works.
-
-## Quick Demo
-
-```text
-========================================================================
-RDP ANALYSIS :: sample.pcap
-========================================================================
-Total Packets            : 214,993
-RDP Packets              : 18,876
-Total Bytes              : 133.42 MB
-Client -> Server         : 21.07 MB
-Server -> Client         : 112.35 MB
-Duration                 : 2h 13m 14.2s
-Sessions                 : 14
-TCP Sessions             : 9
-UDP Sessions             : 5
-Unique Clients           : 3
-Unique Servers           : 3
-------------------------------------------------------------------------
-Top RDP Clients & Servers
-Clients                  Servers
-10.51.142.55(17481)       10.180.81.111(17481)
-10.51.137.116(1560)       10.180.81.123(1560)
-10.182.106.47(8)          10.180.81.139(8)
-------------------------------------------------------------------------
-RDP Sessions
-Client                   Server                   Start                     End                       Duration    Packets  Size
-10.51.142.55:51332        10.180.81.111:3389       2026-02-19T09:12:42Z      2026-02-19T11:25:54Z      2h 13m 12s  17481    104.2 MB
-10.51.137.116:55190       10.180.81.123:3389       2026-02-19T12:01:04Z      2026-02-19T12:27:33Z      26m 29s    1560     12.7 MB
-========================================================================
-```
-
-Secrets/credentials are displayed in reports by default.
-Exports (JSON/CSV/SQLite) include full values by default.
-Use `-v/--verbose` to include additional evidence lines in summaries (for example file artifacts, LDAP anomalies, and OT/ICS command details), and to see the processing detail on stderr (read-pass percentages, per-analysis start/finish timing, scapy and Python warnings, large-capture and decode-as notices) in place of the progress bar.
+- Colored output is used on terminals only; `--no-color` or `NO_COLOR=1` turns it off.
+- Large captures (millions of packets) are read from disk in one shared pass; pcapper says up front how long a full read takes. See [Large captures](docs/reference.md#large-captures).
+- **Recovered secrets are shown in full** in reports and exports: recovering credentials, tokens and community strings is the job. Outputs are written owner-only; treat a case directory as evidence.
 
 ## Documentation
 
-The per-feature reference — every analysis mode, its flags and a worked example —
-lives in **[docs/reference.md](docs/reference.md)**:
+The per-feature reference -- every analysis, its flags and a worked example -- is **[docs/reference.md](docs/reference.md)**, including [-summarize](docs/reference.md#summarize-behavior), [decryption](docs/reference.md#decryption), [carving](docs/reference.md#stream-carving), [baselines](docs/reference.md#baselines), [correlation](docs/reference.md#correlation), [IOC enrichment](docs/reference.md#ioc-enrichment), [configuration](docs/reference.md#configuration), [plugins](docs/reference.md#plugins) and the [CLI flag groups](docs/reference.md#cli-flag-groups).
 
-- [Summarize behavior](docs/reference.md#summarize-behavior)
-- [Decryption](docs/reference.md#decryption)
-- [Stream Carving](docs/reference.md#stream-carving)
-- [Obfuscation Heuristics](docs/reference.md#obfuscation-heuristics)
-- [Control-Loop Validation](docs/reference.md#control-loop-validation)
-- [Safety PLC Detection](docs/reference.md#safety-plc-detection)
-- [Kill-Chain Timeline Tags](docs/reference.md#kill-chain-timeline-tags)
-- [LOLBAS Recognition](docs/reference.md#lolbas-recognition)
-- [Correlation](docs/reference.md#correlation)
-- [Case Metadata](docs/reference.md#case-metadata)
-- [Baselines](docs/reference.md#baselines)
-- [Rules](docs/reference.md#rules)
-- [IOC Enrichment](docs/reference.md#ioc-enrichment)
-- [Configuration](docs/reference.md#configuration)
-- [Logging](docs/reference.md#logging)
-- [Plugins](docs/reference.md#plugins)
-- [CLI Flag Groups](docs/reference.md#cli-flag-groups)
-- [Phone Over IP (VoIP)](docs/reference.md#phone-over-ip-voip)
-- [Notes](docs/reference.md#notes)
+Release notes are in [CHANGELOG.md](CHANGELOG.md); how to report a vulnerability is in [SECURITY.md](SECURITY.md).
 
-See also [CHANGELOG.md](CHANGELOG.md) (current releases),
-[CHANGELOG-archive.md](CHANGELOG-archive.md) (2.0.2 and earlier) and
-[SECURITY.md](SECURITY.md).
+## Development
+
+```bash
+pip install -e ".[dev]"
+ruff check --select F pcapper tests
+pytest -q                     # add -m "not slow" to skip the subprocess tests
+```
+
+The tests run on small synthetic captures built by `tests/make_fixtures.py`; no real traffic is committed, and `.gitignore` is an allow-list, so carved files, decrypted streams, key logs and case exports cannot be added by accident. `tests/rollup_check.py` runs the deep `-summarize` checks over every analysis on composite captures built from the ICS-pcaps collection.
+
+### Pull requests from more than one machine
+
+1. **Start from an up-to-date `main`:** `git switch main && git pull --ff-only`, then `git switch -c <topic>`.
+2. **Add release notes under `## Unreleased`** in CHANGELOG.md, and leave the version alone. The changelog merges as a union, so two branches that both added entries do not conflict.
+3. **Only if GitHub reports a conflict:** `git fetch && git merge origin/main` on the branch, push, and review the merged `## Unreleased` section. A PR that is merely behind `main` merges as it is.
+4. **Squash-merge**, or turn on auto-merge to merge once the checks pass. GitHub deletes the branch; then, on each machine: `git switch main && git pull --ff-only && git fetch --prune && git branch -D <topic>`.
+5. **Release:** set `__version__` in `pcapper/__init__.py` (the only copy of the version) and add a `## X.Y.Z — date` heading directly below `## Unreleased`, which stays the top heading. After that PR merges: `git switch main && git pull --ff-only && git tag -a vX.Y.Z -m "pcapper X.Y.Z" && git push origin vX.Y.Z && gh release create vX.Y.Z --verify-tag`, with the changelog section as the release notes.
 
 ## License
 
-MIT
+MIT -- see [LICENSE](LICENSE).
