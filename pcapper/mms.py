@@ -398,6 +398,60 @@ def _detect_mms_anomalies(
     return anomalies
 
 
+# ACSE (ISO 8650) AARQ password authentication, used by MMS, ICCP/TASE.2 and
+# IEC 61850 clients: mechanism-name [11] = 2.2.3.1 ("password"), then
+# calling-authentication-value [12] EXPLICIT holding charstring [0] IMPLICIT
+# GraphicString -- the password itself, in the clear.
+_ACSE_PASSWORD_MECHANISM = b"\x8b\x03\x52\x03\x01"
+
+
+def _ber_length(data: bytes, pos: int) -> tuple[int, int]:
+    if pos >= len(data):
+        return -1, pos
+    first = data[pos]
+    if first < 0x80:
+        return first, pos + 1
+    count = first & 0x7F
+    if not 1 <= count <= 2 or pos + 1 + count > len(data):
+        return -1, pos
+    return int.from_bytes(data[pos + 1 : pos + 1 + count], "big"), pos + 1 + count
+
+
+def acse_password(payload: bytes) -> str | None:
+    """The password of an ACSE AARQ that authenticates with one, or None."""
+    at = payload.find(_ACSE_PASSWORD_MECHANISM)
+    if at < 0:
+        return None
+    pos = at + len(_ACSE_PASSWORD_MECHANISM)
+    if pos >= len(payload) or payload[pos] != 0xAC:
+        return None
+    outer, pos = _ber_length(payload, pos + 1)
+    if outer < 2 or pos >= len(payload) or payload[pos] != 0x80:
+        return None
+    size, pos = _ber_length(payload, pos + 1)
+    raw = payload[pos : pos + size]
+    if size < 1 or len(raw) != size:
+        return None
+    text = raw.decode("latin-1")
+    return text if text.isprintable() else None
+
+
+def credentials(payload: bytes) -> list[tuple[str, str | None, str | None, str]]:
+    """``--creds`` tuples for one TCP payload."""
+    password = acse_password(payload) if payload else None
+    if password is None:
+        return []
+    return [
+        (
+            "ACSE Password Authentication",
+            None,
+            password,
+            "AARQ calling-authentication-value (mechanism 2.2.3.1, password)",
+        )
+    ]
+
+
+
 @memoize_analysis
 def analyze_mms(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     reassembler = TPKTTCPReassembler("MMS")

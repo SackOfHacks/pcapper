@@ -26,6 +26,7 @@ from .industrial_helpers import (
 )
 from .utils import memoize_analysis
 
+PROTOCOL_NAME = "DLMS/COSEM"
 DLMS_PORT = 4059
 
 APDUS = {
@@ -87,6 +88,23 @@ def _lls_password(apdu: bytes) -> str | None:
     return None
 
 
+def _lls_credential(apdu: bytes) -> tuple[str, str | None, str | None, str] | None:
+    """(kind, user, password, detail) of an AARQ that authenticates with LLS."""
+    password = _lls_password(apdu)
+    if password is None:
+        return None
+    return "DLMS LLS Password", None, password, f"LLS password {password!r}"
+
+
+def credentials(payload: bytes) -> list[tuple[str, str | None, str | None, str]]:
+    """The password this analysis reports, for --creds: an AARQ's LLS
+    password. The parse is the protocol's signature, so it matches on any
+    port the analysis would."""
+    parsed = parse_dlms(payload)
+    credential = _lls_credential(parsed[3]) if parsed else None
+    return [credential] if credential else []
+
+
 def _signature(payload: bytes) -> bool:
     return parse_dlms(payload) is not None
 
@@ -119,9 +137,9 @@ class _DlmsState:
             self.ciphered += 1
         elif apdu[0] in (0xC0, 0xC1, 0xC3, 0xC4, 0xC5, 0xC7):
             self.plain += 1
-        password = _lls_password(apdu)
-        if password is not None:
-            self.passwords.append(f"{src} -> {dst}: LLS password {password!r}")
+        credential = _lls_credential(apdu)
+        if credential:
+            self.passwords.append(f"{src} -> {dst}: {credential[3]}")
             self.first.setdefault("cred", (src, dst, ts))
         label = OBIS_NAMES.get(obis or "", obis or "?")
         if name == "Set-Request":
@@ -178,7 +196,7 @@ def analyze_dlms(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         port_key="dlms",
         path=path,
-        protocol_name="DLMS/COSEM",
+        protocol_name=PROTOCOL_NAME,
         tcp_ports={DLMS_PORT},
         udp_ports={DLMS_PORT},
         signature_matcher=_signature,

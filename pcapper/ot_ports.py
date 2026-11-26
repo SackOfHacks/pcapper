@@ -1,11 +1,20 @@
 """Canonical OT/ICS port -> protocol-label map.
 
-Single source of truth shared by hostname.py (OT host/role detection) and
-timeline.py (event categorisation). Kept as a dependency-free leaf module of
-literal port numbers so it can be imported from anywhere without circular
-imports (industrial_helpers / the protocol modules import each other, so this
-map cannot live there). Labels are display strings only -- no logic branches on
-their exact value.
+Single source of truth for every module that names or classes OT/ICS ports:
+hostname.py (OT host/role detection), timeline.py (event categorisation),
+services.py (service names and the OT service set), hosts.py, beacon.py,
+exfil.py, remote_access.py and baseline_profile.py. Kept as a dependency-free
+leaf module of literal port numbers so it can be imported from anywhere without
+circular imports (industrial_helpers / the protocol modules import each other,
+so this map cannot live there). Labels are display strings only -- no logic
+branches on their exact value.
+
+Every port an OT analyzer decodes as that protocol belongs here, with that
+analyzer's label. Left out on purpose: UDP/1234 (bsap.py claims it by port
+alone, with no frame check, and it is the default port of IPTV/VLC multicast
+streams), TCP/10001 (genisys.py matches the Genisys frame on any port; 10001
+is not Genisys-specific), 1500-1501 (safety.py counts Triconex TSAA by port
+without decoding it) and MQTT 1883/8883 (IoT messaging, not OT).
 """
 
 from __future__ import annotations
@@ -57,7 +66,32 @@ OT_PORT_PROTOCOLS: dict[int, str] = {
     4059: "DLMS/COSEM",
     48898: "ADS/AMS",
     48899: "ADS/AMS",
+    # CODESYS V3 gateway/runtime (codesys.py CODESYS_TCP_PORTS / _UDP_PORTS).
+    1740: "CODESYS",
+    1741: "CODESYS",
+    1742: "CODESYS",
+    1743: "CODESYS",
+    11740: "CODESYS",
+    11741: "CODESYS",
+    11742: "CODESYS",
+    11743: "CODESYS",
+    # IEEE C37.118 PMU/PDC frames (synchrophasor.py SYNCHROPHASOR_PORTS).
+    4712: "Synchrophasor",
+    4713: "Synchrophasor",
+    # HART-IP UDP handover port (hart.py HART_UDP_HANDOVER_PORT).
+    5095: "HART-IP",
+    # MELSOFT engineering connection, decoded by melsec.py (UDP 5560, TCP 5562).
+    5560: "MELSEC",
+    5562: "MELSEC",
 }
+
+# Registry ports whose protocol is not specific to OT networks. PTP (IEEE
+# 1588) also times data-centre, trading, broadcast and telecom networks and
+# Windows hosts; CoAP is a general IoT protocol (baseline_profile classes it as
+# IoT). Port sets derived from the registry subtract what does not fit the
+# question they answer -- see services._OT_SERVICE_PORTS, beacon.OT_PORTS.
+PTP_PORTS = frozenset({319, 320})
+COAP_PORTS = frozenset({5683, 5684})
 
 
 def foreign_service_reply(sport: int, server_ports) -> bool:

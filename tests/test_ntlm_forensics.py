@@ -122,3 +122,27 @@ def test_short_netbios_domain_is_kept() -> None:
 
     assert _sanitize_ntlm_domain("3B") == "3B"
     assert _sanitize_ntlm_domain("A") == "Unknown"
+
+
+def test_negotiate_scheme_wraps_ntlm_in_spnego() -> None:
+    """WinRM, IIS and modern Exchange send NTLM inside an ``Authorization:
+    Negotiate`` (SPNEGO) header, not ``NTLM``, so the signature sits a few bytes
+    into the decoded token. Both schemes must be recovered; a Negotiate token
+    with no NTLMSSP (Kerberos) yields nothing."""
+    ntlm = b"NTLMSSP\x00\x01\x00\x00\x00rest"
+    spnego = b"\x60\x28\x06\x06\x2b\x06\x01\x05\x05\x02\xa0\x1e\x30\x1c\xa2\x1a\x04\x18" + ntlm
+    negotiate = b"WWW-Authenticate: Negotiate " + base64.b64encode(spnego) + b"\r\n"
+    assert _extract_http_ntlm(negotiate) == ntlm
+
+    kerberos = b"Authorization: Negotiate " + base64.b64encode(b"\x60\x82\x04\x00\x06\x09\x2a\x86\x48") + b"\r\n"
+    assert _extract_http_ntlm(kerberos) is None
+
+
+def test_upn_form_username_is_kept() -> None:
+    """A SASL bind (and modern HTTP auth) puts the UPN sasladmin@slapd.ldap in
+    the Type-3 user field; dropping it to "Unknown" lost the whole hash."""
+    from pcapper.ntlm import _sanitize_ntlm_user
+
+    assert _sanitize_ntlm_user("sasladmin@slapd.ldap") == "sasladmin@slapd.ldap"
+    assert _sanitize_ntlm_user("CORP\\alice") == "Unknown"  # not a UPN; unchanged behaviour
+    assert _sanitize_ntlm_user("alice") == "alice"

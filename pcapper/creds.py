@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Optional
 from urllib.parse import parse_qsl, unquote_plus, urlsplit
 
+from . import ads, authproto, c1222, cred_sources, dlms, rocplus
 from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .services import COMMON_PORTS
@@ -51,6 +52,13 @@ try:
 except Exception:  # pragma: no cover
     IP = TCP = UDP = Raw = None  # type: ignore
     Packet = object  # type: ignore
+
+# Logons the OT analyses recover, recovered here with their own parsers so
+# --creds reports what --overview and --threats do: a TwinCAT AddRoute's
+# Windows logon was a HIGH finding there while --creds found no credentials.
+# Each parse is its protocol's signature, so a source matches on any port its
+# analysis would, moved ports included.
+_OT_LOGON_SOURCES = tuple((module.PROTOCOL_NAME, module.credentials) for module in (ads, c1222, dlms, rocplus))
 
 
 USER_KEYS = (
@@ -145,11 +153,22 @@ HTTP_DIGEST_USER_RE = re.compile(
 )
 HTTP_COOKIE_RE = re.compile(r"(?i)\bcookie:\s*([^\r\n]+)")
 HTTP_NTLM_RE = re.compile(r"(?i)authorization:\s*ntlm\s+([A-Za-z0-9+/=]+)")
+# NTLM rides two HTTP auth schemes. "NTLM <b64>" is the raw message; "Negotiate
+# <b64>" (WinRM, IIS, modern Exchange) wraps it in a SPNEGO token, so the
+# NTLMSSP signature sits a few bytes into the decoded blob. Both the request
+# (Authorization) and the challenge (WWW-Authenticate) carry a message.
+HTTP_NTLM_SPNEGO_RE = re.compile(
+    r"(?i)(?:authorization|www-authenticate|proxy-authorization|proxy-authenticate):\s*"
+    r"(?:ntlm|negotiate)\s+([A-Za-z0-9+/=]+)"
+)
 HTTP_REQUEST_LINE_RE = re.compile(
     # NB: tolerate the trailing CR of real CRLF request lines — anchoring with a
     # bare `$` silently failed to match `...HTTP/1.1\r\n`, which broke request
     # detection (and request-URI credential extraction) on real-world traffic.
-    r"(?im)^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT)\s+([^\s]+)\s+HTTP/\d(?:\.\d+)?\r?$"
+    # Embedded HTTP stacks send odd versions ("HTTP/1.0.8", "HTTP/1.1 "); a
+    # request is a request whatever its version string says, so accept any
+    # dotted version and trailing blanks rather than skip its credentials.
+    r"(?im)^(GET|POST|PUT|PATCH|DELETE|HEAD|OPTIONS|TRACE|CONNECT)\s+([^\s]+)\s+HTTP/\d+(?:\.\d+)*[ \t]*\r?$"
 )
 HTTP_HOST_RE = re.compile(r"(?im)^Host:\s*([^\s:\r\n]+)(?::\d+)?\s*$")
 
@@ -318,6 +337,155 @@ _CAMEL_SPLIT_RE = re.compile(r"([a-z0-9])([A-Z])")
 _NON_ALNUM_RE = re.compile(r"[^A-Za-z0-9]+")
 # Request URLs remembered to attribute URL-mined credentials to a packet.
 _MAX_URL_OBSERVATIONS = 20000
+# Hits kept for the report and the exposure analysis. The display caps its own
+# tables; this bounds memory on a capture with a credential in every packet.
+# (It was 200, which let a brute-force run push the privileged account it
+# targeted out of the privileged-exposure check.)
+MAX_STORED_HITS = 50000
+OFFLINE_GUESSABLE = cred_sources.OFFLINE_GUESSABLE
+
+_FTP_CLIENT_COMMANDS = {"USER", "PASS", "AUTH", "FEAT", "SYST", "OPTS"}
+_SMTP_CLIENT_COMMANDS = {"EHLO", "HELO", "STARTTLS", "MAIL"}
+_POP3_CLIENT_COMMANDS = {"USER", "PASS", "APOP", "AUTH", "CAPA", "STLS"}
+_IMAP_CLIENT_COMMANDS = {"LOGIN", "AUTHENTICATE", "CAPABILITY", "STARTTLS", "ID"}
+_MAX_TEXT_FLOWS = 200000
+_BARE_USER_RE = re.compile(r"(?i)^USER\s+(\S{1,128})$")
+
+# A line that belongs to the mail protocol itself rather than to a message.
+_MAIL_PROTOCOL_LINE_RE = re.compile(
+    r"(?i)^(?:\d{3}[ -]|\+OK|-ERR|\* |[A-Za-z0-9.]+ (?:OK|NO|BAD)\b|"
+    r"(?:EHLO|HELO|AUTH|MAIL FROM|RCPT TO|DATA|QUIT|RSET|NOOP|USER|PASS|APOP|RETR|LIST|"
+    r"STAT|UIDL|TOP|DELE|CAPA|STLS|STARTTLS|VRFY|EXPN)\b|"
+    r"[A-Za-z0-9.]+ (?:LOGIN|AUTHENTICATE|SELECT|EXAMINE|FETCH|UID|CAPABILITY|LOGOUT|LIST|STATUS|NOOP|IDLE)\b)"
+)
+_MAIL_BODY_START_RE = re.compile(r"(?i)^(?:\+OK\b|\* \d+ FETCH\b)")
+
+
+class _TextFlows:
+    """Which TCP flows speak FTP, SMTP, POP3 or IMAP, learnt from the dialogue
+    (the server's greeting, then the client's first command) rather than the
+    port, so a login on a port the per-packet sniffers do not know (FTP on
+    443, POP3 on 8110) is still read. A capture that starts after the greeting
+    is caught by its "USER x" / "331" (FTP) or "+OK" (POP3) exchange."""
+
+    def __init__(self) -> None:
+        self.protocol: dict[tuple[object, ...], str] = {}
+        self.greeting: dict[tuple[object, ...], tuple[str, tuple[str, object]]] = {}
+        self.pending_user: dict[tuple[object, ...], tuple[tuple[str, object], tuple[object, ...]]] = {}
+
+    def observe(
+        self,
+        flow: tuple[object, ...],
+        sender: tuple[str, object],
+        first_line: str,
+        packet: tuple[object, ...],
+    ) -> tuple[Optional[str], Optional[tuple[object, ...]]]:
+        """(protocol of the flow or None, the record of a USER packet that
+        this packet's reply just showed to be a login, or None)."""
+        known = self.protocol.get(flow)
+        if known is not None:
+            return known, None
+        room = len(self.greeting) + len(self.pending_user) < _MAX_TEXT_FLOWS
+        pending = self.pending_user.get(flow)
+        if pending is not None and pending[0] != sender:
+            protocol = "FTP" if first_line.startswith(("331", "230", "530")) else (
+                "POP3" if first_line.startswith(("+OK", "-ERR")) else None
+            )
+            del self.pending_user[flow]
+            if protocol:
+                self.protocol[flow] = protocol
+                return protocol, pending[1]
+            return None, None
+        greeting = self.greeting.get(flow)
+        if greeting is None:
+            if first_line.startswith(("220 ", "220-")):
+                kind = "220"
+            elif first_line.startswith("+OK"):
+                kind = "+OK"
+            elif first_line.startswith("* OK"):
+                kind = "* OK"
+            else:
+                if room and _BARE_USER_RE.match(first_line):
+                    self.pending_user[flow] = (sender, packet)
+                return None, None
+            if room:
+                self.greeting[flow] = (kind, sender)
+            return None, None
+        kind, server = greeting
+        if sender == server:
+            return None, None
+        words = first_line.split()
+        protocol: Optional[str] = None
+        if words and kind == "220":
+            command = words[0].upper()
+            if command in _FTP_CLIENT_COMMANDS:
+                protocol = "FTP"
+            elif command in _SMTP_CLIENT_COMMANDS:
+                protocol = "SMTP"
+        elif words and kind == "+OK":
+            protocol = "POP3" if words[0].upper() in _POP3_CLIENT_COMMANDS else None
+        elif len(words) >= 2:
+            protocol = "IMAP" if words[1].upper() in _IMAP_CLIENT_COMMANDS else None
+        del self.greeting[flow]
+        if protocol:
+            self.protocol[flow] = protocol
+        return protocol, None
+
+
+def _flow_key(src_ip: str, sport: Optional[int], dst_ip: str, dport: Optional[int]) -> tuple[object, ...]:
+    side_a, side_b = (src_ip, sport or 0), (dst_ip, dport or 0)
+    return (side_a, side_b) if side_a <= side_b else (side_b, side_a)
+
+
+def _mail_content_creds(
+    text: str, head: list[str]
+) -> list[tuple[str, Optional[str], Optional[str], str]]:
+    """"user=... password=..." written in a message (SMTP DATA, a POP3 RETR or
+    IMAP FETCH body), not the mail login itself. A body says "Password: has
+    been reset" often enough that a colon-written value must look like a
+    password (a digit or a symbol); usernames count only beside a password."""
+    if not head:
+        return []
+    body = text
+    if _MAIL_BODY_START_RE.match(head[0]):
+        _first, _sep, body = text.partition("\n")
+    elif _MAIL_PROTOCOL_LINE_RE.match(head[0]):
+        return []
+    secrets: list[tuple[str, Optional[str], Optional[str], str]] = []
+    users: list[tuple[str, Optional[str], Optional[str], str]] = []
+    for kind, user, secret, evidence in _extract_kv_creds(body, kind_prefix="Mail Body "):
+        if "Token" in kind:
+            continue
+        if secret:
+            written_with_equals = "=" in evidence.split(secret, 1)[0][-4:]
+            looks_like_password = len(secret) >= 4 and any(not c.isalpha() for c in secret)
+            if written_with_equals or looks_like_password:
+                secrets.append((kind, user, secret, evidence))
+        elif user:
+            users.append((kind, user, secret, evidence))
+    return secrets + users if secrets else []
+
+
+def _frame_bytes(pkt: object) -> tuple[bytes, int]:
+    """Raw bytes and link type of a frame that carries no TCP/UDP."""
+    if type(pkt) is LitePacket:
+        return pkt.original, pkt.linktype
+    raw = getattr(pkt, "original", None)
+    try:
+        data = bytes(raw) if isinstance(raw, (bytes, bytearray)) and raw else bytes(pkt)  # type: ignore[arg-type]
+    except Exception:
+        return b"", -1
+    linktype = {
+        "Ether": 1, "CookedLinux": 113, "CookedLinuxV2": 276, "RadioTap": 127,
+        "Dot11": 105, "PPP": 9, "HDLC": 50, "IP": 101, "IPv6": 101,
+    }.get(type(pkt).__name__, 1)
+    return data, linktype
+
+
+def _frame_endpoints(raw: bytes, linktype: int) -> tuple[str, str]:
+    if linktype == 1 and len(raw) >= 12:
+        return ":".join(f"{b:02x}" for b in raw[6:12]), ":".join(f"{b:02x}" for b in raw[0:6])
+    return "-", "-"
 
 
 @dataclass(frozen=True)
@@ -914,6 +1082,21 @@ def _extract_ntlm_credentials(
                 )
             )
     return hits
+
+
+def _http_ntlm_blobs(text: str) -> list[bytes]:
+    """Every NTLMSSP message base64-encoded in an HTTP auth header of a payload,
+    from its signature on. Handles the raw ``NTLM`` scheme and the SPNEGO-wrapped
+    ``Negotiate`` scheme; a Negotiate token carrying Kerberos yields nothing."""
+    blobs: list[bytes] = []
+    for match in HTTP_NTLM_SPNEGO_RE.finditer(text):
+        decoded = _decode_base64_bytes(match.group(1))
+        if not decoded:
+            continue
+        at = decoded.find(NTLM_SIGNATURE)
+        if at >= 0:
+            blobs.append(decoded[at:])
+    return blobs
 
 
 def _ntlm_messages(payload: bytes) -> list[dict[str, object]]:
@@ -2098,6 +2281,57 @@ def _extract_ot_protocol_creds(
     return hits
 
 
+def credential_severity(summary: "CredentialSummary") -> Optional[str]:
+    """The one severity `--creds`, `--threats` and `--overview` grade a
+    capture's credential exposure by, so the three reports agree.
+
+    Report vocabulary -- ``"critical"`` (a cleartext secret or offline-guessable
+    exchange for a privileged account, or sent to a public destination),
+    ``"high"`` (an active credential attack: brute force, spray or stuffing),
+    ``"medium"`` (cleartext secrets, crackable hashes, or reuse, with no
+    privileged/external angle), ``"low"`` (only account names, no credential
+    with them) or ``None`` (nothing). A bare account name with no secret
+    anywhere (an RDP cookie, an SNMPv3 user) does not make the verdict
+    critical; but an FTP or Telnet USER and its PASS are separate hits, so a
+    privileged account name counts when a secret rode the same flow or account.
+    `--threats` maps medium->warning and low->info."""
+    priv = [row for row in (summary.privileged_exposures or []) if isinstance(row, dict)]
+    ext = [row for row in (summary.external_exposures or []) if isinstance(row, dict)]
+
+    secret_flows: set[tuple[object, object]] = set()
+    secret_users: set[str] = set()
+    any_secret = False
+    for hit in summary.hits:
+        evidence = str(hit.evidence or "")
+        if (
+            hit.secret
+            or "hashcat -m" in evidence
+            or str(hit.kind or "").endswith("Hash")
+            or OFFLINE_GUESSABLE in evidence
+        ):
+            any_secret = True
+            secret_flows.add((hit.src_ip, hit.dst_ip))
+            if hit.username:
+                secret_users.add(str(hit.username).lower())
+
+    def _is_material(row: dict) -> bool:
+        if str(row.get("material", "cleartext")) != "account name":
+            return True
+        if str(row.get("user", "")).lower() in secret_users:
+            return True
+        return (row.get("src"), row.get("dst")) in secret_flows
+
+    if any(_is_material(row) for row in priv + ext):
+        return "critical"
+    if summary.auth_abuse_sequences:
+        return "high"
+    if summary.replay_candidates or summary.token_fanout or any_secret:
+        return "medium"
+    if summary.matches:
+        return "low"
+    return None
+
+
 @memoize_analysis
 def analyze_creds(
     path: Path,
@@ -2105,12 +2339,17 @@ def analyze_creds(
     show_status: bool = True,
     packets: list[object] | None = None,
     meta: PcapMeta | None = None,
-    max_hits: int = 200,
+    max_hits: int | None = None,
 ) -> CredentialSummary:
     if TCP is None and UDP is None and Raw is None:
         return CredentialSummary(
             path, 0, 0, [], False, Counter(), Counter(), ["Scapy not available"]
         )
+
+    # Resolved here, not as a default argument, so a test can lower the cap by
+    # setting creds.MAX_STORED_HITS and have it take effect.
+    if max_hits is None:
+        max_hits = MAX_STORED_HITS
 
     total_packets = 0
     matches = 0
@@ -2128,6 +2367,69 @@ def analyze_creds(
     http_url_observations: dict[
         str, tuple[int, Optional[float], str, str, Optional[int], Optional[int]]
     ] = {}
+    text_flows = _TextFlows()
+    tacacs_state = authproto.TacacsState()
+    pending_sources = list(cred_sources.ANALYZER_SOURCES)
+    fired_sources: set[str] = set()
+
+    def _record(
+        kind: str,
+        user: Optional[str],
+        secret: Optional[str],
+        evidence: str,
+        *,
+        packet_number: int,
+        ts: Optional[float],
+        src_ip: str,
+        dst_ip: str,
+        src_port: Optional[int],
+        dst_port: Optional[int],
+        protocol: str,
+    ) -> None:
+        nonlocal matches
+        matches += 1
+        kind_counts[kind] += 1
+        if user:
+            user_counts[user] += 1
+        if len(hits) < max_hits:
+            hits.append(
+                CredentialHit(
+                    packet_number=packet_number,
+                    ts=ts,
+                    src_ip=src_ip,
+                    dst_ip=dst_ip,
+                    src_port=src_port,
+                    dst_port=dst_port,
+                    protocol=protocol,
+                    kind=kind,
+                    username=user,
+                    secret=secret,
+                    evidence=evidence,
+                )
+            )
+
+    def _scan_frame(pkt: object, packet_number: int) -> None:
+        """A frame without TCP/UDP: wake the analyzers whose traffic it is
+        (OSPF, VRRP, IS-IS, 802.11) and read PPP/EAP logins in it."""
+        raw, linktype = _frame_bytes(pkt)
+        if not raw:
+            return
+        for source in list(pending_sources):
+            if source.frame_gate is not None and source.frame_gate(raw, linktype):
+                fired_sources.add(source.name)
+                pending_sources.remove(source)
+        if not authproto.frame_may_carry_credentials(raw, linktype):
+            return
+        found = authproto.frame_credentials(raw, linktype)
+        if not found:
+            return
+        src, dst = _frame_endpoints(raw, linktype)
+        when = safe_float(getattr(pkt, "time", None))
+        for kind, user, secret, evidence in dict.fromkeys(found):
+            _record(
+                kind, user, secret, evidence, packet_number=packet_number, ts=when,
+                src_ip=src, dst_ip=dst, src_port=None, dst_port=None, protocol=kind.split()[0],
+            )
 
     # Read from disk, records come lite: most packets of a large capture carry
     # no payload, and only those that do (or that the lite parser cannot read)
@@ -2136,6 +2438,8 @@ def analyze_creds(
         total_packets += 1
         try:
             src_port, dst_port, proto, payload = _transport_and_payload(pkt)
+            if proto == "OTHER":
+                _scan_frame(pkt, total_packets)
             if not payload or _padding_only(payload):
                 continue
 
@@ -2161,6 +2465,32 @@ def analyze_creds(
             looks_smb_netbios = _looks_like_smb_netbios(
                 payload, src_port, dst_port, service
             )
+            if proto == "TCP" and head:
+                flow_proto, confirmed_user = text_flows.observe(
+                    _flow_key(src_ip, src_port, dst_ip, dst_port),
+                    (src_ip, src_port),
+                    head[0],
+                    (total_packets, ts, src_ip, dst_ip, src_port, dst_port, head[0]),
+                )
+                if flow_proto:
+                    # The dialogue settles the protocol: a mail body that says
+                    # "Your login is ..." is not an IMAP LOGIN or a Telnet prompt.
+                    looks_http = looks_telnet = False
+                    looks_ftp = flow_proto == "FTP"
+                    looks_smtp = flow_proto == "SMTP"
+                    looks_pop3 = flow_proto == "POP3"
+                    looks_imap = flow_proto == "IMAP"
+                if flow_proto and confirmed_user is not None:
+                    # The USER line came before the reply that showed this
+                    # flow to be a login; record it against its own packet.
+                    number, when, u_src, u_dst, u_sport, u_dport, line = confirmed_user
+                    user_match = _BARE_USER_RE.match(str(line))
+                    if user_match:
+                        _record(
+                            f"{flow_proto} USER", user_match.group(1), None, str(line),
+                            packet_number=int(number), ts=when, src_ip=str(u_src), dst_ip=str(u_dst),  # type: ignore[arg-type]
+                            src_port=u_sport, dst_port=u_dport, protocol=flow_proto,  # type: ignore[arg-type]
+                        )
             protocol_label = service
             if looks_smtp:
                 protocol_label = "SMTP"
@@ -2246,6 +2576,9 @@ def analyze_creds(
                 )
                 for item in _extract_mail_auth(lines, state):
                     seen[item] = None
+            if looks_smtp or looks_pop3 or looks_imap:
+                for item in _mail_content_creds(text, head):
+                    seen[item] = None
             if looks_telnet:
                 for item in _extract_telnet_creds(text):
                     seen[item] = None
@@ -2267,7 +2600,12 @@ def analyze_creds(
                 seen[item] = None
             # NTLM challenge/response correlation -> crackable NetNTLM hash.
             # Type 2 (server->client) carries the challenge; Type 3 the response.
+            # On HTTP the message is base64 inside an NTLM/Negotiate auth header,
+            # not raw in the payload, so decode those blobs too.
             ntlm_msgs = _ntlm_messages(payload)
+            if looks_http and b"NTLMSSP\x00" not in payload:
+                for blob in _http_ntlm_blobs(text):
+                    ntlm_msgs.extend(_ntlm_messages(blob))
             if ntlm_msgs:
                 flow_key = tuple(
                     sorted([(src_ip, src_port), (dst_ip, dst_port)])
@@ -2293,28 +2631,43 @@ def analyze_creds(
                                 ] = None
             for item in _extract_ot_protocol_creds(payload, src_port, dst_port):
                 seen[item] = None
+            for protocol, source in _OT_LOGON_SOURCES:
+                found = source(payload)
+                if found:
+                    protocol_label = protocol
+                    seen.update(dict.fromkeys(found))
+            # Credentials other analyzers read: MQTT, BACnet, ACSE, S7, MELSEC.
+            for protocol, reader in cred_sources.PAYLOAD_READERS:
+                found = reader(payload)
+                if found:
+                    protocol_label = protocol
+                    seen.update(dict.fromkeys(found))
+            for item in cred_sources.text_credentials(text):
+                seen[item] = None
+            if proto == "UDP":
+                found = cred_sources.ike_aggressive_identity(payload, src_port, dst_port)
+                if found:
+                    protocol_label = "IKE"
+                    seen.update(dict.fromkeys(found))
+            found = authproto.credentials(
+                src_port, dst_port, payload, tcp=proto == "TCP",
+                src=src_ip, dst=dst_ip, tacacs=tacacs_state,
+            )
+            if found:
+                protocol_label = found[0][0].split()[0]
+                seen.update(dict.fromkeys(found))
+            if pending_sources:
+                for source in list(pending_sources):
+                    if source.payload_gate is not None and source.payload_gate(src_port, dst_port, payload):
+                        fired_sources.add(source.name)
+                        pending_sources.remove(source)
 
             for kind, user, secret, evidence in seen:
-                matches += 1
-                kind_counts[kind] += 1
-                if user:
-                    user_counts[user] += 1
-                if len(hits) < max_hits:
-                    hits.append(
-                        CredentialHit(
-                            packet_number=total_packets,
-                            ts=ts,
-                            src_ip=src_ip,
-                            dst_ip=dst_ip,
-                            src_port=src_port,
-                            dst_port=dst_port,
-                            protocol=protocol_label,
-                            kind=kind,
-                            username=user,
-                            secret=secret,
-                            evidence=evidence,
-                        )
-                    )
+                _record(
+                    kind, user, secret, evidence, packet_number=total_packets, ts=ts,
+                    src_ip=src_ip, dst_ip=dst_ip, src_port=src_port, dst_port=dst_port,
+                    protocol=protocol_label,
+                )
         except Exception as exc:  # noqa: BLE001 — one malformed payload must not end the scan
             skipped_packets += 1
             if first_skip_error is None:
@@ -2350,41 +2703,26 @@ def analyze_creds(
                 if key in seen_hit_keys:
                     continue
                 seen_hit_keys.add(key)
-                matches += 1
-                kind_counts[kind] += 1
-                if user:
-                    user_counts[user] += 1
-                if len(hits) < max_hits:
-                    packet_number = 0
-                    ts_value: Optional[float] = http_summary.first_seen
-                    src_ip = "-"
-                    dst_ip = "-"
-                    src_port: Optional[int] = None
-                    dst_port: Optional[int] = None
-                    if observed is not None:
-                        (
-                            packet_number,
-                            ts_value,
-                            src_ip,
-                            dst_ip,
-                            src_port,
-                            dst_port,
-                        ) = observed
-                    hits.append(
-                        CredentialHit(
-                            packet_number=packet_number,
-                            ts=ts_value,
-                            src_ip=src_ip,
-                            dst_ip=dst_ip,
-                            src_port=src_port,
-                            dst_port=dst_port,
-                            protocol="HTTP",
-                            kind=kind,
-                            username=user,
-                            secret=secret,
-                            evidence=enriched_evidence[:240],
-                        )
-                    )
+                packet_number = 0
+                ts_value: Optional[float] = http_summary.first_seen
+                src_ip = "-"
+                dst_ip = "-"
+                src_port: Optional[int] = None
+                dst_port: Optional[int] = None
+                if observed is not None:
+                    (
+                        packet_number,
+                        ts_value,
+                        src_ip,
+                        dst_ip,
+                        src_port,
+                        dst_port,
+                    ) = observed
+                _record(
+                    kind, user, secret, enriched_evidence[:240], packet_number=packet_number,
+                    ts=ts_value, src_ip=src_ip, dst_ip=dst_ip, src_port=src_port,
+                    dst_port=dst_port, protocol="HTTP",
+                )
     except Exception as exc:
         errors.append(f"HTTP URL credential mining error: {exc}")
 
@@ -2403,43 +2741,58 @@ def analyze_creds(
             (str(h.kind), h.username, h.secret, str(h.evidence)) for h in hits
         }
         for conv in getattr(telnet_summary, "conversations", []) or []:
-            conv_users = list(getattr(conv, "usernames", []) or [])
-            conv_pwds = list(getattr(conv, "password_values", ()) or ())
-            if not conv_users and not conv_pwds:
-                continue
+            # Every login attempt of the session, in order: a failed attempt
+            # often comes before the one that works, and keeping only the
+            # first lost the account that got in.
+            logins = list(getattr(conv, "logins", ()) or ())
+            if not logins:
+                conv_users = list(getattr(conv, "usernames", []) or [])
+                conv_pwds = list(getattr(conv, "password_values", ()) or ())
+                if not conv_users and not conv_pwds:
+                    continue
+                logins = [(conv_users[0] if conv_users else None, conv_pwds[0] if conv_pwds else None, False)]
             src = str(getattr(conv, "client_ip", "-") or "-")
             dst = str(getattr(conv, "server_ip", "-") or "-")
             dport = getattr(conv, "server_port", None)
-            # Pair user+password when both are present in the session; otherwise
-            # emit whichever was recovered.
-            user = conv_users[0] if conv_users else None
-            secret = conv_pwds[0] if conv_pwds else None
-            evidence = "telnet session transcript (reassembled)"
-            key = ("Telnet Login", user, secret, evidence)
-            if key not in existing_hit_keys:
+            attempts = [(u, p, r) for u, p, r in logins if u or p]
+            for index, (user, secret, rejected) in enumerate(attempts, 1):
+                evidence = "telnet session transcript (reassembled)"
+                if len(attempts) > 1:
+                    evidence += f", login {index} of {len(attempts)}"
+                if rejected:
+                    evidence += ", rejected by the server"
+                key = ("Telnet Login", user, secret, evidence)
+                if key in existing_hit_keys:
+                    continue
                 existing_hit_keys.add(key)
-                matches += 1
-                kind_counts["Telnet Login"] += 1
-                if user:
-                    user_counts[user] += 1
-                if len(hits) < max_hits:
-                    hits.append(
-                        CredentialHit(
-                            packet_number=0,
-                            ts=getattr(conv, "first_seen", None),
-                            src_ip=src,
-                            dst_ip=dst,
-                            src_port=getattr(conv, "client_port", None),
-                            dst_port=dport,
-                            protocol="Telnet",
-                            kind="Telnet Login",
-                            username=user,
-                            secret=secret,
-                            evidence=evidence,
-                        )
-                    )
+                _record(
+                    "Telnet Login", user, secret, evidence, packet_number=0,
+                    ts=getattr(conv, "first_seen", None), src_ip=src, dst_ip=dst,
+                    src_port=getattr(conv, "client_port", None), dst_port=dport, protocol="Telnet",
+                )
     except Exception as exc:
         errors.append(f"Telnet credential mining error: {exc}")
+
+    # Credentials the protocol analyzers recover from their own state: each
+    # runs only when its traffic was seen above (cred_sources.py).
+    sourced_seen: set[tuple[object, ...]] = set()
+    for source in cred_sources.ANALYZER_SOURCES:
+        if source.name not in fired_sources:
+            continue
+        try:
+            for item in source.collect(path, packets, meta):
+                key = (item.kind, item.user, item.secret, item.src_ip, item.dst_ip)
+                if key in sourced_seen:
+                    continue
+                sourced_seen.add(key)
+                _record(
+                    item.kind, item.user, item.secret, item.evidence,
+                    packet_number=item.packet_number, ts=item.ts, src_ip=item.src_ip,
+                    dst_ip=item.dst_ip, src_port=item.src_port, dst_port=item.dst_port,
+                    protocol=item.protocol,
+                )
+        except Exception as exc:  # noqa: BLE001 - one analyzer must not end --creds
+            errors.append(f"{source.name} credential mining error: {exc}")
 
     truncated = matches > len(hits)
 
@@ -2459,14 +2812,21 @@ def analyze_creds(
         "likely_benign_test_credentials": [],
     }
 
+    privileged_index: dict[tuple[str, str, str, str], dict[str, object]] = {}
+    external_index: dict[tuple[str, str, str, str], dict[str, object]] = {}
     for hit in hits:
         score = 0
         secret = str(hit.secret or "")
         user = str(hit.username or "")
         kind_l = hit.kind.lower()
-        if "basic" in kind_l or "pass" in kind_l or "credential" in kind_l:
+        if (
+            "basic" in kind_l
+            or "pass" in kind_l
+            or "credential" in kind_l
+            or "cleartext" in kind_l
+        ):
             score += 2
-        elif "token" in kind_l or "bearer" in kind_l:
+        elif "token" in kind_l or "bearer" in kind_l or "key" in kind_l:
             score += 1
         if user:
             score += 1
@@ -2492,6 +2852,7 @@ def analyze_creds(
             "hashcat -m" in str(hit.evidence or "")
             or hit.kind.endswith("Hash")
             or "challenge response" in kind_low
+            or OFFLINE_GUESSABLE in str(hit.evidence or "")
         )
         if is_hash:
             deterministic_checks["crackable_hash_capture"].append(
@@ -2503,33 +2864,48 @@ def analyze_creds(
                 f"pkt={hit.packet_number} {hit.src_ip}->{hit.dst_ip} {hit.kind} confidence={confidence}"
             )
 
+        # One row per (account, source, destination, kind) with a count: a
+        # brute-force run repeats the same exposure thousands of times.
+        material = "offline-guessable" if is_hash else ("cleartext" if secret else "account name")
         if is_public_ip(hit.dst_ip):
-            external_exposures.append(
-                {
+            ext_key = (user.lower(), hit.src_ip, hit.dst_ip, hit.kind)
+            row = external_index.get(ext_key)
+            if row is None:
+                row = {
                     "src": hit.src_ip,
                     "dst": hit.dst_ip,
                     "kind": hit.kind,
                     "user": hit.username or "-",
                     "pkt": hit.packet_number,
+                    "count": 0,
+                    "material": material,
                 }
-            )
-            deterministic_checks["external_destination_exposure"].append(
-                f"{hit.src_ip}->{hit.dst_ip} kind={hit.kind}"
-            )
+                external_index[ext_key] = row
+                external_exposures.append(row)
+                deterministic_checks["external_destination_exposure"].append(
+                    f"{hit.src_ip}->{hit.dst_ip} kind={hit.kind}"
+                )
+            row["count"] = int(row["count"]) + 1  # type: ignore[call-overload]
 
         if user and PRIV_USER_RE.search(user):
-            privileged_exposures.append(
-                {
+            priv_key = (user.lower(), hit.src_ip, hit.dst_ip, hit.kind)
+            row = privileged_index.get(priv_key)
+            if row is None:
+                row = {
                     "src": hit.src_ip,
                     "dst": hit.dst_ip,
                     "user": user,
                     "kind": hit.kind,
                     "pkt": hit.packet_number,
+                    "count": 0,
+                    "material": material,
                 }
-            )
-            deterministic_checks["privileged_account_exposure"].append(
-                f"{user} exposed via {hit.kind} {hit.src_ip}->{hit.dst_ip}"
-            )
+                privileged_index[priv_key] = row
+                privileged_exposures.append(row)
+                deterministic_checks["privileged_account_exposure"].append(
+                    f"{user} exposed via {hit.kind} {hit.src_ip}->{hit.dst_ip}"
+                )
+            row["count"] = int(row["count"]) + 1  # type: ignore[call-overload]
 
         if secret and secret.lower() in PLACEHOLDER_SECRETS:
             deterministic_checks["likely_benign_test_credentials"].append(

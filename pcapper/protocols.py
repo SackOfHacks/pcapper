@@ -18,6 +18,7 @@ except ImportError:
     IP = TCP = UDP = Ether = IPv6 = ARP = ICMP = DNS = Raw = FlagValue = None
 
 from .analyzer import _lite_layer_chain
+from .ot_ports import OT_PORT_PROTOCOLS
 from .lite import LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .utils import memoize_analysis, packet_length, safe_float
@@ -458,6 +459,13 @@ KNOWN_PORTS = {
     27017: "MongoDB",
     5353: "mDNS",
 }
+# Any OT port the registry knows that is not hand-labelled above: so --protocols
+# names every port --services does, and a port added to the registry shows up
+# here with no edit. The fuller labels above (S7/MMS/ICCP, GE SRTP, CIP/ENIP-IO)
+# win where both have one, matching services.COMMON_PORTS.
+for _ot_port, _ot_label in OT_PORT_PROTOCOLS.items():
+    INDUSTRIAL_PORTS.setdefault(_ot_port, _ot_label)
+
 KNOWN_PORTS.update(INDUSTRIAL_PORTS)
 
 OSCILLATION_REPEAT_CAP = 3

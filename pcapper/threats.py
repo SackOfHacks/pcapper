@@ -13,18 +13,21 @@ import time
 from collections import Counter, defaultdict
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Optional
 
+from .aim import analyze_aim
 from .arp import analyze_arp
 from .netbios import analyze_netbios, collect_netbios_host_intel
 from .bacnet import analyze_bacnet
 from .beacon import analyze_beacons
 from .remote_access import analyze_remote_access
 from .carving import analyze_carving
+from .certificates import analyze_certificates
 from .cip import analyze_cip
 from .coap import analyze_coap
 from .control_loop import build_control_loop_summary
-from .creds import analyze_creds
+from .creds import analyze_creds, credential_severity
 from .crimson import analyze_crimson
 from .csp import analyze_csp
 from .df1 import analyze_df1
@@ -54,10 +57,13 @@ from .modicon import analyze_modicon
 from .mqtt import analyze_mqtt
 from .niagara import analyze_niagara
 from .ntlm import analyze_ntlm
+from .ntp import NTP_PORT, analyze_ntp
 from .obfuscation import analyze_obfuscation
 from .codesys import analyze_codesys
 from .opc import analyze_opc
 from .opc_classic import analyze_opc_classic
+from .ot_commands import control_command_counts, worst_command_severity
+from .ot_ports import OT_PORT_PROTOCOLS
 from .ot_risk import compute_ot_risk_posture, dedupe_findings
 from .capture_parts import capture_parts
 from .ot_extra import OT_EXTRA
@@ -66,7 +72,7 @@ from .port_overrides import is_standard as is_standard_port
 from .port_overrides import overrides as port_overrides_for
 from .fifo_feed import FeedRegistry, FifoFeed, can_feed, start_part_feeds
 from .lite import UNSUPPORTED, LitePacket
-from .pcap_cache import PcapMeta, capture_hashes, forget_part_hooks, iter_packets
+from .pcap_cache import PcapMeta, capture_hashes, forget_part_hooks, get_forced_packet_view, iter_packets
 from .pccc import analyze_pccc
 from .pcworx import analyze_pcworx
 from .powershell import analyze_powershell
@@ -82,6 +88,7 @@ from .safety import SAFETY_PORTS
 from .smb import analyze_smb
 from .snmp import analyze_snmp
 from .socks import analyze_socks
+from .ssdp import _looks_like_ssdp, analyze_ssdp
 from .ftp import analyze_ftp
 from .nfs import analyze_nfs
 from .malware import analyze_malware
@@ -102,6 +109,8 @@ from .syslog import analyze_syslog
 from .hypothesis import annotate as _annotate_hypothesis
 from .skeptical import apply_skeptical_filter
 from .tcp import analyze_tcp
+from .teamviewer import _EPHEMERAL_MIN as TEAMVIEWER_EPHEMERAL_MIN
+from .teamviewer import TEAMVIEWER_HINT_RE, TEAMVIEWER_PORTS, analyze_teamviewer
 from .tls import analyze_tls
 from .udp import analyze_udp
 from .utils import (
@@ -121,8 +130,10 @@ from .utils import (
     setdict_add,
     shannon_entropy,
 )
+from .vlan import analyze_vlans
 from .vpn import analyze_vpn
 from .winrm import analyze_winrm
+from .wlan import analyze_wlan
 from .wmic import analyze_wmic
 from .yokogawa import analyze_yokogawa
 
@@ -179,44 +190,31 @@ CIP_SERVICE_CODE_SET = {
     0x91,
 }
 
-OT_PORTS: dict[int, str] = {
+# OT service ports, derived from the shared registry (ot_ports, which the
+# host and timeline views read too), so a port registered there -- every
+# table-driven analyzer's (ADS/AMS, KNXnet/IP, ROC Plus ...) -- is an OT port
+# here and in --compromised. A hand-kept copy lacked eleven of them: ADS
+# polling every 30 s was HIGH beaconing while identical Modbus polling was
+# baseline.
+# Ports the registry does not list.
+_OT_PORTS_OUTSIDE_REGISTRY: dict[int, str] = {1883: "MQTT", 8883: "MQTT-TLS"}
+# Where this engine names a registry port differently. The labels key the
+# strict wire-format check of public flows (_STRICT_VALIDATED_PROTOS: a
+# public flow on 2222 is not held to the EtherNet/IP check) and match the
+# analyzer labels the per-protocol packet counts are added to.
+_OT_PORT_LABELS: dict[int, str] = {
+    102: "S7/MMS/ICCP",
     319: "PTP",
     320: "PTP",
-    502: "Modbus",
-    20000: "DNP3",
-    2404: "IEC-104",
-    102: "S7/MMS/ICCP",
-    44818: "EtherNet/IP",
     2222: "CIP/ENIP-IO",
-    2221: "CIP Security",
-    47808: "BACnet",
     34962: "Profinet",
     34963: "Profinet",
     34964: "Profinet",
-    4840: "OPC UA",
-    789: "Crimson",
-    1911: "Niagara Fox",
-    4911: "Niagara Fox",
-    9600: "FINS",
-    5094: "HART-IP",
-    18245: "SRTP",
-    18246: "SRTP",
-    1962: "PCWorx",
-    5006: "MELSEC",
-    5007: "MELSEC",
-    20547: "ProConOS",
-    2455: "CODESYS",
-    1217: "CODESYS",
-    5683: "CoAP",
-    5684: "CoAP",
-    1883: "MQTT",
-    8883: "MQTT-TLS",
-    34378: "P-NET",
-    34379: "P-NET",
-    34380: "P-NET",
-    5313: "Yokogawa Vnet/IP",
-    55565: "Honeywell CDA",
-    1502: "Triconex/SIS",
+    44818: "EtherNet/IP",
+}
+OT_PORTS: dict[int, str] = {
+    **{port: _OT_PORT_LABELS.get(port, label) for port, label in OT_PORT_PROTOCOLS.items()},
+    **_OT_PORTS_OUTSIDE_REGISTRY,
 }
 
 try:
@@ -1404,11 +1402,15 @@ def _append_ot_anomalies(
                 "srcs": Counter(),
                 "dsts": Counter(),
                 "seen": set(),
+                "attack": [],
             }
             grouped[title] = grp
             order.append(title)
         if _SEVERITY_RANK.get(sev, 0) > _SEVERITY_RANK.get(str(grp["severity"]), 0):
             grp["severity"] = sev
+        attack = _attack_tag(anomaly)
+        if attack and attack not in grp["attack"]:  # type: ignore[operator]
+            grp["attack"].append(attack)  # type: ignore[union-attr]
         ev_key = (description, src, dst)
         if ev_key in grp["seen"]:  # type: ignore[operator]
             continue
@@ -1438,7 +1440,30 @@ def _append_ot_anomalies(
             item["top_sources"] = srcs.most_common(5)
         if dsts:
             item["top_destinations"] = dsts.most_common(5)
+        if grp["attack"]:
+            item["attack"] = "; ".join(grp["attack"])  # type: ignore[arg-type]
         detections.append(item)
+
+
+# Where analyzers file the ATT&CK technique(s) of a finding: an anomaly's
+# ``attack`` attribute, a detection's "attack"/"technique"/"mitre" key.
+_ATTACK_TAG_KEYS = ("attack", "technique", "mitre")
+
+
+def _attack_tag(finding: object) -> str:
+    """The analyzer's own ATT&CK tag on an anomaly object or dict ("" for
+    none). Carried onto the detection so --mitre maps what the analyzer saw
+    rather than inferring it from words in the title."""
+    for key in _ATTACK_TAG_KEYS:
+        value = finding.get(key) if isinstance(finding, dict) else getattr(finding, key, None)
+        if isinstance(value, (set, frozenset)):
+            value = sorted(str(entry) for entry in value)
+        if isinstance(value, (list, tuple)):
+            value = "; ".join(str(entry) for entry in value if entry)
+        text = str(value or "").strip()
+        if text:
+            return text
+    return ""
 
 
 def _append_detection_items(
@@ -1490,6 +1515,9 @@ def _append_anomaly_items(
                 item["top_sources"] = [(str(src), 1)]
             if dst:
                 item["top_destinations"] = [(str(dst), 1)]
+            attack = _attack_tag(anomaly)
+            if attack:
+                item["attack"] = attack
             detections.append(item)
             continue
 
@@ -1515,6 +1543,9 @@ def _append_anomaly_items(
             item["top_sources"] = [(str(src), 1)]
         if dst:
             item["top_destinations"] = [(str(dst), 1)]
+        attack = _attack_tag(anomaly)
+        if attack:
+            item["attack"] = attack
         detections.append(item)
 
 
@@ -1540,42 +1571,17 @@ _DHCP_THREAT_SEVERITY = {
 }
 
 
-_OT_COMMAND_KEYWORDS: dict[str, str] = {
-    "plcstop": "critical",
-    "plccoldstart": "high",
-    "plchotstart": "high",
-    "stopdt": "high",
-    "startdt": "warning",
-    "stop": "high",
-    "start": "warning",
-    "restart": "high",
-    "reset": "high",
-    "download": "high",
-    "upload": "warning",
-    "program": "high",
-    "firmware": "critical",
-    "write": "warning",
-    "setpoint": "high",
-    "override": "high",
-    "control": "warning",
-    "delete": "high",
-    "erase": "critical",
-}
-
-
-def _collect_ot_command_hits(commands: Counter[str]) -> tuple[Counter[str], str]:
-    hits: Counter[str] = Counter()
-    severity_rank = {"critical": 0, "high": 1, "warning": 2, "info": 3}
-    max_sev = "info"
-    for cmd, count in commands.items():
-        cmd_lower = str(cmd).lower()
-        for token, sev in _OT_COMMAND_KEYWORDS.items():
-            if token in cmd_lower:
-                hits[cmd] += int(count)
-                if severity_rank.get(sev, 99) < severity_rank.get(max_sev, 99):
-                    max_sev = sev
-                break
-    return hits, max_sev
+def _collect_ot_command_hits(source: str, summary: object) -> tuple[Counter[str], str]:
+    """The state-changing commands of one OT analyzer's summary and their
+    grade, by the rule --ot-commands counts and grades them with: requests
+    only (a device answering a write is not a writer), each protocol as its
+    own analyzer classifies it (an ADS ReadWrite is a symbol lookup unless it
+    goes through a sum-write group), graded by the most consequential kind of
+    command seen and never by how many. The keyword list used here before
+    counted replies, filed ADS lookups and notification unsubscribes as
+    writes, and called them HIGH where --ot-commands said MEDIUM."""
+    hits = control_command_counts(source, summary)
+    return hits, worst_command_severity(hits)
 
 
 def _counter_total(value: object) -> int:
@@ -2426,8 +2432,12 @@ def _classify_internal_periodicity(
     """
     source = str(item.get("source", "")).strip().lower()
     summary = str(item.get("summary", "")).strip().lower()
+    # The TCP analyzer's per-flow cadence check ("Possible TCP beaconing") is
+    # periodicity like the beacon analysis's, and is judged the same way: an
+    # internal HMI->PLC poll stayed HIGH from it while the beacon verdict on
+    # the very same flow was OT baseline.
     is_periodic = source in {"beacon", "c2"} or (
-        source == "udp" and "beacon" in summary
+        source in {"udp", "tcp"} and "beacon" in summary
     )
     if not is_periodic:
         return None
@@ -2884,6 +2894,21 @@ _STEP_THREAT_LABELS = {
 }
 
 
+def _table_driven_endpoints(ot_summaries: dict[str, object]) -> dict[str, set[str]]:
+    """For the OT_PORTS label of each table-driven analyzer's port (ADS/AMS,
+    KNXnet/IP, ROC Plus ...): the addresses that analyzer decoded the
+    protocol between -- empty when it decoded none."""
+    out: dict[str, set[str]] = {}
+    for spec in OT_EXTRA:
+        summary = ot_summaries.get(_STEP_THREAT_LABELS.get(spec.step, spec.label))
+        seen = set(getattr(summary, "src_ips", None) or ()) | set(getattr(summary, "dst_ips", None) or ())
+        for port in spec.ports:
+            label = OT_PORTS.get(port)
+            if label:
+                out.setdefault(label, set()).update(str(ip) for ip in seen)
+    return out
+
+
 def _nonstandard_port_detections(
     path: Path, ot_summaries: dict[str, object] | None = None
 ) -> list[dict[str, object]]:
@@ -2929,6 +2954,233 @@ def _nonstandard_port_detections(
             }
         )
     return items
+
+
+def _credential_exposure_detection(creds_summary: object) -> dict[str, object]:
+    """The consolidated credential-exposure detection, graded by the signals
+    --creds grades its own verdict by (reporting/creds.py): a credential sent
+    to a public destination or a privileged account's is critical, an active
+    credential attack (brute force, spray, stuffing) high, cleartext secrets,
+    reuse and crackable hashes a warning. Graded by hit count instead
+    (critical from 20), one cleartext Administrator logon was a warning the
+    report then suppressed as noise while --creds called it critical. Those
+    signals lead the evidence, so a cleartext secret is never a context-free
+    one-liner the noise filter drops. One pass over the hits: there can be
+    thousands."""
+    external = list(getattr(creds_summary, "external_exposures", None) or [])
+    privileged = list(getattr(creds_summary, "privileged_exposures", None) or [])
+    abuse = list(getattr(creds_summary, "auth_abuse_sequences", None) or [])
+    reuse = list(getattr(creds_summary, "replay_candidates", None) or []) + list(
+        getattr(creds_summary, "token_fanout", None) or []
+    )
+    exposed = {
+        (str(row.get("src", "")), str(row.get("dst", "")), row.get("pkt"))
+        for row in external + privileged
+        if isinstance(row, dict)
+    }
+    by_src: Counter[str] = Counter()
+    by_dst: Counter[str] = Counter()
+    hashes = 0
+    first: list[object] = []  # exposed (public/privileged) hits first, then the rest
+    rest: list[object] = []
+    for hit in getattr(creds_summary, "hits", None) or []:
+        by_src[str(hit.src_ip)] += 1
+        by_dst[str(hit.dst_ip)] += 1
+        if "hashcat -m" in str(hit.evidence or "") or str(hit.kind or "").endswith("Hash"):
+            hashes += 1
+        shown = first if (str(hit.src_ip), str(hit.dst_ip), hit.packet_number) in exposed else rest
+        if len(shown) < 8:
+            shown.append(hit)
+    matches = int(getattr(creds_summary, "matches", 0) or 0)
+
+    reasons: list[str] = []
+    if external:
+        dsts = sorted({str(row.get("dst", "-")) for row in external if isinstance(row, dict)})
+        reasons.append(f"{len(external)} credential(s) sent to a public destination ({', '.join(dsts[:4])})")
+    if privileged:
+        users = sorted({str(row.get("user", "-")) for row in privileged if isinstance(row, dict)})
+        reasons.append("privileged account(s) exposed: " + ", ".join(users[:6]))
+    if abuse:
+        patterns = sorted({str(p) for seq in abuse if isinstance(seq, dict) for p in (seq.get("patterns") or [])})
+        reasons.append(f"active credential attack ({', '.join(patterns) or 'auth abuse'}) from {len(abuse)} source(s)")
+    if reuse:
+        reasons.append(f"credential reuse across hosts ({len(reuse)} value(s))")
+    if matches > hashes:
+        reasons.append("cleartext credential(s) on the wire")
+    if hashes:
+        reasons.append(f"{hashes} offline-crackable hash(es)")
+    # The one grader --creds and --overview also use, so the three agree; its
+    # report vocabulary maps onto the threat engine's (medium->warning,
+    # low->info), and a critical credential detection is never curated as noise.
+    severity = {
+        "critical": "critical", "high": "high", "medium": "warning", "low": "info",
+    }.get(credential_severity(creds_summary) or "", "warning")
+
+    cred_evidence: list[str] = list(reasons)
+    for hit in (first + rest)[:8]:
+        secret = str(hit.secret or "-")
+        if len(secret) > 40:
+            secret = f"{secret[:40]}..."
+        cred_evidence.append(
+            f"{hit.kind} {hit.src_ip}->{hit.dst_ip} user={hit.username or '-'} secret={secret} evidence={hit.evidence}"
+        )
+    kinds = len(getattr(creds_summary, "kind_counts", None) or {})
+    return {
+        "source": "Creds",
+        "severity": severity,
+        "summary": "Credential exposure artifacts observed",
+        "details": (
+            f"{matches} credential/token artifact(s) detected across {kinds} method(s)"
+            + (f": {'; '.join(reasons)}." if reasons else ".")
+        ),
+        "top_sources": by_src.most_common(5),
+        "top_destinations": by_dst.most_common(5),
+        "evidence": _dedupe_evidence(cred_evidence, limit=12),
+    }
+
+
+def _certificate_detections(summary: object) -> list[dict[str, object]]:
+    """Certificate findings the TLS analyzer does not already raise (it reports
+    self-signed, expired, weak-key, validity-outlier and impersonation
+    certificates itself): known-malicious certificates (critical, as
+    --certificates grades them) and weak signature algorithms (medium, like
+    the weak keys). A missing SAN is hygiene, left to --certificates."""
+    out: list[dict[str, object]] = []
+    known_bad = [row for row in getattr(summary, "known_bad_certs", None) or [] if isinstance(row, dict)]
+    if known_bad:
+        out.append(
+            {
+                "severity": "critical",
+                "summary": "Known-malicious TLS certificate observed",
+                "details": "Certificate(s) matching a known-malicious IOC: "
+                + ", ".join(sorted({str(row.get("label", "IOC match")) for row in known_bad})[:4]) + ".",
+                "top_sources": Counter(str(row.get("src")) for row in known_bad if row.get("src")).most_common(5),
+                "top_destinations": Counter(str(row.get("dst")) for row in known_bad if row.get("dst")).most_common(5),
+                "evidence": [
+                    f"{row.get('label', 'IOC match')} serial={row.get('serial', '-')} sha256={row.get('sha256', '-')}"
+                    for row in known_bad[:8]
+                ],
+            }
+        )
+    weak = [row for row in getattr(summary, "weak_signatures", None) or [] if isinstance(row, dict)]
+    if weak:
+        out.append(
+            {
+                "severity": "warning",
+                "summary": "Weak certificate signature algorithms",
+                "details": f"{len(weak)} certificate(s) signed with a weak algorithm.",
+                "top_destinations": Counter(str(row.get("dst")) for row in weak if row.get("dst")).most_common(5),
+                "evidence": [f"{row.get('subject', '-')}: {row.get('sig_algo', '-')}" for row in weak[:8]],
+            }
+        )
+    return out
+
+
+# Frames this analysis's pass hands the VLAN and Wi-Fi analyses: 802.1Q,
+# 802.1ad and QinQ tags, and the 802.11 link types (802.11, Prism, radiotap,
+# AVS, PPI) -- by the first layer scapy builds for a packet held in memory.
+_VLAN_TAG_BYTES = (b"\x81\x00", b"\x88\xa8", b"\x91\x00")
+_VLAN_ETHERTYPES = frozenset({0x8100, 0x88A8, 0x9100})
+_WLAN_LINKTYPES = frozenset({105, 119, 127, 163, 192})
+_WLAN_FIRST_LAYERS = frozenset({"Dot11", "Dot11FCS", "RadioTap", "PrismHeader", "PPI", "AVSWLANHeader"})
+_SSDP_STARTS = (b"m-search", b"notify", b"http/1.")
+
+
+def _l2_frame_kind(pkt: object) -> str | None:
+    """The frame's kind: "vlan" for an 802.1Q/802.1ad-tagged Ethernet frame,
+    "vlan2" for one carrying two tags (the VLAN-hopping shape), "wlan" for an
+    802.11 frame, else None. A lite record answers from its bytes."""
+    if type(pkt) is LitePacket:
+        linktype = pkt.linktype
+        if linktype in _WLAN_LINKTYPES:
+            return "wlan"
+        if linktype == 1 and pkt.original[12:14] in _VLAN_TAG_BYTES:
+            return "vlan2" if pkt.original[16:18] in _VLAN_TAG_BYTES else "vlan"
+        return None
+    name = type(pkt).__name__
+    if name in _WLAN_FIRST_LAYERS:
+        return "wlan"
+    if name == "Ether" and getattr(pkt, "type", None) in _VLAN_ETHERTYPES:
+        return "vlan2" if getattr(pkt.payload, "type", None) in _VLAN_ETHERTYPES else "vlan"
+    return None
+
+
+def _teamviewer_packet(sport: int, dport: int, payload_lower: bytes) -> bool:
+    """teamviewer.py's own test for a TeamViewer packet: its port as the
+    server side, or its name / a TV id in the first 64 payload bytes."""
+    if dport in TEAMVIEWER_PORTS or (sport in TEAMVIEWER_PORTS and dport >= TEAMVIEWER_EPHEMERAL_MIN):
+        return True
+    head = payload_lower[:64]
+    return (b"tv" in head or b"teamviewer" in head) and TEAMVIEWER_HINT_RE.search(head.decode("latin-1")) is not None
+
+
+def _ssdp_packet(payload: bytes, payload_lower: bytes) -> bool:
+    """ssdp.py's own test for an SSDP message (any port)."""
+    return payload_lower[:16].lstrip().startswith(_SSDP_STARTS) and _looks_like_ssdp(payload)
+
+
+class _ProtocolPackets:
+    """The packets of the protocols whose analyzers dissect every packet they
+    read (VLAN, 802.11, NTP, SSDP, TeamViewer), kept by the threat pass: each
+    a superset of what that analyzer itself accepts (its own port, tag or
+    signature test), so its analysis over them finds what it finds over the
+    whole capture -- the contract iter_packets' prefilters keep. --threats
+    reads lightweight records: a capture streamed from disk is never
+    dissected whole for them. At most SUBSET_CAP per protocol are kept."""
+
+    SUBSET_CAP = 20_000
+
+    def __init__(self) -> None:
+        self.kept: dict[str, list[object]] = defaultdict(list)
+        self.seen: Counter[str] = Counter()
+
+    def __repr__(self) -> str:
+        # What was selected, not the packet objects: a pass over lite records
+        # and one over scapy packets select the same (tests/test_lite_threats).
+        return f"_ProtocolPackets({sorted(self.seen.items())})"
+
+    def keep(self, name: str, pkt: object) -> None:
+        kept = self.kept[name]
+        if kept and kept[-1] is pkt:  # a packet with a TCP and a UDP layer
+            return
+        self.seen[name] += 1
+        if len(kept) < self.SUBSET_CAP:
+            kept.append(pkt)
+
+    def analysis(
+        self,
+        name: str,
+        func,
+        path: Path,
+        packets: list[object] | None,
+        meta: PcapMeta | None,
+        errors: list[str],
+        *,
+        present: bool | None = None,
+    ) -> object | None:
+        """``func``'s result for this capture when the protocol is present
+        (``present``, else any packet kept): held in memory, the analysis of
+        the whole capture (memoised, shared with its own flag); streamed, the
+        analysis of the packets kept. None when absent -- always so in a
+        plan's dry run, which sees no packet: --threats' plan stays one of
+        lightweight reads."""
+        kept = self.kept.get(name) or []
+        if not (present if present is not None else kept):
+            return None
+        if packets is not None or get_forced_packet_view(path) is not None:
+            return call_with_packet_view(func, path, packets=packets, meta=meta, show_status=False)
+        if self.seen[name] > len(kept):
+            errors.append(
+                f"{name}: --threats analysed the first {len(kept):,} of {self.seen[name]:,} packets; "
+                f"run its own flag for all of them."
+            )
+        return getattr(func, "__wrapped__", func)(
+            path, show_status=False, packets=[_dissected(pkt) for pkt in kept], meta=meta
+        )
+
+
+def _dissected(pkt: object) -> object:
+    return pkt.materialize() if type(pkt) is LitePacket else pkt
 
 
 @fan_out
@@ -3012,6 +3264,8 @@ def analyze_threats(
     last_seen: Optional[float] = None
     total_packets = 0
     control_command_total = 0
+    kept_packets = _ProtocolPackets()
+    vlan_double_tagged = False
 
     # Read from disk, records come lite: a TCP/UDP segment whose payload scapy
     # leaves Raw (95% of a scan-heavy capture's packets) is counted from its
@@ -3025,6 +3279,13 @@ def analyze_threats(
                 first_seen = ts
             if last_seen is None or ts > last_seen:
                 last_seen = ts
+
+        frame_kind = _l2_frame_kind(pkt)
+        if frame_kind == "wlan":
+            kept_packets.keep("WLAN", pkt)
+        elif frame_kind is not None:
+            kept_packets.keep("VLAN", pkt)
+            vlan_double_tagged = vlan_double_tagged or frame_kind == "vlan2"
 
         src_ip, dst_ip = extract_packet_endpoints(pkt)
 
@@ -3049,6 +3310,13 @@ def analyze_threats(
                     setdict_add(outbound_public_dests_by_src, src_ip, dst_ip)
 
                 payload_lower = payload_data.lower() if payload_data else b""
+                if not is_tcp:
+                    if NTP_PORT in (sport, dport):
+                        kept_packets.keep("NTP", pkt)
+                    if _ssdp_packet(payload_data, payload_lower):
+                        kept_packets.keep("SSDP", pkt)
+                if _teamviewer_packet(sport, dport, payload_lower):
+                    kept_packets.keep("TeamViewer", pkt)
                 if payload_lower:
                     matched_any = False
                     for marker_text, marker_bytes in zip(
@@ -3192,6 +3460,8 @@ def analyze_threats(
             tcp_layer = pkt[TCP]
             dport = int(getattr(tcp_layer, "dport", 0) or 0)
             sport = int(getattr(tcp_layer, "sport", 0) or 0)
+            if _teamviewer_packet(sport, dport, payload_lower):
+                kept_packets.keep("TeamViewer", pkt)
 
             ot_match = _ot_proto_for_flow(sport, dport)
             if ot_match is not None:
@@ -3280,6 +3550,12 @@ def analyze_threats(
             udp_layer = pkt[UDP]
             dport = int(getattr(udp_layer, "dport", 0) or 0)
             sport = int(getattr(udp_layer, "sport", 0) or 0)
+            if NTP_PORT in (sport, dport):
+                kept_packets.keep("NTP", pkt)
+            if _ssdp_packet(payload_data, payload_lower):
+                kept_packets.keep("SSDP", pkt)
+            if _teamviewer_packet(sport, dport, payload_lower):
+                kept_packets.keep("TeamViewer", pkt)
 
             ot_match = _ot_proto_for_flow(sport, dport)
             if ot_match is not None:
@@ -3374,6 +3650,28 @@ def analyze_threats(
     opc_classic_summary = _analyze(analyze_opc_classic, show_status=show_status)
     synchrophasor_summary = _analyze(analyze_synchrophasor, show_status=show_status)
     iec101_103_summary = _analyze(analyze_iec101_103, show_status=show_status)
+    # Findings that stopped at their own flag and so never reached --threats,
+    # nor --overview, which reads it. AIM (computed for --files) and the
+    # certificates (computed for TLS) read lightweight records like the rest
+    # of this plan. The VLAN, Wi-Fi, NTP, SSDP and TeamViewer analyses
+    # dissect every packet they read: they run when their protocol is in the
+    # capture, over the packets of it this pass kept (_ProtocolPackets), so
+    # --threats never dissects a whole capture for them and its plan stays
+    # one of lightweight reads (test_jobs_groups). VLAN runs when a frame
+    # carries two tags: its other findings are context-free warnings the
+    # curation below drops. The domain, HTTP/2, secrets, strings and
+    # web-request analyses also dissect every packet and need most of them;
+    # they stay with their own flags.
+    aim_summary = _analyze(analyze_aim, show_status=show_status)
+    certificates_summary = _analyze(analyze_certificates, show_status=show_status)
+    vlan_summary = kept_packets.analysis(
+        "VLAN", analyze_vlans, path, packets, meta, errors, present=vlan_double_tagged
+    )
+    wlan_summary = kept_packets.analysis("WLAN", analyze_wlan, path, packets, meta, errors)
+    ntp_summary = kept_packets.analysis("NTP", analyze_ntp, path, packets, meta, errors)
+    ssdp_summary = kept_packets.analysis("SSDP", analyze_ssdp, path, packets, meta, errors)
+    teamviewer_summary = kept_packets.analysis("TeamViewer", analyze_teamviewer, path, packets, meta, errors)
+    del kept_packets
 
     artifacts_by_name: dict[str, list[object]] = defaultdict(list)
     for artifact in files_summary.artifacts:
@@ -3525,6 +3823,16 @@ def analyze_threats(
     _append_detection_items(detections, "Obfuscation", obfuscation_summary.detections)
     _append_detection_items(detections, "Carving", carving_summary.detections)
     _append_detection_items(detections, "ControlLoop", control_loop_summary.detections)
+    _append_detection_items(detections, "AIM", aim_summary.detections)
+    _append_detection_items(detections, "Certificates", _certificate_detections(certificates_summary))
+    _append_detection_items(detections, "VLAN", getattr(vlan_summary, "detections", None))
+    _append_detection_items(detections, "WLAN", getattr(wlan_summary, "detections", None))
+    _append_detection_items(detections, "NTP", getattr(ntp_summary, "detections", None))
+    # SSDP files its findings under "title", as anomalies are.
+    _append_anomaly_items(detections, "SSDP", getattr(ssdp_summary, "detections", None))
+    _append_anomaly_items(detections, "SSDP", getattr(ssdp_summary, "anomalies", None))
+    _append_detection_items(detections, "TeamViewer", getattr(teamviewer_summary, "detections", None))
+    _append_anomaly_items(detections, "TeamViewer", getattr(teamviewer_summary, "anomalies", None))
 
     _append_anomaly_items(detections, "NTLM", ntlm_summary.anomalies)
     _append_anomaly_items(detections, "Syslog", syslog_summary.anomalies)
@@ -3603,28 +3911,7 @@ def analyze_threats(
     _append_anomaly_items(detections, "DHCP", dhcp_summary.anomalies)
 
     if creds_summary.matches:
-        hits_by_src: Counter[str] = Counter(hit.src_ip for hit in creds_summary.hits)
-        hits_by_dst: Counter[str] = Counter(hit.dst_ip for hit in creds_summary.hits)
-        cred_evidence: list[str] = []
-        for hit in creds_summary.hits[:8]:
-            secret = hit.secret or "-"
-            if len(secret) > 40:
-                secret = f"{secret[:40]}..."
-            cred_evidence.append(
-                f"{hit.kind} {hit.src_ip}->{hit.dst_ip} user={hit.username or '-'} secret={secret} evidence={hit.evidence}"
-            )
-
-        detections.append(
-            {
-                "source": "Creds",
-                "severity": "critical" if creds_summary.matches >= 20 else "warning",
-                "summary": "Credential exposure artifacts observed",
-                "details": f"{creds_summary.matches} credential/token artifact(s) detected across {len(creds_summary.kind_counts)} method(s).",
-                "top_sources": hits_by_src.most_common(5),
-                "top_destinations": hits_by_dst.most_common(5),
-                "evidence": _dedupe_evidence(cred_evidence, limit=8),
-            }
-        )
+        detections.append(_credential_exposure_detection(creds_summary))
 
     errors.extend(http_summary.errors)
     errors.extend(creds_summary.errors)
@@ -3667,6 +3954,15 @@ def analyze_threats(
     errors.extend(obfuscation_summary.errors)
     errors.extend(carving_summary.errors)
     errors.extend(control_loop_summary.errors)
+    for summary_obj in (
+        aim_summary, certificates_summary, vlan_summary, wlan_summary, ntp_summary, ssdp_summary,
+        teamviewer_summary,
+    ):
+        # Some carry their sub-analyses' errors (TLS already reported the
+        # certificate parser's): each error once.
+        for err in getattr(summary_obj, "errors", []) or []:
+            if err not in errors:
+                errors.append(err)
 
     smb1_sources: Counter[str] = Counter()
     smb1_destinations: Counter[str] = Counter()
@@ -3932,9 +4228,17 @@ def analyze_threats(
             }
         )
 
+    # The table-driven analyzers' ports (ROC Plus 4000, XGT 2004/2005, KNX
+    # 3671 ...) are told by port alone in the packet pass, and some are busy
+    # IT ports too (TCP 4000 is NoMachine's): such a protocol is counted only
+    # where its own analyzer decoded it.
+    table_driven = _table_driven_endpoints(ot_summaries)
+
     # The packet pass ran first (above): its OT protocol counts go in after the
     # analyzers' ones, in the order it met them, as when it ran here.
     for proto, count in loop_ot_protocol_counts.items():
+        if proto in table_driven and not table_driven[proto]:
+            continue
         counter_inc(ot_protocol_counts, proto, count)
 
     duration_seconds = (
@@ -3956,6 +4260,8 @@ def analyze_threats(
                 pairs = strict_ot_pairs.get(proto, set())
                 if (src, dst) not in pairs and (dst, src) not in pairs:
                     continue
+            if proto in table_driven and not {src, dst} <= table_driven[proto]:
+                continue
             validated_public_ot_pairs.add((proto, src, dst))
         public_ot_pairs = validated_public_ot_pairs
 
@@ -4015,7 +4321,7 @@ def analyze_threats(
     for source, summary_obj in ot_summaries.items():
         commands = getattr(summary_obj, "commands", None)
         if isinstance(commands, Counter) and commands:
-            hits, severity = _collect_ot_command_hits(commands)
+            hits, severity = _collect_ot_command_hits(source, summary_obj)
             if hits:
                 evidence = [f"{cmd}({count})" for cmd, count in hits.most_common(10)]
                 detections.append(
@@ -4030,7 +4336,12 @@ def analyze_threats(
 
         func_counts = getattr(summary_obj, "func_counts", None)
         if isinstance(func_counts, Counter):
-            func_hits, func_sev = _collect_ot_command_hits(func_counts)
+            # Requests only where the analyzer keeps them apart: a Modbus
+            # write is echoed by its response under the same function name.
+            func_counts = getattr(summary_obj, "request_func_counts", None) or func_counts
+            func_hits, func_sev = _collect_ot_command_hits(
+                source, SimpleNamespace(func_counts=func_counts)
+            )
             if func_hits:
                 detections.append(
                     {
@@ -4276,27 +4587,17 @@ def analyze_threats(
             }
         )
 
-    control_tokens = (
-        "write",
-        "control",
-        "setpoint",
-        "start",
-        "stop",
-        "download",
-        "upload",
-        "program",
-        "firmware",
-    )
+    # The same commands, classified and graded as above (and as --ot-commands
+    # does): requests only, graded by kind. Five ADS symbol lookups and their
+    # five replies made this HIGH by count alone.
     control_commands: Counter[str] = Counter()
     for source, summary_obj in ot_summaries.items():
         commands = getattr(summary_obj, "commands", None)
         if not isinstance(commands, Counter):
             continue
-        for cmd, count in commands.items():
-            cmd_text = str(cmd).lower()
-            if any(token in cmd_text for token in control_tokens):
-                control_commands[f"{source}:{cmd}"] += int(count)
-                control_command_total += int(count)
+        for cmd, count in control_command_counts(source, summary_obj).items():
+            control_commands[f"{source}:{cmd}"] += int(count)
+            control_command_total += int(count)
     if control_commands:
         top_cmds = [
             f"{cmd} ({count})" for cmd, count in control_commands.most_common(10)
@@ -4304,9 +4605,7 @@ def analyze_threats(
         detections.append(
             {
                 "source": "OT/ICS",
-                "severity": "high"
-                if sum(control_commands.values()) >= 5
-                else "warning",
+                "severity": worst_command_severity(control_commands),
                 "summary": "OT control/program operations observed",
                 "details": f"{sum(control_commands.values())} control-like command(s) detected.",
                 "evidence": _dedupe_evidence(top_cmds, limit=10),

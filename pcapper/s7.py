@@ -1013,6 +1013,50 @@ def _parse_commands(payload: bytes) -> list[str]:
     return _S7State().parse_commands(payload)
 
 
+def plc_password(payload: bytes) -> str | None:
+    """The password of an S7comm UserData "PLC password" request (function
+    group 5 security, subfunction 1), or None. The CPU password travels as 8
+    bytes XOR-obfuscated with 0x55 and the byte two positions earlier, which
+    any capture can undo."""
+    if len(payload) < 17 or payload[0] != 0x03:
+        return None
+    s7 = 5 + payload[4]  # TPKT (4) + COTP length byte + COTP header
+    if s7 + 10 > len(payload) or payload[s7] != 0x32 or payload[s7 + 1] != 0x07:
+        return None
+    param_len = int.from_bytes(payload[s7 + 6 : s7 + 8], "big")
+    data_len = int.from_bytes(payload[s7 + 8 : s7 + 10], "big")
+    param = payload[s7 + 10 : s7 + 10 + param_len]
+    data = payload[s7 + 10 + param_len : s7 + 10 + param_len + data_len]
+    if len(param) < 8 or param[:3] != b"\x00\x01\x12":
+        return None
+    if param[5] != 0x45 or param[6] != 0x01:  # request, group 5; PLC password
+        return None
+    if len(data) < 12:
+        return None
+    encoded = data[4:12]
+    decoded = bytearray(8)
+    for index in range(8):
+        decoded[index] = encoded[index] ^ 0x55 ^ (encoded[index - 2] if index >= 2 else 0)
+    text = decoded.decode("latin-1").rstrip(" \x00")
+    return text if text and text.isprintable() else None
+
+
+def credentials(payload: bytes) -> list[tuple[str, str | None, str | None, str]]:
+    """``--creds`` tuples for one TCP payload."""
+    password = plc_password(payload) if payload else None
+    if password is None:
+        return []
+    return [
+        (
+            "S7 PLC Password",
+            None,
+            password,
+            "UserData security request 'PLC password' (XOR-obfuscated on the wire, decoded)",
+        )
+    ]
+
+
+
 @memoize_analysis
 def analyze_s7(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     state = _S7State()

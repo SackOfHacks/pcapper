@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import importlib
 import ipaddress
 import re
 from collections import Counter
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Iterable, Optional
 
 from .analyzer import analyze_pcap
 from .bacnet import analyze_bacnet
@@ -39,9 +40,13 @@ from .sv import analyze_sv
 from .threats import analyze_threats
 from .opc_classic import analyze_opc_classic
 from .ot_extra import OT_EXTRA
+from .ot_ports import OT_PORT_PROTOCOLS
 from .port_heuristics import auto_decode
+from .port_overrides import PROTOCOL_ALIASES
 from .port_overrides import is_standard as is_standard_port
 from .port_overrides import overrides as port_overrides_for
+from .threats import _STEP_THREAT_LABELS
+from .threats import OT_PORTS as _THREAT_OT_PORT_LABELS
 from .utils import call_with_packet_view, fan_out
 from .rollup import merge_benign_claims, merge_undirected, record_digests, rollup_numeric_kind, union_count
 
@@ -409,6 +414,142 @@ def _detect_ot_modules_from_ports(protocols, services) -> dict[str, list[int]]:
         if matched:
             detected[step] = sorted(set(matched))
     return detected
+
+
+def _family_key(label: object) -> str:
+    """A protocol name reduced for comparison: ``Yokogawa Vnet/IP`` ->
+    ``yokogawavnetip``, ``IEC-101/103`` -> ``iec101103``."""
+    return "".join(re.findall(r"[a-z0-9]+", str(label or "").lower()))
+
+
+def _same_family(first: str, second: str) -> bool:
+    """Two reduced names of one protocol family: one names the other's start
+    (``yokogawa`` / ``yokogawavnetip``, ``niagara`` / ``niagarafox``)."""
+    return bool(first and second) and (first.startswith(second) or second.startswith(first))
+
+
+# Link-layer neighbour discovery every managed switch speaks: the analyzers
+# count it with the OT protocols (PROFINET uses it), but on its own it says
+# nothing about a capture being OT.
+_NOT_OT_BY_ITSELF = frozenset({"LLDP"})
+
+
+def _ot_found_by_analyzers(
+    services,
+    threats_summary,
+    analyzer_packets: Callable[[str], int] | None = None,
+    run_steps: Iterable[str] = (),
+) -> tuple[list[tuple[str, str]], list[tuple[str, list[int]]]]:
+    """The OT protocol families the overview's own label and port hints
+    missed, from evidence that does not rest on a port number alone:
+    ``(steps, families)`` -- deep-dive steps to run (``(step, label)``: GOOSE,
+    a PROFINET DCP exchange ...) and families no deep dive here covers
+    (``(label, ports)``: FINS, MELSEC, SRTP, Modicon, EtherCAT ...).
+
+    * An analyzer that ran found it: the threat correlation runs every OT
+      analyzer and counts what each found. A count that may be one of the
+      correlation's bare port counts stands when that analyzer raised a
+      detection, its own packet count (``analyzer_packets``: the memoised
+      result the correlation computed) is not zero, or a host served the port.
+    * A host served the protocol's port of the canonical registry
+      (OT_PORT_PROTOCOLS): the services inventory saw it accept a TCP
+      connection there. (A UDP "service" there can be a client's source port:
+      the inventory files a DNS reply to client port 55565 as Honeywell CDA.)
+
+    The registry port also names a family. A family whose deep dive already
+    ran (``run_steps``) is left to it: it confirms by its own analyzer."""
+    run = set(run_steps)
+    covered_ports = {port for ports in _OT_PORT_HINTS.values() for port in ports}
+    served: dict[str, set[int]] = {}
+    for asset in list(getattr(services, "assets", []) or []):
+        if not getattr(asset, "handshake_confirmed", False):
+            continue
+        try:
+            port = int(getattr(asset, "port", 0) or 0)
+        except Exception:
+            continue
+        label = OT_PORT_PROTOCOLS.get(port)
+        if label and port not in covered_ports and not _detect_ot_modules(f" {label.lower()} "):
+            served.setdefault(label, set()).add(port)
+    counts = dict(getattr(threats_summary, "ot_protocol_counts", None) or {})
+    port_only = set(_THREAT_OT_PORT_LABELS.values())
+    sources = {
+        str(item.get("source") or "")
+        for item in list(getattr(threats_summary, "detections", []) or [])
+        if isinstance(item, dict)
+    }
+    step_by_label = {label: step for step, label in _MODULE_LABELS.items()}
+    steps: list[tuple[str, str]] = []
+    families: list[tuple[str, list[int]]] = []
+    seen: list[str] = []
+    for label, count in sorted(counts.items(), key=lambda kv: (-int(kv[1] or 0), str(kv[0]))):
+        label = str(label)
+        key = _family_key(label)
+        if not int(count or 0) or not key or label in _NOT_OT_BY_ITSELF:
+            continue
+        covering = (
+            [step_by_label[label]]
+            if label in step_by_label
+            else [step for step, _name in _detect_ot_modules(f" {label.lower()} ")]
+        )
+        if run & set(covering) or any(_same_family(key, known) for known in seen):
+            continue
+        registry = next(
+            ((name, ports) for name, ports in served.items() if _same_family(_family_key(name), key)),
+            None,
+        )
+        if (
+            label in port_only
+            and label not in sources
+            and registry is None
+            and not (analyzer_packets is not None and analyzer_packets(label) > 0)
+        ):
+            continue  # a port number alone: no analyzer finding, no served port
+        seen.append(key)
+        if covering:
+            if all(step != covering[0] for step, _name in steps):
+                steps.append((covering[0], _MODULE_LABELS.get(covering[0], label)))
+        else:
+            families.append((registry[0], sorted(registry[1])) if registry else (label, []))
+    for name, ports in sorted(served.items()):
+        key = _family_key(name)
+        if key and not any(_same_family(key, known) for known in seen):
+            seen.append(key)
+            families.append((name, sorted(ports)))
+    return steps, families
+
+
+def _host_identities(dhcp_summary, ads_summary, enip_summary) -> tuple[dict[str, str], dict[str, str]]:
+    """``(host names, device identities)`` by IP from analyses the overview
+    has run: the host name a DHCP client sent (option 12) on the lease it got,
+    the name a TwinCAT device's ADS discovery reply gave itself, and the
+    product an EtherNet/IP device named itself in a ListIdentity reply."""
+    names: dict[str, str] = {}
+    by_mac = dict(getattr(dhcp_summary, "client_hostnames_by_mac", None) or {})
+    for lease in list(getattr(dhcp_summary, "host_leases", None) or []):
+        ip = str(getattr(lease, "client_ip", "") or "").strip()
+        name = str(getattr(lease, "hostname", "") or "").strip()
+        if name in ("", "-"):
+            known = by_mac.get(str(getattr(lease, "client_mac", "") or "")) or []
+            name = str(known[0]).strip() if known else ""
+        if ip and ip not in ("0.0.0.0", "-") and name:
+            names.setdefault(ip, name)
+    for artifact in list(getattr(ads_summary, "artifacts", None) or []):
+        if str(getattr(artifact, "kind", "")) != "ads_host":
+            continue
+        ip, _sep, name = str(getattr(artifact, "detail", "") or "").partition(": ")
+        if ip.strip() and name.strip():
+            names.setdefault(ip.strip(), name.strip())
+    devices: dict[str, str] = {}
+    for ident in list(getattr(enip_summary, "identities", None) or []):
+        ip = str(getattr(ident, "src_ip", "") or "").strip()
+        product = str(getattr(ident, "product_name", "") or "").strip() or str(
+            getattr(ident, "product_code_name", "") or ""
+        ).strip()
+        vendor = str(getattr(ident, "vendor_name", "") or "").strip()
+        if ip and product:
+            devices.setdefault(ip, f"{product} ({vendor})" if vendor else product)
+    return names, devices
 
 
 def _ot_marker_tokens(steps: list[str], labels: list[str]) -> set[str]:
@@ -2337,7 +2478,7 @@ def analyze_overview(
         add_module(step, reason, runner)
 
     module_results: list[OverviewModuleResult] = []
-    modules_run = [module for module, _reason, _runner in plan]
+    module_summaries: dict[str, object] = {}
     all_errors = [
         str(item)
         for item in list(getattr(protocol_summary, "errors", []) or [])
@@ -2345,28 +2486,112 @@ def analyze_overview(
         if str(item or "").strip()
     ]
 
-    for module, reason, runner in plan:
-        try:
-            summary = runner()
-        except Exception as exc:
-            error_text = f"{type(exc).__name__}: {exc}"
-            module_results.append(
-                OverviewModuleResult(
-                    module=module,
-                    reason=reason,
-                    metrics={},
-                    highlights=[f"{_MODULE_LABELS.get(module, module.upper())} failed: {error_text}"],
-                    errors=[error_text],
+    def run_plan(entries: list[tuple[str, str, Callable[[], object]]]) -> None:
+        for module, reason, runner in entries:
+            try:
+                summary = runner()
+            except Exception as exc:
+                error_text = f"{type(exc).__name__}: {exc}"
+                module_results.append(
+                    OverviewModuleResult(
+                        module=module,
+                        reason=reason,
+                        metrics={},
+                        highlights=[f"{_MODULE_LABELS.get(module, module.upper())} failed: {error_text}"],
+                        errors=[error_text],
+                    )
                 )
-            )
-            all_errors.append(f"{module}: {error_text}")
-            continue
+                all_errors.append(f"{module}: {error_text}")
+                continue
 
-        module_result = _build_module_result(module, reason, summary)
-        module_results.append(module_result)
-        all_errors.extend(module_result.errors)
+            module_summaries[module] = summary
+            module_result = _build_module_result(module, reason, summary)
+            module_results.append(module_result)
+            all_errors.extend(module_result.errors)
+
+    run_plan(plan)
+
+    # OT families the label and port hints above missed: the threat
+    # correlation ran every OT analyzer (FINS, MELSEC, SRTP, Modicon, GOOSE,
+    # PROFINET DCP ...), and the canonical port registry names what the
+    # services inventory saw served.
+    step_by_threat_label = {label: step for step, label in _STEP_THREAT_LABELS.items()}
+
+    def _analyzer_packets(label: str) -> int:
+        """Packets a protocol's own analyzer matched: the result the threat
+        correlation computed (memoised), 0 for a protocol without one."""
+        step = step_by_threat_label.get(label)
+        if step is None:
+            return 0
+        try:
+            analyzer = getattr(importlib.import_module(f".{step}", __package__), f"analyze_{step}")
+            found = _first_int(
+                _analyze(analyzer, show_status=False),
+                ("protocol_packets", "modbus_packets", "dnp3_packets", "cip_packets", "enip_packets"),
+            )
+            return int(found or 0)
+        except Exception:  # noqa: BLE001 - evidence lookup only
+            return 0
+
+    found_steps, extra_ot = _ot_found_by_analyzers(
+        services_summary,
+        module_summaries.get("threats"),
+        _analyzer_packets,
+        run_steps=set(seen_modules) | set(detected_ot_steps),
+    )
+    tail = len(plan)
+    for step, label in found_steps:
+        _register_detected(step, label=label, inventory=False)
+        runner = ot_runners.get(step)
+        if runner is not None:
+            add_module(step, f"Detected {label} via the protocol analyzers of the threat correlation.", runner)
+    if found_steps or extra_ot:
+        # The OT command and safety passes OT families get (their analyzers
+        # already ran in the threat correlation).
+        add_module(
+            "ot_commands",
+            "OT protocol families detected; normalize control/write command activity.",
+            lambda: analyze_ot_commands(
+                path,
+                show_status=show_status,
+                fast=ot_commands_fast,
+                config=ot_commands_config,
+                packets=packets,
+                meta=meta,
+            ),
+        )
+        add_module(
+            "safety",
+            "Check for safety PLC/SIS communications and exposure indicators.",
+            lambda: _analyze(analyze_safety, show_status=show_status),
+        )
+    run_plan(plan[tail:])
+    ot_markers |= _ot_marker_tokens([step for step, _label in found_steps], [label for _step, label in found_steps])
+    modules_run = [module for module, _reason, _runner in plan]
+
+    # Host names beyond NetBIOS (filled in above, and first): the DHCP host
+    # name option (12) a client sent, a TwinCAT device's ADS discovery name,
+    # and an EtherNet/IP device's ListIdentity product as its device identity.
+    # The DHCP analysis ran in the threat correlation; the ADS and ENIP ones
+    # only when their deep dive did.
+    try:
+        from .dhcp import analyze_dhcp
+
+        dhcp_summary = _analyze(analyze_dhcp, show_status=False)
+    except Exception:  # noqa: BLE001 - names are an enrichment
+        dhcp_summary = None
+    host_names, device_names = _host_identities(
+        dhcp_summary, module_summaries.get("ads"), module_summaries.get("enip")
+    )
+    for _row in list(ip_activity) + list(observed_ips) + list(ip_activity_tail):
+        _ip = str(_row.get("ip", ""))
+        if not _row.get("hostname") and host_names.get(_ip):
+            _row["hostname"] = host_names[_ip]
+        if not _row.get("os") and device_names.get(_ip):
+            _row["os"] = device_names[_ip]
 
     module_lookup = {result.module: result for result in module_results}
+    ot_markers |= {label.lower() for label, _ports in extra_ot}
     hunt_leads = _build_hunt_leads(
         ip_activity=ip_activity,
         notable_flows=notable_flows,
@@ -2385,6 +2610,7 @@ def analyze_overview(
         for step in detected_ot_steps
         for port in list(detected_meta.get(step, {}).get("decode_as_ports", []) or [])
     }
+    ot_iot_ports |= {int(port) for _label, ports in extra_ot for port in ports}
     ot_cross_zone_flows: list[dict[str, object]] = []
     cross_zone_ot_iot_flows = _cross_zone_ot_iot_flow_count(
         notable_flows=notable_flows,
@@ -2406,6 +2632,11 @@ def analyze_overview(
         str(detected_meta.get(step, {}).get("label") or _MODULE_LABELS.get(step, step))
         for step in detected_ot_steps
     ]
+    known_families = [_family_key(label) for label in detected_ot_labels]
+    for label, _ports in extra_ot:
+        if not any(_same_family(_family_key(label), known) for known in known_families):
+            known_families.append(_family_key(label))
+            detected_ot_labels.append(label)
     detected_iot_labels = _iot_labels_from_ot_labels(detected_ot_labels)
 
     ot_highlights: list[str] = []
@@ -2460,13 +2691,20 @@ def analyze_overview(
     )
 
     recommendations: list[str] = []
-    if detected_ot_steps:
-        next_flags = []
-        for step in detected_ot_steps[:4]:
-            flag = "--lldp" if step == "lldp" else f"--{step.replace('_', '-')}"
-            next_flags.append(flag)
+    next_flags = []
+    for step in detected_ot_steps[:4]:
+        flag = "--lldp" if step == "lldp" else f"--{step.replace('_', '-')}"
+        next_flags.append(flag)
+    # The other families by the analyzer step their name resolves to (the
+    # decode-as alias table: FINS -> --fins); a name it does not know is in
+    # the OT/ICS families line and the detections instead.
+    for label, _ports in extra_ot:
+        for step in PROTOCOL_ALIASES.get(_family_key(label), ())[:1]:
+            if f"--{step}" not in next_flags:
+                next_flags.append(f"--{step}")
+    if next_flags:
         recommendations.append(
-            "Deep-dive detected OT families with: " + " ".join(next_flags)
+            "Deep-dive detected OT families with: " + " ".join(next_flags[:6])
         )
 
     if threats_result:

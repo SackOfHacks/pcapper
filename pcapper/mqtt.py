@@ -11,6 +11,7 @@ from .industrial_helpers import (
 from .utils import memoize_analysis
 
 MQTT_PORTS = {1883, 8883}
+PROTOCOL_NAME = "MQTT"
 
 MQTT_TYPES = {
     1: "CONNECT",
@@ -124,19 +125,25 @@ def _parse_mqtt_packets(payload: bytes) -> list[dict[str, object]]:
             "payload": b"",
         }
         if msg_type == 1 and len(data) >= 10:
-            proto_len = int.from_bytes(data[0:2], "big")
-            if len(data) >= 2 + proto_len + 4:
-                client_id_len_offset = 2 + proto_len + 4
-                if client_id_len_offset + 2 <= len(data):
-                    client_len = int.from_bytes(
-                        data[client_id_len_offset : client_id_len_offset + 2], "big"
-                    )
-                    client_start = client_id_len_offset + 2
-                    client_id = data[client_start : client_start + client_len].decode(
-                        "utf-8", errors="ignore"
-                    )
-                    if client_id:
-                        entry["client_id"] = client_id
+            connect = _connect_fields(data)
+            if connect is not None:
+                for key in ("client_id", "username", "password"):
+                    if connect.get(key):
+                        entry[key] = connect[key]
+            else:
+                proto_len = int.from_bytes(data[0:2], "big")
+                if len(data) >= 2 + proto_len + 4:
+                    client_id_len_offset = 2 + proto_len + 4
+                    if client_id_len_offset + 2 <= len(data):
+                        client_len = int.from_bytes(
+                            data[client_id_len_offset : client_id_len_offset + 2], "big"
+                        )
+                        client_start = client_id_len_offset + 2
+                        client_id = data[client_start : client_start + client_len].decode(
+                            "utf-8", errors="ignore"
+                        )
+                        if client_id:
+                            entry["client_id"] = client_id
         elif msg_type == 3 and len(data) >= 2:
             tlen = int.from_bytes(data[0:2], "big")
             if 2 + tlen > len(data):
@@ -170,6 +177,85 @@ def _parse_mqtt_packets(payload: bytes) -> list[dict[str, object]]:
         packets.append(entry)
         idx = msg_end
     return packets
+
+
+def _mqtt_string(data: bytes, pos: int) -> tuple[bytes, int] | None:
+    if pos + 2 > len(data):
+        return None
+    size = int.from_bytes(data[pos : pos + 2], "big")
+    end = pos + 2 + size
+    if end > len(data):
+        return None
+    return data[pos + 2 : end], end
+
+
+def _connect_fields(data: bytes) -> dict[str, object] | None:
+    """Client id, username and password of a CONNECT body (variable header +
+    payload), MQTT 3.1 ("MQIsdp"), 3.1.1 and 5. A CONNECT carries the
+    credentials in the clear unless the session runs over TLS (8883)."""
+    name = _mqtt_string(data, 0)
+    if name is None or name[0] not in (b"MQTT", b"MQIsdp"):
+        return None
+    pos = name[1]
+    if pos + 4 > len(data):
+        return None
+    level, flags = data[pos], data[pos + 1]
+    pos += 4  # level, connect flags, keep-alive
+    if level == 5:  # properties: a variable-length integer, then the bytes
+        size, after = _decode_remaining_length(data, pos)
+        if size is None:
+            return None
+        pos = after + size
+    fields: dict[str, object] = {}
+    client = _mqtt_string(data, pos)
+    if client is None:
+        return None
+    fields["client_id"] = client[0].decode("utf-8", errors="replace")
+    pos = client[1]
+    if flags & 0x04:  # will: [v5 properties], topic, message
+        if level == 5:
+            size, after = _decode_remaining_length(data, pos)
+            if size is None:
+                return fields
+            pos = after + size
+        for _ in range(2):
+            item = _mqtt_string(data, pos)
+            if item is None:
+                return fields
+            pos = item[1]
+    if flags & 0x80:
+        user = _mqtt_string(data, pos)
+        if user is None:
+            return fields
+        fields["username"] = user[0].decode("utf-8", errors="replace")
+        pos = user[1]
+    if flags & 0x40:
+        secret = _mqtt_string(data, pos)
+        if secret is not None:
+            fields["password"] = secret[0].decode("utf-8", errors="replace")
+    return fields
+
+
+def credentials(payload: bytes) -> list[tuple[str, str | None, str | None, str]]:
+    """``--creds`` tuples for the CONNECT messages in one TCP payload."""
+    found: list[tuple[str, str | None, str | None, str]] = []
+    if not payload or payload[0] != 0x10:
+        return found
+    for entry in _parse_mqtt_packets(payload):
+        user = entry.get("username")
+        secret = entry.get("password")
+        if entry.get("type") != 1 or not (user or secret):
+            continue
+        client = entry.get("client_id") or "-"
+        found.append(
+            (
+                "MQTT CONNECT Credentials",
+                str(user) if user else None,
+                str(secret) if secret else None,
+                f"CONNECT client id {client!r}" + (" username/password" if secret else " username"),
+            )
+        )
+    return found
 
 
 def _parse_commands(payload: bytes) -> list[str]:
@@ -221,6 +307,9 @@ def _parse_artifacts(payload: bytes) -> list[tuple[str, str]]:
         client_id = entry.get("client_id")
         if isinstance(client_id, str) and client_id:
             artifacts.append(("mqtt_client_id", client_id))
+        username = entry.get("username")
+        if isinstance(username, str) and username:
+            artifacts.append(("mqtt_username", username))
     return artifacts
 
 
@@ -277,6 +366,22 @@ def _detect_anomalies(
                 ts=ts,
             )
         )
+    for entry in parsed:
+        if entry.get("type") == 1 and entry.get("password"):
+            anomalies.append(
+                IndustrialAnomaly(
+                    severity="HIGH",
+                    title="MQTT Credentials in Cleartext",
+                    description=(
+                        f"CONNECT from client {entry.get('client_id') or '-'} carries "
+                        f"username {entry.get('username') or '-'!r} and a password "
+                        "outside TLS."
+                    ),
+                    src=src_ip,
+                    dst=dst_ip,
+                    ts=ts,
+                )
+            )
     if any(cmd == "AUTH" for cmd in commands):
         anomalies.append(
             IndustrialAnomaly(

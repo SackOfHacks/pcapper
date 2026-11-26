@@ -486,6 +486,9 @@ def _resolve_flow(state: _FlowState) -> Optional[_ResolvedFlow]:
             "user": auth["user"],
             "secret": auth["secret"],
             "result": "failed" if auth_failed else "accepted",
+            # When: merged across captures as the earliest (a timestamp named
+            # "ts" would make the same credential of two captures two rows).
+            "first_seen": auth.get("ts"),
         }
 
     reverse = state.syn_initiator is not None and state.syn_initiator == server

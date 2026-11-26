@@ -18,7 +18,7 @@ from .netbios import analyze_netbios
 from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, iter_packets
 from .progress import run_with_busy_status
-from .services import ServiceAsset, analyze_services
+from .services import _OT_SERVICE_PORTS, ServiceAsset, analyze_services
 from .smb import analyze_smb
 from .utils import env_int, extract_packet_endpoints, gateway_macs, memoize_analysis, tcp_flags_int
 from .utils import is_private_ip as _is_private_ip
@@ -80,10 +80,10 @@ class HostSummary:
     errors: list[str] = field(default_factory=list)
 
 
-_HOST_OT_PORTS = {
-    102, 502, 1962, 2404, 4840, 5006, 5007, 9600, 18245, 20000, 34962,
-    34963, 34964, 44818, 47808,
-}
+# A host's OT service ports: the services module's set (the registry less PTP
+# and CoAP, which IT and IoT hosts run as well), so "OT port on a public IP"
+# and "OT + admin ports on one host" agree with --services' OT/IT checks.
+_HOST_OT_PORTS = _OT_SERVICE_PORTS
 _HOST_ADMIN_PORTS = {22, 23, 135, 139, 445, 3389, 5900, 5985, 5986}
 
 

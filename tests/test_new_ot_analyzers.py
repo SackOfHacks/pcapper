@@ -125,13 +125,16 @@ def test_roc_plus_login_and_custom_port(tmp_path) -> None:
 # --- Beckhoff ADS -------------------------------------------------------------------------
 
 
-def test_ads_addroute_credentials(tmp_path) -> None:
+def _ads_addroute() -> bytes:
     def tag(tid, value):
         return tid.to_bytes(2, "little") + len(value).to_bytes(2, "little") + value
     tags = tag(12, b"EWS-PC\x00") + tag(7, bytes([192, 168, 1, 99, 1, 1])) + tag(13, b"Administrator\x00") + tag(2, b"1\x00")
-    route = b"\x03\x66\x14\x71" + b"\x00" * 4 + (6).to_bytes(4, "little") + bytes([192, 168, 1, 99, 1, 1]) + (10000).to_bytes(2, "little") + (4).to_bytes(4, "little") + tags
+    return b"\x03\x66\x14\x71" + b"\x00" * 4 + (6).to_bytes(4, "little") + bytes([192, 168, 1, 99, 1, 1]) + (10000).to_bytes(2, "little") + (4).to_bytes(4, "little") + tags
+
+
+def test_ads_addroute_credentials(tmp_path) -> None:
     capture = tmp_path / "ads.pcap"
-    _udp(capture, [(False, route)], dport=48899)
+    _udp(capture, [(False, _ads_addroute())], dport=48899)
     found = analyze_ads(capture, show_status=False).anomalies
     cred = next(a for a in found if a.title == "ADS AddRoute with cleartext Windows credentials")
     assert "user 'Administrator' password '1'" in cred.evidence[0]
@@ -171,6 +174,64 @@ def test_c1222_cleartext_security(tmp_path) -> None:
     assert result.commands["Security"] == 1
     cred = next(a for a in result.anomalies if "credentials" in a.title)
     assert "password 'password1234'" in cred.evidence[0]
+
+
+# --- --creds reports the logons these analyzers recover ----------------------------------
+
+
+def test_creds_reports_the_ot_logons(tmp_path) -> None:
+    """--overview listed a TwinCAT AddRoute's Windows logon as a HIGH finding
+    while --creds reported no cleartext credentials. --creds now recovers the
+    ADS, C12.22, DLMS and ROC Plus logons with the analyzers' own parsers, on
+    any port the analyzers match: the ROC Plus login is on a moved port, behind
+    another frame in the same segment."""
+    from pcapper.creds import analyze_creds
+
+    login = _roc(17, b"OP1" + (13330).to_bytes(2, "little") + b"\x01")
+    captures = {
+        "ads": (_udp, [(False, _ads_addroute())], {"dport": 48899}),
+        "roc": (_tcp, [(False, _roc(6, b"\x00" * 10) + login)], {"dport": 12345}),
+        "dlms": (_tcp, [(False, _dlms(bytes([0x60, 0x0C, 0xAC, 0x0A, 0x80, 0x08]) + b"12345678"))], {"dport": 4059}),
+        "c1222": (_tcp, [(False, _c1222(b"\x50" + (7).to_bytes(2, "big") + b"meteruser\x00")),
+                         (False, _c1222(b"\x51" + b"password1234".ljust(20, b"\x00")))], {"dport": 1153}),
+    }
+    expected = {
+        "ads": [("Beckhoff ADS/AMS", "ADS AddRoute Credential", "Administrator", "1")],
+        "roc": [("ROC Plus", "ROC Plus Login Credential", "OP1", "13330")],
+        "dlms": [("DLMS/COSEM", "DLMS LLS Password", None, "12345678")],
+        "c1222": [("ANSI C12.22", "C12.22 Logon User", "meteruser", None),
+                  ("ANSI C12.22", "C12.22 Security Password", None, "password1234")],
+    }
+    for name, (write, frames, ports) in captures.items():
+        capture = tmp_path / f"{name}.pcap"
+        write(capture, frames, **ports)
+        hits = analyze_creds(capture, show_status=False).hits
+        assert [(h.protocol, h.kind, h.username, h.secret) for h in hits] == expected[name], name
+
+
+def test_roc_login_prefilter_never_hides_a_login() -> None:
+    """--creds runs rocplus.credentials() on every payload, which skips the CRC
+    when no frame can be a login. On payloads mixed from valid, truncated,
+    corrupted and random frames it finds exactly what the unfiltered parse
+    finds."""
+    import random
+
+    from pcapper import rocplus
+
+    rng = random.Random(4000)
+    login = _roc(17, b"OP1" + (13330).to_bytes(2, "little") + b"\x01")
+    pieces = [login, login[:-3], _roc(6, b"\x00" * 10), _roc(181, b"\x01\x02\x03"), b"\x11" * 9]
+    found = 0
+    for _ in range(3000):
+        payload = bytearray(b"".join(rng.choice(pieces) for _ in range(rng.randint(1, 4))))
+        if rng.random() < 0.3:
+            payload[0:0] = bytes(rng.getrandbits(8) for _ in range(rng.randint(1, 12)))
+        if rng.random() < 0.3:
+            payload[rng.randrange(len(payload))] ^= 1 << rng.randrange(8)
+        unfiltered = [c for f in rocplus.parse_roc_frames(bytes(payload)) if (c := rocplus._login_credential(f))]
+        assert rocplus.credentials(bytes(payload)) == unfiltered, bytes(payload).hex()
+        found += bool(unfiltered)
+    assert found > 300  # the logins are there to be hidden
 
 
 # --- LonTalk / CN-IP --------------------------------------------------------------------------

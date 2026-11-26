@@ -174,6 +174,44 @@ def _detect_anomalies(
     return anomalies
 
 
+REMOTE_PASSWORD_UNLOCK = 0x1630
+
+
+def remote_password(payload: bytes) -> str | None:
+    """The password of an SLMP/MC "Remote Password Unlock" (0x1630) request,
+    binary 3E/4E or ASCII 3E frame, or None. It is sent in the clear."""
+    if len(payload) >= 17 and payload[:2] in (b"\x50\x00", b"\x54\x00"):
+        base = 4 if payload[:2] == b"\x54\x00" else 0
+        if int.from_bytes(payload[base + 11 : base + 13], "little") != REMOTE_PASSWORD_UNLOCK:
+            return None
+        data = payload[base + 15 :]
+        size = int.from_bytes(data[:2], "little")
+        raw = data[2 : 2 + size]
+    elif len(payload) >= 35 and payload[:4] == b"5000":
+        try:
+            if int(payload[22:26], 16) != REMOTE_PASSWORD_UNLOCK:
+                return None
+            size = int(payload[30:34], 16)
+        except ValueError:
+            return None
+        raw = payload[34 : 34 + size]
+    else:
+        return None
+    if not raw or len(raw) != size:
+        return None
+    text = raw.decode("latin-1")
+    return text if text.isprintable() else None
+
+
+def credentials(payload: bytes) -> list[tuple[str, str | None, str | None, str]]:
+    """``--creds`` tuples for one TCP/UDP payload."""
+    password = remote_password(payload) if payload else None
+    if password is None:
+        return []
+    return [("MELSEC Remote Password", None, password, "SLMP Remote Password Unlock (0x1630)")]
+
+
+
 @memoize_analysis
 def analyze_melsec(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
