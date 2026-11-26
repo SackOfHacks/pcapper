@@ -129,6 +129,7 @@ class VncConversation:
     repeater_id: str = ""  # UltraVNC repeater/backconnect "ID:" number
     handshake: str = ""  # how far the RFB handshake got
     hello_strings: tuple[str, ...] = ()  # strings in the UltraVNC hello buffer
+    security: str = ""  # the security type the session settled on
 
 
 @dataclass(frozen=True)
@@ -726,6 +727,7 @@ def analyze_vnc(
                 repeater_id=session.repeater_id,
                 handshake=session.handshake(),
                 hello_strings=session.hello_strings,
+                security=session.vnc_security,
             )
         )
         if session.packets <= 6 and session.bytes < 2000:

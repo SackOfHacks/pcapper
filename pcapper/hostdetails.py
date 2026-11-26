@@ -16,6 +16,7 @@ from .tls import analyze_tls
 from .smb import analyze_smb
 from .email import analyze_email
 from .dhcp import analyze_dhcp
+from .enip import analyze_enip
 from .files import analyze_files
 from .hostname import analyze_hostname
 from .ips import analyze_ips
@@ -31,6 +32,43 @@ _IPV4_RE = re.compile(r"\b(?:\d{1,3}\.){3}\d{1,3}\b")
 _SEVERITY_WEIGHT = {"critical": 8, "high": 5, "warning": 3, "medium": 3, "info": 1}
 
 _NO_OS_EVIDENCE = "no reliable passive OS indicators observed"
+
+# Inferred "OS / device" labels a device's own identity is more precise than.
+_GENERIC_DEVICE_LABELS = {
+    "",
+    "-",
+    "Unknown",
+    "OT/ICS Device (Embedded/Appliance)",
+    "Embedded RTOS",
+    "Network/IoT Appliance",
+}
+
+
+def _enip_identity_text(ident) -> tuple[str, str]:
+    """``(label, evidence)`` of an EtherNet/IP ListIdentity reply: the product
+    name the device gives itself (``1756-ENBT/A``), with the vendor, device
+    type and revision the identity object resolves to -- as --enip lists it."""
+    vendor = ident.vendor_name or (f"Vendor {ident.vendor_id}" if ident.vendor_id is not None else "")
+    device_type = ident.device_type_name or (
+        f"DeviceType {ident.device_type}" if ident.device_type is not None else ""
+    )
+    model = ident.product_code_name or (
+        f"Product {ident.product_code}" if ident.product_code is not None else ""
+    )
+    product = str(ident.product_name or "").strip() or model or "EtherNet/IP device"
+    maker = " ".join(part for part in (vendor, device_type) if part)
+    qualifiers = [part for part in (maker, f"rev {ident.revision}" if ident.revision else "") if part]
+    label = f"{product} ({', '.join(qualifiers)})" if qualifiers else product
+    fields = [
+        ("vendor", vendor),
+        ("product", ident.product_name or ""),
+        ("model", model),
+        ("type", device_type),
+        ("revision", ident.revision or ""),
+        ("serial", str(ident.serial_number) if ident.serial_number is not None else ""),
+    ]
+    evidence = "EtherNet/IP ListIdentity: " + " ".join(f"{k}={v}" for k, v in fields if v)
+    return label, evidence
 
 
 def _detection_pair_ips(detection: dict[str, object], field: str) -> list[str]:
@@ -1557,6 +1595,30 @@ def analyze_hostdetails(
     if netbios_os and (not operating_system or operating_system in ("Unknown", "-", "")):
         operating_system = netbios_os
         os_evidence = list(os_evidence) + [f"Browser (MS-BRWS) announced OS: {netbios_os}"]
+    # The device's own EtherNet/IP identity (a ListIdentity reply it sent):
+    # the product, vendor, type, revision and serial --enip lists for it. For
+    # an OT device the naming/service heuristics can only call generic, that
+    # identity IS its "OS / device"; beside a real OS it is added to it.
+    try:
+        enip_summary = _busy("EtherNet/IP", analyze_enip, path, show_status=False)
+    except Exception:  # noqa: BLE001 - an identity lookup must not sink the host view
+        enip_summary = None
+    identities = [
+        ident
+        for ident in getattr(enip_summary, "identities", None) or []
+        if (_canonical_ip(ident.src_ip) or ident.src_ip) == target_canonical
+    ]
+    if identities:
+        label, _evidence = _enip_identity_text(identities[0])
+        os_evidence = [item for item in os_evidence if item != _NO_OS_EVIDENCE]
+        for ident in identities[:4]:
+            line = _enip_identity_text(ident)[1]
+            if line not in os_evidence:
+                os_evidence.append(line)
+        if operating_system in _GENERIC_DEVICE_LABELS:
+            operating_system = label
+        else:
+            operating_system = f"{operating_system}; EtherNet/IP {label}"
     hostname_findings.sort(
         key=lambda item: int(item.get("count", 0) or 0), reverse=True
     )

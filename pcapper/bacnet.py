@@ -13,6 +13,12 @@ from .industrial_helpers import (
 )
 
 BACNET_PORT = 47808
+PROTOCOL_NAME = "BACnet"
+
+# Confirmed services whose request carries a password (a CharacterString in
+# the clear) and the context tag that holds it: DeviceCommunicationControl
+# [2], ReinitializeDevice [1] (ASHRAE 135, clauses 16.1 and 16.4).
+PASSWORD_SERVICES = {0x11: ("DeviceCommunicationControl", 2), 0x14: ("ReinitializeDevice", 1)}
 
 BVLC_FUNCTIONS = {
     0x00: "BVLC-Result",
@@ -525,6 +531,7 @@ def _parse_bacnet_payload(payload: bytes) -> dict[str, object]:
                 service_choice, f"Confirmed Service 0x{service_choice:02x}"
             )
             service_data = apdu[offset + 1 :]
+            info["service_data"] = service_data
     elif pdu_type == 0x01:
         if len(apdu) >= 2:
             service_choice = apdu[1]
@@ -595,6 +602,42 @@ def _parse_bacnet_payload(payload: bytes) -> dict[str, object]:
             info["who_is_high_limit"] = _context_unsigned(service_data, 1)
 
     return info
+
+
+def _character_string(raw: bytes) -> str | None:
+    """A BACnet CharacterString: a character-set byte, then the text."""
+    if len(raw) < 2:
+        return None
+    charset, text = raw[0], raw[1:]
+    if charset == 4:  # UCS-2
+        return text.decode("utf-16-be", errors="replace")
+    return text.decode("utf-8" if charset == 0 else "latin-1", errors="replace")
+
+
+def service_password(payload: bytes) -> tuple[str, str] | None:
+    """(service name, password) of a DeviceCommunicationControl or
+    ReinitializeDevice request, or None."""
+    if not payload or payload[0] != 0x81:
+        return None
+    info = _parse_bacnet_payload(payload)
+    if info.get("apdu_type") != 0x00:
+        return None
+    service = PASSWORD_SERVICES.get(info.get("service_choice"))  # type: ignore[arg-type]
+    if service is None:
+        return None
+    name, tag = service
+    raw = _context_primitive_value(info.get("service_data") or b"", tag)  # type: ignore[arg-type]
+    password = _character_string(raw) if raw else None
+    return (name, password) if password else None
+
+
+def credentials(payload: bytes) -> list[tuple[str, str | None, str | None, str]]:
+    """``--creds`` tuples for one UDP payload."""
+    found = service_password(payload)
+    if found is None:
+        return []
+    name, password = found
+    return [("BACnet Service Password", None, password, f"{name} request password {password!r}")]
 
 
 def _parse_commands(payload: bytes) -> list[str]:

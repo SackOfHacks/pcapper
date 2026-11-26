@@ -8,7 +8,7 @@ from __future__ import annotations
 
 from collections import Counter
 
-from ..creds import CredentialSummary
+from ..creds import CredentialSummary, credential_severity
 from ..utils import output_redaction_enabled
 from . import _style as st
 from ._common import (
@@ -19,9 +19,11 @@ from ._kv import counter_line
 
 _OT_TOKENS = {"ethernet/ip", "enip", "cip", "modbus", "dnp3", "iec-104", "iec104", "profinet", "s7", "bacnet", "opc ua", "opc-ua",
               "mms", "srtp", "fins", "ethercat", "hart", "iccp", "pcworx", "melsec", "codesys", "niagara", "proconos", "pccc",
-              "modicon", "yokogawa", "honeywell", "goose"}
+              "modicon", "yokogawa", "honeywell", "goose", "ads/ams", "c12.22", "dlms", "roc plus", "acse"}
 _IT_TOKENS = {"http", "ftp", "smtp", "pop3", "imap", "telnet", "ssh", "ldap", "kerberos", "ntlm", "smb", "rdp", "winrm", "rpc",
-              "nfs", "dns", "dhcp", "snmp", "tls", "quic", "mqtt", "coap", "syslog", "netbios", "vnc"}
+              "nfs", "dns", "dhcp", "snmp", "tls", "quic", "mqtt", "coap", "syslog", "netbios", "vnc", "socks", "sip", "iax2",
+              "turn", "radius", "tacacs", "ppp", "eap", "ospf", "rip", "hsrp", "vrrp", "is-is", "bfd", "ike", "wlan"}
+_OFFLINE_GUESSABLE = "offline-guessable"
 _FAMILY_RANK = {"OT": 0, "IT": 1, "Mixed": 2, "Other": 3}
 
 
@@ -84,6 +86,16 @@ def render_creds_summary(summary: CredentialSummary) -> str:
 
     ext = list(summary.external_exposures or [])
     priv = list(summary.privileged_exposures or [])
+    # A bare account name (an RDP cookie, an SNMPv3 user) is worth listing but
+    # is not a compromised credential: only rows carrying a secret or an
+    # offline-guessable exchange make the verdict critical (credential_severity).
+    priv_material = [i for i in priv if str(i.get("material", "cleartext")) != "account name"]
+    exchanges = [h for h in summary.hits if _OFFLINE_GUESSABLE in str(h.evidence or "")]
+    cleartext_hits = sum(
+        1 for h in summary.hits
+        if h.secret and _OFFLINE_GUESSABLE not in str(h.evidence or "")
+        and "hashcat -m" not in str(h.evidence or "") and not str(h.kind or "").endswith("Hash")
+    )
     abuse = list(summary.auth_abuse_sequences or [])
     replay = list(summary.replay_candidates or [])
     fanout = list(summary.token_fanout or [])
@@ -91,8 +103,13 @@ def render_creds_summary(summary: CredentialSummary) -> str:
     reasons = []
     if ext:
         reasons.append(f"{len(ext)} credential(s) sent to a public internet destination")
-    if priv:
-        reasons.append("privileged accounts exposed: " + ", ".join(sorted({str(p.get("user", "-")) for p in priv})[:6]))
+    if priv_material:
+        reasons.append("privileged accounts exposed: " + ", ".join(sorted({str(p.get("user", "-")) for p in priv_material})[:6]))
+    elif priv:
+        reasons.append("privileged account names seen (no credential with them): "
+                       + ", ".join(sorted({str(p.get("user", "-")) for p in priv})[:6]))
+    if exchanges:
+        reasons.append(f"{len(exchanges)} authentication exchange(s) whose password is offline-guessable")
     if abuse:
         patterns = sorted({str(p) for seq in abuse for p in (seq.get("patterns") or [])})
         reasons.append(f"active credential attack ({', '.join(patterns) or 'auth abuse'}) from {len(abuse)} source(s)")
@@ -102,17 +119,18 @@ def render_creds_summary(summary: CredentialSummary) -> str:
         reasons.append(f"token reused across destinations ({len(fanout)})")
     if hashes:
         reasons.append(f"{len(hashes)} offline-crackable hash(es) for " + ", ".join(sorted({str(h['account']) for h in hashes})[:6]))
-    cleartext = summary.matches > len(hashes)
-    if ext or priv:
-        severity, text = "critical", "credential compromise: rotate the exposed accounts now"
-    elif abuse:
-        severity, text = "high", "active credential attack"
-    elif replay or fanout:
-        severity, text = "medium", "credential reuse / token misuse"
-    elif cleartext:
-        severity, text = "medium", "cleartext credentials exposed"
-    elif hashes:
-        severity, text = "medium", "authentication hashes captured (offline-crackable)"
+    # One grader, shared with --threats and --overview so the three agree.
+    severity = credential_severity(summary)
+    if severity == "critical":
+        text = "credential compromise: rotate the exposed accounts now"
+    elif severity == "high":
+        text = "active credential attack"
+    elif severity == "medium":
+        text = ("credential reuse / token misuse" if (replay or fanout) and not cleartext_hits
+                else "cleartext credentials exposed" if cleartext_hits
+                else "authentication hashes captured (offline-crackable)")
+    elif severity == "low":
+        text = "account names exposed, no credential with them"
     else:
         severity, text = None, "no cleartext credentials"
     rep.headline(severity, text, st.join([st.plural(summary.matches, "credential hit"), f"{st.count(summary.total_packets)} packets scanned"]))
@@ -126,14 +144,16 @@ def render_creds_summary(summary: CredentialSummary) -> str:
         rep.section("Errors", [f"  {st.bad('!')} {e}" for e in summary.errors])
 
     rep.section("Sent to the internet", st.table(
-        ["Source", "Public destination", "Account", "Kind", "Packet"],
-        [[i.get("src", "-"), st.bad(str(i.get("dst", "-"))), i.get("user", "-"), i.get("kind", "-"), i.get("pkt", "-")] for i in ext],
-        max_rows=20, noun="credential",
+        ["Source", "Public destination", "Account", "Kind", "Packet", "Hits"],
+        [[i.get("src", "-"), st.bad(str(i.get("dst", "-"))), i.get("user", "-"), i.get("kind", "-"), i.get("pkt", "-"),
+          st.count(int(i.get("count", 1) or 1))] for i in ext],
+        align="lllllr", max_rows=20, noun="credential",
     ))
     rep.section("Privileged accounts", st.table(
-        ["Account", "Source", "Destination", "Kind", "Packet"],
-        [[st.bad(str(i.get("user", "-"))), i.get("src", "-"), i.get("dst", "-"), i.get("kind", "-"), i.get("pkt", "-")] for i in priv],
-        max_rows=20, noun="account",
+        ["Account", "Source", "Destination", "Kind", "Packet", "Hits"],
+        [[st.bad(str(i.get("user", "-"))) if i in priv_material else str(i.get("user", "-")), i.get("src", "-"),
+          i.get("dst", "-"), i.get("kind", "-"), i.get("pkt", "-"), st.count(int(i.get("count", 1) or 1))] for i in priv],
+        align="lllllr", max_rows=20, noun="account",
     ))
     rep.section("Credential attacks", st.table(
         ["Source", "Pattern", "Attempts", "Accounts", "Passwords", "Targets", "Example"],

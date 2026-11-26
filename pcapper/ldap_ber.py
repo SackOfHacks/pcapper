@@ -45,7 +45,8 @@ class LdapMessage:
     op: str
     dn: str = ""  # bind name, search base, target DN or returned entry DN
     auth: str = ""  # "simple", "sasl:<mechanism>"
-    password: str = ""  # simple-bind credential, in the clear
+    password: str = ""  # simple-bind (or SASL PLAIN) credential, in the clear
+    sasl_user: str = ""  # SASL PLAIN authentication identity
     scope: str = ""
     filter: str = ""
     attributes: tuple[str, ...] = ()  # requested (search) or touched (writes)
@@ -225,6 +226,11 @@ def _decode_op(data: bytes, msg_id: int, tag: int, vs: int, ve: int) -> LdapMess
             elif atag == 0xA3:
                 mech = _octet_strings(data, avs, ave)
                 msg.auth = "sasl:" + (mech[0] if mech else "?")
+                if len(mech) > 1 and mech[0].upper() == "PLAIN":
+                    parts = mech[1].split("\x00")
+                    if len(parts) == 3 and parts[2]:
+                        msg.sasl_user = parts[1] or parts[0]
+                        msg.password = parts[2]
             else:
                 msg.auth = f"auth[{atag & 0x1F}]"
     elif op == 3:  # SearchRequest

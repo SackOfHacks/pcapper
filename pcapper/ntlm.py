@@ -260,7 +260,9 @@ NTSTATUS_MAP = {
 }
 
 _NTLM_VISIBLE_RE = re.compile(r"^[\x20-\x7e]{1,128}$")
-_NTLM_USER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._$-]{2,63}$")
+# A UPN-form user (sasladmin@slapd.ldap) is what a SASL bind puts in the Type-3
+# user field, so allow an optional @domain suffix rather than drop the hash.
+_NTLM_USER_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._$-]{2,63}(?:@[A-Za-z0-9][A-Za-z0-9.-]{0,63})?$")
 _NTLM_DOMAIN_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9.-]{1,63}$")
 _NTLM_WORKSTATION_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$")
 
@@ -376,18 +378,24 @@ _HTTP_NTLM_HEADERS = {
 
 
 def _extract_http_ntlm(payload: bytes) -> Optional[bytes]:
-    """Decode an HTTP NTLM auth header's base64 token to raw NTLMSSP bytes.
+    """Decode an HTTP auth header's base64 token to raw NTLMSSP bytes.
 
     NTLM-over-HTTP (Exchange, SharePoint, web proxies, internal apps) carries the
     NTLMSSP message base64-encoded in an Authorization/WWW-Authenticate header, so
     the raw binary signature scan misses it entirely.
+
+    Two schemes carry it. ``NTLM <b64>`` is the raw NTLMSSP message. ``Negotiate
+    <b64>`` -- the WinRM, IIS and modern-Exchange default -- wraps it in a SPNEGO
+    (GSS-API) token, so the NTLMSSP signature sits a few bytes in rather than at
+    the start; a Negotiate token that holds a Kerberos ticket has no NTLMSSP and
+    is skipped. Returns the NTLMSSP message from its signature on, or ``None``.
     """
     for line in payload.splitlines():
         header, separator, value = line.partition(b":")
         if not separator or header.strip().lower() not in _HTTP_NTLM_HEADERS:
             continue
         scheme, separator, token = value.strip().partition(b" ")
-        if not separator or scheme.lower() != b"ntlm" or not token.strip():
+        if not separator or scheme.lower() not in (b"ntlm", b"negotiate") or not token.strip():
             continue
         try:
             decoded = base64.b64decode(token.strip(), validate=True)
@@ -395,6 +403,9 @@ def _extract_http_ntlm(payload: bytes) -> Optional[bytes]:
             continue
         if decoded.startswith(NTLM_SIG):
             return decoded
+        at = decoded.find(NTLM_SIG)
+        if at >= 0:  # SPNEGO-wrapped NTLMSSP
+            return decoded[at:]
     return None
 
 
@@ -415,7 +426,10 @@ def _lite_not_ntlm(record: LitePacket) -> bool:
         return l3 is not None and l3 is not UNSUPPORTED and l3[0] == 1
     if l4 is UNSUPPORTED or l4[5] < 0:
         return False
-    return b"ntlm" not in record.original[l4[7] :].lower()
+    body = record.original[l4[7] :].lower()
+    # "negotiate" catches an HTTP Negotiate header whose SPNEGO-wrapped NTLMSSP
+    # (base64) spells neither "ntlm" nor "NTLMSSP" in the clear.
+    return b"ntlm" not in body and b"negotiate" not in body
 
 
 def _parse_http_status(payload: bytes) -> Optional[str]:

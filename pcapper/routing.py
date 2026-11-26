@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import ipaddress
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -238,6 +238,10 @@ class RoutingSummary:
     first_seen: Optional[float]
     last_seen: Optional[float]
     duration_seconds: Optional[float]
+    # Every cleartext routing password seen (OSPF/RIPv2 simple, HSRP, VRRPv2,
+    # IS-IS): {"protocol", "src", "dst", "password", "ts"}, one per sender and
+    # password. --creds reads these; the artifacts above are display text.
+    cleartext_auth: list[dict[str, object]] = field(default_factory=list)
 
 
 def _ip_text(raw: bytes) -> str:
@@ -393,12 +397,19 @@ def _parse_vrrp(payload: bytes) -> dict[str, object]:
     priority = payload[2]
     auth_type = payload[4] if len(payload) >= 5 else None
     advert_int = payload[5] if len(payload) >= 6 else None
+    # VRRPv2 (RFC 2338) type 1 "simple text password": 8 bytes after the
+    # virtual addresses. VRRPv3 dropped authentication altogether.
+    auth_data = b""
+    if version == 2 and auth_type == 1 and len(payload) >= 8:
+        offset = 8 + 4 * payload[3]
+        auth_data = payload[offset : offset + 8]
     return {
         "version": version,
         "type": msg_type,
         "vrid": vrid,
         "priority": priority,
         "auth_type": auth_type,
+        "auth_data": auth_data,
         "advert_int": advert_int,
     }
 
@@ -1073,6 +1084,16 @@ def analyze_routing(
     pim_options_counts: Counter[str] = Counter()
     pim_dr_priority_counts: Counter[str] = Counter()
     auth_counts: Counter[str] = Counter()
+    cleartext_auth: list[dict[str, object]] = []
+    cleartext_auth_seen: set[tuple[str, str, str]] = set()
+
+    def _cleartext_password(protocol: str, src: str, dst: str, password: str, when: Optional[float]) -> None:
+        key = (protocol, src, password)
+        if password and key not in cleartext_auth_seen and len(cleartext_auth) < 1000:
+            cleartext_auth_seen.add(key)
+            cleartext_auth.append(
+                {"protocol": protocol, "src": src, "dst": dst, "password": password, "ts": when}
+            )
     vrid_counts: Counter[str] = Counter()
     hsrp_group_counts: Counter[str] = Counter()
     sessions_map: dict[tuple[str, str, str, int, int], dict[str, object]] = {}
@@ -1352,6 +1373,7 @@ def analyze_routing(
                                     dst_label,
                                 )
                             )
+                            _cleartext_password("OSPF", src_label, dst_label, pwd, ts)
                         elif auth_type == 0:
                             # Dedup per src->dst: OSPF Hellos repeat every ~10 s,
                             # so one finding per adjacency, not one per packet.
@@ -1405,6 +1427,18 @@ def analyze_routing(
                     auth_type = info.get("auth_type")
                     if auth_type:
                         auth_counts[f"VRRP Auth {auth_type}"] += 1
+                    vrrp_auth = info.get("auth_data") or b""
+                    if vrrp_auth:
+                        vrrp_pwd = bytes(vrrp_auth).decode("latin-1", errors="ignore").strip("\x00")
+                        if vrrp_pwd and (proto_name, src_label, vrrp_pwd) not in cleartext_auth_seen:
+                            detections.append(
+                                {
+                                    "severity": "warning",
+                                    "summary": "VRRP plaintext authentication",
+                                    "details": f"{src_label} -> {dst_label} vrid {vrid} cleartext password '{vrrp_pwd}'",
+                                }
+                            )
+                        _cleartext_password("VRRP", src_label, dst_label, vrrp_pwd, ts)
                     _update_session(
                         "VRRP", src_label, dst_label, 0, 0, ts, f"vrid {vrid}"
                     )
@@ -1486,6 +1520,7 @@ def analyze_routing(
                                     "details": f"{src_label} -> {dst_label} cleartext password '{password}'",
                                 }
                             )
+                            _cleartext_password("IS-IS", src_label, dst_label, str(password), ts)
                     _update_session("IS-IS", src_label, dst_label, 0, 0, ts, pdu_name)
                 elif proto_name == "PIM":
                     info = _parse_pim(payload)
@@ -1694,6 +1729,7 @@ def analyze_routing(
                                     "details": f"{src_label} -> {dst_label} cleartext password '{password}'",
                                 }
                             )
+                            _cleartext_password("IS-IS", src_label, dst_label, str(password), ts)
                     _update_session("IS-IS", src_label, dst_label, 0, 0, ts, pdu_name)
 
             # Port-based routing protocols (BGP/RIP/HSRP/GLBP)
@@ -1869,6 +1905,7 @@ def analyze_routing(
                                         dst_label,
                                     )
                                 )
+                                _cleartext_password(proto_name, src_label, dst_label, pwd, ts)
                             elif auth_type == 0:
                                 detections.append(
                                     {
@@ -1913,6 +1950,7 @@ def analyze_routing(
                                     dst_label,
                                 )
                             )
+                            _cleartext_password("HSRP", src_label, dst_label, auth_text, ts)
                         _update_session(
                             "HSRP",
                             src_label,
@@ -2104,6 +2142,7 @@ def analyze_routing(
 
     return RoutingSummary(
         path=path,
+        cleartext_auth=cleartext_auth,
         total_packets=total_packets,
         routing_packets=routing_packets,
         protocol_counts=protocol_counts,
@@ -2291,6 +2330,7 @@ def merge_routing_summaries(summaries: list[RoutingSummary]) -> RoutingSummary:
     )
     return RoutingSummary(
         path=Path(f"ALL_PCAPS_{len(summaries)}"),
+        cleartext_auth=[row for item in summaries for row in getattr(item, "cleartext_auth", []) or []][:1000],
         total_packets=total_packets,
         routing_packets=routing_packets,
         protocol_counts=protocol_counts,

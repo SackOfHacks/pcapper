@@ -73,6 +73,10 @@ SECRET_RE = re.compile(
     r"\b(?:secret|token|apikey|api_key|api-key|session|sessionid|auth|authorization)\b\s*[:=]\s*([^\s&;,]{3,256})",
     re.IGNORECASE,
 )
+# "AUTH=PLAIN", "AUTH=LOGIN", "AUTH=XAOL-UAS-MB": a server advertising its
+# SASL mechanisms (SMTP EHLO, IMAP CAPABILITY), which SECRET_RE's "auth="
+# would otherwise read as a secret.
+_SASL_MECHANISM_RE = re.compile(r"[A-Z][A-Z0-9_-]{1,39}")
 
 # --- Forensic header / content extraction (threat-hunt / IR additions) -----
 # Email-authentication results. Authentication-Results / ARC headers carry
@@ -680,8 +684,11 @@ def _extract_pair_tokens(
         if token and not _is_qp_artifact(token):
             password_counts[token] += 1
             secret_counts[token] += 1
-    for secret in SECRET_RE.findall(text):
-        token = secret.strip()
+    for match in SECRET_RE.finditer(text):
+        token = match.group(1).strip()
+        key = text[match.start() : match.start(1)].rstrip(" \t:=").lower()
+        if key == "auth" and _SASL_MECHANISM_RE.fullmatch(token):
+            continue
         if token and not _is_qp_artifact(token):
             secret_counts[token] += 1
 

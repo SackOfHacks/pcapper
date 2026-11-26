@@ -560,6 +560,10 @@ class KerberosAnalysis:
     deterministic_checks: Dict[str, List[str]] = field(default_factory=dict)
     attack_matrix: List[Dict[str, str]] = field(default_factory=list)
     etype_counts: Counter[int] = field(default_factory=Counter)
+    # Accounts whose AS-REP answered an AS-REQ without pre-authentication:
+    # {"account", "client", "server", "ts"}. Their encrypted part is
+    # offline-guessable, so --creds lists them with the other exposures.
+    asrep_roastable: List[Dict[str, object]] = field(default_factory=list)
 
 
 def _build_kerberos_attack_overview(
@@ -939,6 +943,7 @@ def analyze_kerberos(
     last_asreq_preauth: Dict[Tuple[str, str], bool] = {}
     asrep_without_preauth: Counter[str] = Counter()
     asrep_roastable_accounts: set[str] = set()
+    asrep_roastable: List[Dict[str, object]] = []
 
     for pkt in iter_packets(path, packets=packets, meta=meta, show_status=show_status, lite=True):
         total_packets += 1
@@ -1083,11 +1088,24 @@ def analyze_kerberos(
                         if name_type in (1, 10) and len(components) == 1:
                             account = _normalize_principal_local(components[0])
                             if account.lower() != "krbtgt":
-                                asrep_roastable_accounts.add(
+                                roastable_name = (
                                     f"{account}@{packet_realms[0]}"
                                     if packet_realms
                                     else account
                                 )
+                                if (
+                                    roastable_name not in asrep_roastable_accounts
+                                    and len(asrep_roastable) < 1000
+                                ):
+                                    asrep_roastable.append(
+                                        {
+                                            "account": roastable_name,
+                                            "client": client_ip,
+                                            "server": server_ip,
+                                            "ts": ts,
+                                        }
+                                    )
+                                asrep_roastable_accounts.add(roastable_name)
 
             # Binary cname/sname/realm: the only source that works on real
             # Kerberos (see _krb_principal_names).
@@ -1416,4 +1434,5 @@ def analyze_kerberos(
         deterministic_checks=deterministic_checks,
         attack_matrix=attack_matrix,
         etype_counts=etype_counts,
+        asrep_roastable=asrep_roastable,
     )

@@ -25,6 +25,7 @@ from .industrial_helpers import (
 )
 from .utils import memoize_analysis
 
+PROTOCOL_NAME = "ROC Plus"
 ROC_PORT = 4000
 
 OPCODES = {
@@ -157,6 +158,36 @@ def _login(frame: RocFrame) -> tuple[str, str] | None:
     return None
 
 
+def _login_credential(frame: RocFrame) -> tuple[str, str | None, str | None, str] | None:
+    """(kind, operator, password, detail) of an opcode 17 login request."""
+    login = _login(frame)
+    if login is None:
+        return None
+    return "ROC Plus Login Credential", login[0], login[1], f"operator {login[0]!r} password {login[1]!r}"
+
+
+def _has_login_opcode(payload: bytes) -> bool:
+    """Whether a walk of the frame lengths in ``payload`` (no CRC) meets
+    opcode 17. parse_roc_frames returns a prefix of these same frames, so
+    without one there is no login and no CRC to compute."""
+    pos = 0
+    while pos + 8 <= len(payload):
+        if payload[pos + 4] == 17:
+            return True
+        pos += payload[pos + 5] + 8
+    return False
+
+
+def credentials(payload: bytes) -> list[tuple[str, str | None, str | None, str]]:
+    """The logins this analysis reports, for --creds. The parse (CRC-valid
+    frames) is the protocol's signature, so it matches on any port the
+    analysis would. --creds calls this for every payload, so a payload
+    without a login frame is turned away before the CRC."""
+    if not _has_login_opcode(payload):
+        return []
+    return [credential for frame in parse_roc_frames(payload) if (credential := _login_credential(frame))]
+
+
 class _RocState:
     def __init__(self) -> None:
         self.writes: Counter[str] = Counter()
@@ -175,9 +206,9 @@ class _RocState:
             if frame.opcode == 203:
                 self.file_transfers += 1
                 self.first.setdefault("file", (src, dst, ts))
-            login = _login(frame)
+            login = _login_credential(frame)
             if login and len(self.logins) < 20:
-                self.logins.append(f"{src} -> {dst}: operator {login[0]!r} password {login[1]!r}")
+                self.logins.append(f"{src} -> {dst}: {login[3]}")
             if frame.opcode == 255 and frame.data:
                 code = frame.data[-1]
                 self.errors[ERROR_CODES.get(code, f"error {code}")] += 1
@@ -223,7 +254,7 @@ def analyze_rocplus(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         port_key="rocplus",
         path=path,
-        protocol_name="ROC Plus",
+        protocol_name=PROTOCOL_NAME,
         tcp_ports={ROC_PORT},
         udp_ports={ROC_PORT},
         signature_matcher=_signature,

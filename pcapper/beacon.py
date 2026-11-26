@@ -9,6 +9,7 @@ from .dns import analyze_dns
 from .http import analyze_http
 from .lite import UNSUPPORTED, LitePacket
 from .openvpn import is_openvpn_tcp_control
+from .ot_ports import OT_PORT_PROTOCOLS, PTP_PORTS
 from .pcap_cache import PcapMeta, iter_packets
 from .services import COMMON_PORTS
 from .utils import (
@@ -38,38 +39,10 @@ except Exception:  # pragma: no cover
     Ether = None  # type: ignore
 
 
-OT_PORTS = {
-    102,
-    502,
-    9600,
-    20000,
-    2404,
-    47808,
-    44818,
-    2222,
-    34962,
-    34963,
-    34964,
-    4840,
-    1911,
-    4911,
-    5094,
-    18245,
-    18246,
-    20547,
-    1962,
-    5006,
-    5007,
-    5683,
-    5684,
-    2455,
-    1217,
-    5313,
-    55565,
-    34378,
-    34379,
-    34380,
-}
+# OT/ICS (and IoT CoAP) control-protocol ports: the registry's, less PTP. PTP
+# is periodic by design (sync/announce at fixed intervals) and carries no
+# control, so its flows must not read as OT control-channel beacons.
+OT_PORTS = frozenset(OT_PORT_PROTOCOLS) - PTP_PORTS
 
 MGMT_PORTS = {
     22,

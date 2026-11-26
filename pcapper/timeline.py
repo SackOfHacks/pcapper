@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from .utils import read_ber_length as _read_ber_length
+import hashlib
+import importlib
 import ipaddress
 from array import array
 import re
@@ -25,7 +27,8 @@ from .ot_risk import compute_ot_risk_posture, dedupe_findings
 from .pcap_cache import PcapMeta, iter_packets
 from .powershell import PS_COMMAND_RE
 from .progress import build_statusbar, run_with_busy_status
-from .s7 import S7_PORT, analyze_s7
+from .s7 import analyze_s7
+from .services import COMMON_PORTS
 from .telnet import TELNET_PORTS
 from .utils import (
     fan_out,
@@ -33,8 +36,10 @@ from .utils import (
     dns_questions,
     env_int,
     extract_packet_endpoints,
+    format_ts,
     memoize_analysis,
     network_egress_allowed,
+    planning,
     safe_float,
 )
 from .winrm import WINRM_PORTS, WSMAN_RE
@@ -546,8 +551,12 @@ EMAIL_PORT_SERVICES: dict[int, str] = {
 }
 
 # Canonical OT port map now lives in ot_ports.py (shared with hostname.py).
-from .ot_ports import OT_PORT_PROTOCOLS  # noqa: E402
+from .ot_ports import OT_PORT_PROTOCOLS, foreign_service_reply  # noqa: E402
+from .ot_extra import OT_EXTRA  # noqa: E402
 
+# An OT event's category is the registry label of its port, so every label the
+# registry has is an OT category -- the table-driven protocols (KNXnet/IP, ADS/
+# AMS, POWERLINK ...) included, and any port added to the registry later.
 OT_CATEGORIES = {
     "Modbus",
     "DNP3",
@@ -568,11 +577,12 @@ OT_CATEGORIES = {
     "CODESYS",
     "CoAP",
     "Triconex/SIS",
-}
+} | set(OT_PORT_PROTOCOLS.values())
 
 NON_OT_CATEGORIES = {
     "ARP",
     "Connection",
+    "Credentials",
     "DHCP",
     "DNS",
     "Email",
@@ -586,6 +596,7 @@ NON_OT_CATEGORIES = {
     "PowerShell",
     "RPC",
     "Recon",
+    "Remote IN",
     "SMB",
     "SNMP",
     "Telnet",
@@ -595,6 +606,110 @@ NON_OT_CATEGORIES = {
 }
 
 TIMELINE_CATEGORIES = tuple(sorted(OT_CATEGORIES | NON_OT_CATEGORIES, key=str.casefold))
+
+# OT analyzers whose findings (anomalies: a time and both endpoints each) the
+# timeline adds for a host that spoke the protocol, keyed by the registry label
+# the packet pass counts it under: (module, function). The analyzer runs only
+# for a protocol the host's own traffic carried. DNP3, IEC-104, S7, ENIP and
+# CIP have blocks of their own below.
+_OT_FINDING_ANALYZERS: dict[str, tuple[str, str]] = {
+    "Modbus": ("modbus", "analyze_modbus"),
+    "OPC UA": ("opc", "analyze_opc"),
+    "BACnet": ("bacnet", "analyze_bacnet"),
+    "PROFINET": ("profinet", "analyze_profinet"),
+    "Niagara Fox": ("niagara", "analyze_niagara"),
+    "FINS": ("fins", "analyze_fins"),
+    "HART-IP": ("hart", "analyze_hart"),
+    "SRTP": ("srtp", "analyze_srtp"),
+    "PCWorx": ("pcworx", "analyze_pcworx"),
+    "MELSEC": ("melsec", "analyze_melsec"),
+    "ProConOS": ("prconos", "analyze_prconos"),
+    "CODESYS": ("codesys", "analyze_codesys"),
+    "CoAP": ("coap", "analyze_coap"),
+    "Crimson": ("crimson", "analyze_crimson"),
+    "Yokogawa Vnet/IP": ("yokogawa", "analyze_yokogawa"),
+    "Honeywell CDA": ("honeywell", "analyze_honeywell"),
+    **{
+        OT_PORT_PROTOCOLS[spec.ports[0]]: (spec.module, spec.function)
+        for spec in OT_EXTRA
+        if spec.ports and spec.ports[0] in OT_PORT_PROTOCOLS
+    },
+}
+
+# Credential exposures listed per kind (the first sightings; one row then says
+# how many more there were -- --creds lists every hit).
+_TIMELINE_CREDS_PER_KIND = env_int("PCAPPER_TIMELINE_CREDS_PER_KIND", 20, minimum=1)
+
+# TCP flows (with an OT-registry port) whose server port a SYN or SYN/ACK
+# showed, kept for the flow's later packets; cleared when full.
+_OT_TCP_FLOWS_MAX = 65536
+
+
+# Registered non-OT service ports above the well-known range (OpenVPN, RDP,
+# SIP, STUN, 8080 ...): the other end of a flow on one of them is a client.
+_OTHER_SERVICE_PORTS = frozenset(COMMON_PORTS) - frozenset(OT_PORT_PROTOCOLS)
+
+
+def _foreign_service(other: int, port: int) -> bool:
+    """``other`` is a service port of its own, so ``port`` opposite it is a
+    client's source port that happens to be an OT port number."""
+    return foreign_service_reply(other, (port,)) or (other != port and other in _OTHER_SERVICE_PORTS)
+
+
+def _service_rank(port: int) -> int:
+    """How likely a port is a listener: well-known, registered, or in the
+    range operating systems pick client ports from (industrial_helpers'
+    _PORT_SERVER_EPHEMERAL_MIN)."""
+    return 0 if port < 1024 else 1 if port < 32768 else 2
+
+
+def _ot_service_port(sport: int, dport: int) -> tuple[int, bool] | None:
+    """``(service port, is_request)`` of a packet of an OT flow, or None.
+
+    The OT service port is whichever side's port is in the registry -- the
+    destination for a request (client -> PLC/RTU/outstation), the source for a
+    reply -- unless the other side is a different service: a reply from DNS/53
+    to a client whose ephemeral port happens to be 44818 is not EtherNet/IP.
+    Two registered ports (a Modbus master sourcing from 2222, a Linux client
+    from 44818 to DNP3/20000): the likelier listener is the service, the
+    destination when they rank alike."""
+    d_ot = dport in OT_PORT_PROTOCOLS
+    s_ot = sport in OT_PORT_PROTOCOLS
+    if d_ot and s_ot and sport != dport:
+        return (sport, False) if _service_rank(sport) < _service_rank(dport) else (dport, True)
+    if d_ot and not _foreign_service(sport, dport):
+        return dport, True
+    if s_ot and not _foreign_service(dport, sport):
+        return sport, False
+    return None
+
+
+# A login command's secret argument (FTP/POP3 PASS, POP3 APOP, SMTP/POP3 AUTH
+# with an initial response, IMAP LOGIN / AUTHENTICATE): the timeline shows the
+# command with that argument as _secret_preview does.
+_SECRET_COMMAND_RE = re.compile(
+    r"^(?P<head>(?:\S+\s+)?(?:PASS|APOP\s+\S+|AUTH\s+\S+|AUTHENTICATE\s+\S+|LOGIN\s+\S+)\s+)(?P<secret>\S.*)$",
+    re.IGNORECASE,
+)
+
+
+def _mask_command_secret(command: str) -> str:
+    match = _SECRET_COMMAND_RE.match(command or "")
+    if match is None:
+        return command
+    return match.group("head") + _secret_preview(match.group("secret"))
+
+
+def _secret_preview(secret: str) -> str:
+    """A credential's secret as the timeline shows it: never a character of
+    it, only what tells two secrets apart -- its length and a 4-hex digest
+    (the same secret twice has the same digest). ``--creds`` shows the value.
+    One token after ``secret=``, so ``--redact`` blanks it whole."""
+    text = str(secret or "").strip()
+    if not text:
+        return "-"
+    digest = hashlib.sha256(text.encode("utf-8", "surrogatepass")).hexdigest()[:4]
+    return f"[len={len(text)}#{digest}]"
 
 
 FTP_CONTROL_PORTS = {21, 2100, 2121, 8021}
@@ -1576,6 +1691,12 @@ def analyze_timeline(
     ot_protocol_counts: Counter[str] = Counter()
     seen_ot_flows: set[tuple[str, str, str, int]] = set()
     seen_ot_commands: set[tuple[str, str, str, int, str]] = set()
+    # (protocol, client, server) of the target's OT flows: which way a
+    # protocol analyzer's command event went (request or reply).
+    ot_pairs: set[tuple[str, str, str]] = set()
+    # Server port of a TCP flow with an OT-registry port, from its SYN or
+    # SYN/ACK (keyed by the flow's endpoints in a fixed order).
+    ot_tcp_services: dict[tuple[str, int, str, int], int] = {}
     seen_udp_flows: set[tuple[str, int]] = set()
     seen_domain_flows: set[tuple[str, int, str, str]] = set()
     seen_ldap_flows: set[tuple[str, int, str, str]] = set()
@@ -1691,13 +1812,15 @@ def analyze_timeline(
         (anomalies + artifacts), filtered to the target host. Shared by the
         CIP/ENIP/DNP3/IEC-104/S7 blocks so the per-protocol code stays DRY.
         `include_artifacts=False` skips artifacts (used for CIP, whose ENIP-layer
-        artifacts are already emitted by the ENIP block)."""
+        artifacts are already emitted by the ENIP block). A finding an analyzer
+        totals over the capture carries time 0: it is listed untimed, not at
+        the epoch ahead of every timed event."""
         errors.extend(getattr(summary, "errors", []) or [])
         for anomaly in getattr(summary, "anomalies", []) or []:
             if anomaly.src != target_ip and anomaly.dst != target_ip:
                 continue
             _emit_event(
-                ts=anomaly.ts,
+                ts=anomaly.ts or None,
                 category=category,
                 summary=anomaly.title,
                 details=f"{anomaly.description} ({anomaly.src} -> {anomaly.dst})",
@@ -1709,12 +1832,130 @@ def analyze_timeline(
             if artifact.src != target_ip and artifact.dst != target_ip:
                 continue
             _emit_event(
-                ts=artifact.ts,
+                ts=artifact.ts or None,
                 category=category,
                 summary=f"{category} artifact ({artifact.kind})",
                 details=f"{artifact.detail} ({artifact.src} -> {artifact.dst})",
                 source=source,
             )
+
+    def _ot_packet(
+        ts: Optional[float],
+        src_ip: str,
+        dst_ip: str,
+        side: tuple[int, bool] | None,
+        payload: bytes | None,
+        *,
+        peer_to_peer: bool = False,
+    ) -> None:
+        """A packet of one of the target's OT flows, seen from the target's
+        side: as the client it sent commands to the peer's OT port; as the
+        server (a PLC, RTU or outstation) it received them on its own. Only a
+        request is read for a command; a reply adds the flow (and a Modbus
+        exception) and nothing else. ``peer_to_peer``: both ends use the OT
+        port (BACnet, TwinCAT discovery), so every packet is its sender's
+        request and the pair is one flow, worded by who spoke first."""
+        if side is None:
+            return
+        port, is_request = side
+        proto = OT_PORT_PROTOCOLS.get(port)
+        if not proto:
+            return
+        client_ip, server_ip = (src_ip, dst_ip) if is_request else (dst_ip, src_ip)
+        as_server = server_ip == target_ip and client_ip != target_ip
+        peer_ip = client_ip if as_server else server_ip
+        if not peer_ip:
+            return
+        ot_protocol_counts[proto] += 1
+        ot_pairs.add((proto, client_ip, server_ip))
+        role = "server" if as_server else "client"
+        flow_role = "peer" if peer_to_peer else role
+        flow = f"{peer_ip} -> {target_ip}:{port}" if as_server else f"{target_ip} -> {peer_ip}:{port}"
+
+        def _command(label: str, detail: str = "") -> bool:
+            key = (proto, role, peer_ip, port, label)
+            if key in seen_ot_commands:
+                return False
+            seen_ot_commands.add(key)
+            _emit_event(
+                ts=ts,
+                category=proto,
+                summary=f"Received {label} from {peer_ip}" if as_server else label,
+                details=f"{flow}{detail}",
+            )
+            return True
+
+        cmd_event_added = False
+        if proto == "Modbus" and port == MODBUS_TCP_PORT:
+            parsed = _parse_modbus_command(payload)
+            if parsed:
+                _func_code, func_name, is_exc, unit_id, exc_desc = parsed
+                if is_request and not is_exc:
+                    cmd_event_added = _command(f"Modbus {func_name}", f" unit {unit_id} {func_name}")
+                elif is_exc:
+                    # An exception reply: the error the slave returned for a
+                    # request (reconnaissance, a refused write).
+                    label = f"Modbus exception {func_name}"
+                    key = (proto, role, peer_ip, port, label)
+                    if key not in seen_ot_commands:
+                        seen_ot_commands.add(key)
+                        sender, receiver = (target_ip, peer_ip) if as_server else (peer_ip, target_ip)
+                        detail = f"{sender}:{port} -> {receiver} unit {unit_id} {func_name}"
+                        if exc_desc:
+                            detail += f" (Exception: {exc_desc})"
+                        _emit_event(
+                            ts=ts,
+                            category=proto,
+                            summary=f"Sent {label} to {peer_ip}" if as_server else label,
+                            details=detail,
+                        )
+                        cmd_event_added = True
+        elif not is_request:
+            pass
+        elif proto == "ENIP" and port == 44818:
+            enip = _parse_enip_command(payload)
+            if enip:
+                cmd, name = enip
+                cmd_event_added = _command(f"{proto} {name or f'ENIP cmd 0x{cmd:04x}'}")
+        elif proto == "OPC UA" and port == OPC_UA_PORT:
+            msg = _parse_opcua_message(payload)
+            if msg:
+                cmd_event_added = _command(f"OPC UA {msg}")
+        elif proto == "IEC-104" and port == IEC104_PORT:
+            frame = _iec104_frame_type(payload)
+            if frame:
+                cmd_event_added = _command(f"IEC-104 {frame}")
+        elif proto == "DNP3" and port == DNP3_PORT:
+            if _dnp3_frame_seen(payload):
+                cmd_event_added = _command("DNP3 frame")
+        # S7 commands come from analyze_s7() below (COTP/S7 decoding).
+
+        if not cmd_event_added:
+            flow_key = (proto, flow_role, peer_ip, port)
+            if flow_key not in seen_ot_flows:
+                seen_ot_flows.add(flow_key)
+                _emit_event(
+                    ts=ts,
+                    category=proto,
+                    summary=f"Inbound {proto} flow" if as_server else f"{proto} flow",
+                    details=flow,
+                )
+
+    def _request_direction(proto: str, src: str, dst: str) -> Optional[bool]:
+        """Whether a protocol analyzer's event from ``src`` to ``dst`` went
+        the request way (client -> server) on one of the target's OT flows:
+        True, False for a reply, None when the flows do not tell."""
+        forward = (proto, src, dst) in ot_pairs
+        backward = (proto, dst, src) in ot_pairs
+        if forward != backward:
+            return forward
+        return None
+
+    def _as_seen_by_target(summary_text: str, src: str, dst: str) -> str:
+        """An event the target received is worded from its side."""
+        if dst == target_ip and src != target_ip:
+            return f"Received {summary_text} from {src}"
+        return summary_text
 
     domain_ports = {88, 464, 445, 139, 135, 593, 3268, 3269}
     ldap_ports = {389, 636, 3268, 3269}
@@ -1986,146 +2227,25 @@ def analyze_timeline(
                         handshake = _find_handshake_for_ack(bucket)
                         if handshake is not None:
                             handshake["ack"] = ts
-            if src_ip == target_ip or dst_ip == target_ip:
-                port_key = dport if src_ip == target_ip else sport
-                if port_key:
-                    proto = OT_PORT_PROTOCOLS.get(port_key)
-                    if proto:
-                        ot_protocol_counts[proto] += 1
-                        direction = "outbound" if src_ip == target_ip else "inbound"
-                        peer_ip = dst_ip if src_ip == target_ip else src_ip
-                        if peer_ip:
-                            cmd_event_added = False
-                            if proto == "Modbus" and port_key == MODBUS_TCP_PORT:
-                                parsed = _parse_modbus_command(payload)
-                                if parsed:
-                                    (
-                                        func_code,
-                                        func_name,
-                                        is_exc,
-                                        unit_id,
-                                        exc_desc,
-                                    ) = parsed
-                                    label = f"Modbus {func_name}"
-                                    if is_exc:
-                                        label = f"Modbus exception {func_name}"
-                                    key = (
-                                        proto,
-                                        direction,
-                                        peer_ip,
-                                        port_key,
-                                        label,
-                                    )
-                                    if key not in seen_ot_commands:
-                                        seen_ot_commands.add(key)
-                                        detail = f"{target_ip} -> {peer_ip}:{port_key} unit {unit_id} {func_name}"
-                                        if is_exc and exc_desc:
-                                            detail += f" (Exception: {exc_desc})"
-                                        _emit_event(
-                                            ts=ts,
-                                            category="Modbus",
-                                            summary=label,
-                                            details=detail,
-                                        )
-                                        cmd_event_added = True
-                            elif proto in {"ENIP", "CIP"} and port_key in {
-                                44818,
-                                2222,
-                            }:
-                                enip = _parse_enip_command(payload)
-                                if enip:
-                                    cmd, name = enip
-                                    label = name or f"ENIP cmd 0x{cmd:04x}"
-                                    key = (
-                                        proto,
-                                        direction,
-                                        peer_ip,
-                                        port_key,
-                                        label,
-                                    )
-                                    if key not in seen_ot_commands:
-                                        seen_ot_commands.add(key)
-                                        _emit_event(
-                                            ts=ts,
-                                            category=proto,
-                                            summary=f"{proto} {label}",
-                                            details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                        )
-                                        cmd_event_added = True
-                            elif proto == "OPC UA" and port_key == OPC_UA_PORT:
-                                msg = _parse_opcua_message(payload)
-                                if msg:
-                                    label = f"OPC UA {msg}"
-                                    key = (
-                                        proto,
-                                        direction,
-                                        peer_ip,
-                                        port_key,
-                                        label,
-                                    )
-                                    if key not in seen_ot_commands:
-                                        seen_ot_commands.add(key)
-                                        _emit_event(
-                                            ts=ts,
-                                            category="OPC UA",
-                                            summary=label,
-                                            details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                        )
-                                        cmd_event_added = True
-                            elif proto == "IEC-104" and port_key == IEC104_PORT:
-                                frame = _iec104_frame_type(payload)
-                                if frame:
-                                    label = f"IEC-104 {frame}"
-                                    key = (
-                                        proto,
-                                        direction,
-                                        peer_ip,
-                                        port_key,
-                                        label,
-                                    )
-                                    if key not in seen_ot_commands:
-                                        seen_ot_commands.add(key)
-                                        _emit_event(
-                                            ts=ts,
-                                            category="IEC-104",
-                                            summary=label,
-                                            details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                        )
-                                        cmd_event_added = True
-                            elif proto == "DNP3" and port_key == DNP3_PORT:
-                                if _dnp3_frame_seen(payload):
-                                    label = "DNP3 frame"
-                                    key = (
-                                        proto,
-                                        direction,
-                                        peer_ip,
-                                        port_key,
-                                        label,
-                                    )
-                                    if key not in seen_ot_commands:
-                                        seen_ot_commands.add(key)
-                                        _emit_event(
-                                            ts=ts,
-                                            category="DNP3",
-                                            summary=label,
-                                            details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                        )
-                                        cmd_event_added = True
-                            elif proto == "S7" and port_key == S7_PORT:
-                                # S7 command and COTP detail extraction is handled
-                                # below via analyze_s7(); keep only flow context here.
-                                pass
-
-                            if not cmd_event_added:
-                                flow_key = (proto, direction, peer_ip, port_key)
-                                if flow_key not in seen_ot_flows:
-                                    seen_ot_flows.add(flow_key)
-                                    _emit_event(
-                                        ts=ts,
-                                        category=proto,
-                                        summary=f"{proto} flow",
-                                        details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                    )
+            if (src_ip == target_ip or dst_ip == target_ip) and sport and dport:
+                side: tuple[int, bool] | None = None
+                if sport in OT_PORT_PROTOCOLS or dport in OT_PORT_PROTOCOLS:
+                    flow_id = (
+                        (src_ip, sport, dst_ip, dport)
+                        if (src_ip, sport) <= (dst_ip, dport)
+                        else (dst_ip, dport, src_ip, sport)
+                    )
+                    if is_syn:
+                        # The handshake names the server port: no guess.
+                        if len(ot_tcp_services) >= _OT_TCP_FLOWS_MAX:
+                            ot_tcp_services.clear()
+                        ot_tcp_services[flow_id] = sport if is_ack else dport
+                    server_port = ot_tcp_services.get(flow_id)
+                    if server_port is None:
+                        side = _ot_service_port(sport, dport)
+                    elif server_port in OT_PORT_PROTOCOLS:
+                        side = (server_port, dport == server_port)
+                _ot_packet(ts, src_ip, dst_ip, side, payload, peer_to_peer=sport == dport)
             if src_ip == target_ip:
                 if dport in TELNET_PORTS:
                     key = (dst_ip, dport, "TCP", "outbound")
@@ -2245,7 +2365,7 @@ def analyze_timeline(
                                 details=f"{target_ip} -> {dst_ip}:{dport} {telnet_cmd}",
                             )
                 if payload and dport in FTP_CONTROL_PORTS:
-                    ftp_cmd = _extract_ftp_command(_decode_payload_line(payload))
+                    ftp_cmd = _mask_command_secret(_extract_ftp_command(_decode_payload_line(payload)) or "")
                     if ftp_cmd:
                         key = (src_ip, dst_ip, dport, ftp_cmd)
                         if key not in seen_ftp_commands:
@@ -2307,7 +2427,7 @@ def analyze_timeline(
                             details=f"{target_ip} -> {dst_ip}:{dport}",
                         )
                     first_line = _decode_payload_line(payload)
-                    command = _extract_email_command(service, first_line)
+                    command = _mask_command_secret(_extract_email_command(service, first_line) or "")
                     if command:
                         action_key = (
                             dst_ip,
@@ -2520,7 +2640,7 @@ def analyze_timeline(
                                 details=f"{src_ip} -> {target_ip}:{sport} {telnet_cmd}",
                             )
                 if payload and sport in FTP_CONTROL_PORTS:
-                    ftp_cmd = _extract_ftp_command(_decode_payload_line(payload))
+                    ftp_cmd = _mask_command_secret(_extract_ftp_command(_decode_payload_line(payload)) or "")
                     if ftp_cmd:
                         key = (src_ip, dst_ip, sport, ftp_cmd)
                         if key not in seen_ftp_commands:
@@ -2543,7 +2663,7 @@ def analyze_timeline(
                             details=f"{src_ip} -> {target_ip}:{sport}",
                         )
                     first_line = _decode_payload_line(payload)
-                    command = _extract_email_command(service, first_line)
+                    command = _mask_command_secret(_extract_email_command(service, first_line) or "")
                     if command:
                         action_key = (
                             src_ip,
@@ -2635,45 +2755,10 @@ def analyze_timeline(
                         )
                     except Exception:
                         pass
-            if src_ip == target_ip or dst_ip == target_ip:
-                port_key = dport if src_ip == target_ip else sport
-                if port_key:
-                    proto = OT_PORT_PROTOCOLS.get(port_key)
-                    if proto:
-                        ot_protocol_counts[proto] += 1
-                        direction = "outbound" if src_ip == target_ip else "inbound"
-                        peer_ip = dst_ip if src_ip == target_ip else src_ip
-                        if peer_ip:
-                            cmd_event_added = False
-                            if proto == "DNP3" and port_key == DNP3_PORT:
-                                if _dnp3_frame_seen(payload):
-                                    label = "DNP3 frame"
-                                    key = (
-                                        proto,
-                                        direction,
-                                        peer_ip,
-                                        port_key,
-                                        label,
-                                    )
-                                    if key not in seen_ot_commands:
-                                        seen_ot_commands.add(key)
-                                        _emit_event(
-                                            ts=ts,
-                                            category="DNP3",
-                                            summary=label,
-                                            details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                        )
-                                        cmd_event_added = True
-                            if not cmd_event_added:
-                                flow_key = (proto, direction, peer_ip, port_key)
-                                if flow_key not in seen_ot_flows:
-                                    seen_ot_flows.add(flow_key)
-                                    _emit_event(
-                                        ts=ts,
-                                        category=proto,
-                                        summary=f"{proto} flow",
-                                        details=f"{target_ip} -> {peer_ip}:{port_key}",
-                                    )
+            if (src_ip == target_ip or dst_ip == target_ip) and sport and dport:
+                _ot_packet(
+                    ts, src_ip, dst_ip, _ot_service_port(sport, dport), payload, peer_to_peer=sport == dport
+                )
             if src_ip == target_ip:
                 if dport:
                     key = (dst_ip, dport)
@@ -2805,8 +2890,17 @@ def analyze_timeline(
         art.packet_index for art in artifacts_for_ip if art.packet_index
     }
     creds_summary = _busy("Credentials", analyze_creds, path, show_status=False, **view)
+    target_cred_hits = [
+        hit for hit in creds_summary.hits if target_ip in (hit.src_ip, hit.dst_ip)
+    ]
     index_ts = _artifact_times(
-        path, artifact_indices, packet_times, untimed, total_packets, packets=packets, meta=meta
+        path,
+        artifact_indices | {int(hit.packet_number) for hit in target_cred_hits if hit.packet_number},
+        packet_times,
+        untimed,
+        total_packets,
+        packets=packets,
+        meta=meta,
     )
 
     for art in artifacts_for_ip:
@@ -2860,43 +2954,81 @@ def analyze_timeline(
                     )
                 )
 
-    smtp_cred_seen: set[tuple[int, str, str, str, str, str]] = set()
-    for hit in creds_summary.hits:
-        kind_upper = str(hit.kind or "").upper()
-        if "SMTP" not in kind_upper:
-            continue
-        if hit.src_ip != target_ip and hit.dst_ip != target_ip:
-            continue
-        secret_text = str(hit.secret or "").strip()
-        user_text = str(hit.username or "").strip()
-        evidence_text = str(hit.evidence or "").strip()
-        dedupe_key = (
-            int(hit.packet_number or 0),
+    # Every credential exposure the host was party to, of any kind: one row per
+    # distinct (kind, flow, account, secret) at its first sighting, saying how
+    # often it recurred; at most _TIMELINE_CREDS_PER_KIND rows per kind, then a
+    # row saying how many more there were. The secret itself is never shown
+    # (_secret_preview); --creds lists every hit with its value and evidence.
+    # The kind is bracketed: --redact masks the word after a bare "PASS".
+    cred_rows: dict[tuple[str, str, str, str, str], list] = {}
+    for hit in target_cred_hits:
+        kind = str(hit.kind or "").strip() or "Credential"
+        key = (
+            kind,
             str(hit.src_ip),
             str(hit.dst_ip),
-            str(hit.kind),
-            user_text,
-            secret_text,
+            str(hit.username or "").strip(),
+            str(hit.secret or "").strip(),
         )
-        if dedupe_key in smtp_cred_seen:
-            continue
-        smtp_cred_seen.add(dedupe_key)
+        row = cred_rows.get(key)
+        if row is None:
+            cred_rows[key] = [hit, 1, hit.ts]
+        else:
+            row[1] += 1
+            if hit.ts is not None and (row[2] is None or hit.ts > row[2]):
+                row[2] = hit.ts
+    listed_per_kind: Counter[str] = Counter()
+    unlisted: dict[str, list] = {}  # kind -> [hits, first time, first packet]
+    for (kind, src, dst, user_text, secret_text), (hit, sightings, last_ts) in cred_rows.items():
         packet_ts = index_ts.get(int(hit.packet_number or 0))
         if packet_ts is None:
             packet_ts = hit.ts
+        listed_per_kind[kind] += 1
+        if listed_per_kind[kind] > _TIMELINE_CREDS_PER_KIND:
+            extra = unlisted.setdefault(kind, [0, packet_ts, hit.packet_number])
+            extra[0] += sightings
+            continue
         details = (
-            f"{hit.src_ip} -> {hit.dst_ip} {hit.protocol} "
-            f"{hit.kind} user={user_text or '-'} secret={secret_text or '-'}"
+            f"{src} -> {dst} {hit.protocol} "
+            f"user={user_text or '-'} secret={_secret_preview(secret_text)}"
         )
-        if evidence_text:
-            details = f"{details} evidence={evidence_text}"
+        if sightings > 1:
+            details += f" (seen {sightings}×, last {format_ts(last_ts)})"
         _emit_event(
             ts=packet_ts,
-            category="Email",
-            summary="SMTP credential artifact",
+            category="Credentials",
+            summary=f"Credential exposed ({kind})",
             details=details,
-            dedupe_key=("smtp-cred",) + dedupe_key,
+            dedupe_key=("cred", kind, src, dst, user_text, secret_text),
             packet_index=hit.packet_number,
+            source="creds",
+        )
+    for kind, (count, first_ts, first_packet) in unlisted.items():
+        _emit_event(
+            ts=first_ts,
+            category="Credentials",
+            summary=f"{count} more credential exposures not listed ({kind})",
+            details=(
+                f"the timeline lists {_TIMELINE_CREDS_PER_KIND} of a kind per host; "
+                "--creds lists every hit"
+            ),
+            dedupe_key=("cred-capped", kind),
+            packet_index=first_packet,
+            source="creds",
+        )
+    if creds_summary.truncated:
+        # For a host with exposures listed, at the last hit the credential
+        # analysis kept (past it, nothing); otherwise an untimed caveat.
+        kept_times = [hit.ts for hit in creds_summary.hits if hit.ts is not None]
+        _emit_event(
+            ts=max(kept_times) if kept_times and target_cred_hits else None,
+            category="Credentials",
+            summary="Credential analysis capped",
+            details=(
+                f"it kept {len(creds_summary.hits)} of {creds_summary.matches} credential "
+                "hits in the capture, the first: exposures past them are not listed here"
+            ),
+            dedupe_key=("cred-analysis-capped",),
             source="creds",
         )
 
@@ -2946,12 +3078,27 @@ def analyze_timeline(
                 dedupe_key=dedupe_key,
             )
 
-    if "DNP3" in ot_protocol_counts:
+    # The OT protocols whose analyzers the blocks below read: those the host
+    # spoke. While a shared pass plans (sharedpass.discover runs this over an
+    # empty capture) every one of them is named, so the pass computes them in
+    # its one read rather than each reading the capture again later.
+    ot_spoken = set(ot_protocol_counts)
+    if planning():
+        ot_spoken |= {"DNP3", "IEC-104", "S7", "ENIP", "CIP", *_OT_FINDING_ANALYZERS}
+
+    if "DNP3" in ot_spoken:
         dnp3_summary = _busy("DNP3", analyze_dnp3, path, show_status=False)
         errors.extend(dnp3_summary.errors)
         seen_msgs: set[tuple[str, str, str, int, int]] = set()
         for msg in dnp3_summary.messages:
             if msg.src_ip != target_ip and msg.dst_ip != target_ip:
+                continue
+            # Requests only (the master's function codes are below 0x80; a
+            # link-layer frame has none and goes by the flow's direction).
+            if msg.func_code is not None:
+                if msg.func_code >= 0x80:
+                    continue
+            elif _request_direction("DNP3", msg.src_ip, msg.dst_ip) is False:
                 continue
             key = (msg.src_ip, msg.dst_ip, msg.func_name, msg.src_addr, msg.dst_addr)
             if key in seen_msgs:
@@ -2960,8 +3107,9 @@ def analyze_timeline(
             _emit_event(
                 ts=msg.ts,
                 category="DNP3",
-                summary=f"DNP3 {msg.func_name}",
+                summary=_as_seen_by_target(f"DNP3 {msg.func_name}", msg.src_ip, msg.dst_ip),
                 details=f"{msg.src_ip} -> {msg.dst_ip} addr {msg.src_addr}->{msg.dst_addr}",
+                source="dnp3",
             )
             if len(seen_msgs) >= 200:
                 break
@@ -2969,14 +3117,14 @@ def analyze_timeline(
             if anomaly.src != target_ip and anomaly.dst != target_ip:
                 continue
             _emit_event(
-                ts=anomaly.ts,
+                ts=anomaly.ts or None,
                 category="DNP3",
                 summary=anomaly.title,
                 details=f"{anomaly.description} ({anomaly.src} -> {anomaly.dst})",
                 source="dnp3",
             )
 
-    if "IEC-104" in ot_protocol_counts:
+    if "IEC-104" in ot_spoken:
         iec_summary = _busy("IEC-104", analyze_iec104, path, show_status=False)
         _emit_ot_summary_events(iec_summary, "IEC-104", "iec104")
         if iec_summary.command_events:
@@ -2984,6 +3132,8 @@ def analyze_timeline(
             for cmd_event in iec_summary.command_events:
                 if cmd_event.src != target_ip and cmd_event.dst != target_ip:
                     continue
+                if _request_direction("IEC-104", cmd_event.src, cmd_event.dst) is False:
+                    continue  # the outstation's replies and monitoring data
                 key = (
                     cmd_event.src,
                     cmd_event.dst,
@@ -2996,12 +3146,14 @@ def analyze_timeline(
                 _emit_event(
                     ts=cmd_event.ts,
                     category="IEC-104",
-                    summary=f"IEC-104 {cmd_event.command}",
+                    summary=_as_seen_by_target(
+                        f"IEC-104 {cmd_event.command}", cmd_event.src, cmd_event.dst
+                    ),
                     details=f"{cmd_event.src} -> {cmd_event.dst}",
                     source="iec104",
                 )
 
-    if "S7" in ot_protocol_counts:
+    if "S7" in ot_spoken:
         s7_summary = _busy("S7", analyze_s7, path, show_status=False)
         _emit_ot_summary_events(s7_summary, "S7", "s7")
         if s7_summary.command_events:
@@ -3009,6 +3161,8 @@ def analyze_timeline(
             for cmd_event in s7_summary.command_events:
                 if cmd_event.src != target_ip and cmd_event.dst != target_ip:
                     continue
+                if _request_direction("S7", cmd_event.src, cmd_event.dst) is False:
+                    continue  # the PLC's acknowledgement of a job
                 cmd_text = str(cmd_event.command or "").strip()
                 if not _is_interesting_s7_command(cmd_text):
                     continue
@@ -3029,7 +3183,7 @@ def analyze_timeline(
                 _emit_event(
                     ts=cmd_event.ts,
                     category="S7",
-                    summary=summary_text,
+                    summary=_as_seen_by_target(summary_text, cmd_event.src, cmd_event.dst),
                     details=details,
                     dedupe_key=("s7-cmd",) + key,
                     source="s7",
@@ -3037,7 +3191,7 @@ def analyze_timeline(
 
     # EtherNet/IP encapsulation activity (RegisterSession, ListIdentity,
     # SendRRData/SendUnitData) on TCP 44818 / UDP 2222.
-    if "ENIP" in ot_protocol_counts:
+    if "ENIP" in ot_spoken:
         enip_summary = _busy("ENIP", analyze_enip, path, show_status=False)
         _emit_ot_summary_events(enip_summary, "ENIP", "enip")
 
@@ -3045,9 +3199,22 @@ def analyze_timeline(
     # are carried inside ENIP on 44818, so analyze whenever either is present.
     # Only emit CIP *anomalies* (the service-layer operations/threats) -- the
     # ENIP-layer session/CPF/cip_object artifacts are already covered above.
-    if "CIP" in ot_protocol_counts or "ENIP" in ot_protocol_counts:
+    if "CIP" in ot_spoken or "ENIP" in ot_spoken:
         cip_summary = _busy("CIP", analyze_cip, path, show_status=False)
         _emit_ot_summary_events(cip_summary, "CIP", "cip", include_artifacts=False)
+
+    # The other OT protocols the host spoke: their analyzers' findings (a
+    # write, a mode change, cleartext credentials, an exposure ...), each with
+    # its time and both endpoints. Artifacts stay in the protocol reports.
+    for proto in sorted(ot_spoken):
+        finder = _OT_FINDING_ANALYZERS.get(proto)
+        if finder is None:
+            continue
+        module, function = finder
+        analyzer = getattr(importlib.import_module(f".{module}", __package__), function)
+        _emit_ot_summary_events(
+            _busy(proto, analyzer, path, show_status=False), proto, module, include_artifacts=False
+        )
 
     # Inbound remote-access connections TO the target host (SSH/RDP/Telnet/etc.).
     # A remote foothold landing on a host that then issues OT commands is the

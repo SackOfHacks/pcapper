@@ -50,6 +50,12 @@ USERNAME_RE = re.compile(
 PASSWORD_RE = re.compile(
     r"\b(?:password|passwd|pass)\s*[:=]\s*(\S+)", re.IGNORECASE
 )
+# What a server prints after refusing a login; searched only between one
+# password and the next prompt.
+LOGIN_REJECTED_RE = re.compile(
+    r"\b(?:login incorrect|incorrect|invalid|denied|failed|failure|bad password)\b",
+    re.IGNORECASE,
+)
 
 SUSPICIOUS_PLAINTEXT = [
     (re.compile(r"password\s*[:=]", re.IGNORECASE), "Credential indicator"),
@@ -85,6 +91,8 @@ class TelnetConversation:
     usernames: list[str]
     passwords: int
     password_values: tuple[str, ...] = ()
+    # Every login attempt in the session, in order: (user, password, rejected).
+    logins: tuple[tuple[Optional[str], Optional[str], bool], ...] = ()
 
 
 @dataclass(frozen=True)
@@ -225,24 +233,47 @@ def _maybe_dedouble(value: str) -> str:
     return v
 
 
-def _extract_transcript_credentials(transcript: str) -> tuple[Optional[str], Optional[str]]:
-    """Pull a username/password out of a reassembled telnet transcript. The
-    server's "login:"/"Password:" prompt and the client's typed value only sit
-    next to each other once both directions are merged in order."""
-    user: Optional[str] = None
-    pwd: Optional[str] = None
-    user_match = USERNAME_RE.search(transcript)
-    if user_match:
-        candidate = _maybe_dedouble(user_match.group(2))
+def _extract_transcript_logins(
+    transcript: str,
+) -> list[tuple[Optional[str], Optional[str], bool]]:
+    """Every login attempt in a reassembled telnet transcript, in order, as
+    (user, password, rejected). The server's "login:"/"Password:" prompt and the
+    client's typed value only sit next to each other once both directions are
+    merged in order. A session often holds a failed attempt before the one that
+    works, so keeping only the first match loses the account that got in."""
+    events: list[tuple[int, int, str, str]] = []
+    for match in USERNAME_RE.finditer(transcript):
         # Strip trailing CR/LF debris and reject prompt-only / empty captures.
-        candidate = candidate.strip().strip("\r\n")
+        candidate = _maybe_dedouble(match.group(2)).strip().strip("\r\n")
         if candidate and candidate.lower() not in {"login", "user", "username"}:
-            user = candidate
-    pass_match = PASSWORD_RE.search(transcript)
-    if pass_match:
-        candidate = _maybe_dedouble(pass_match.group(1)).strip().strip("\r\n")
+            events.append((match.start(), match.end(), "user", candidate))
+    for match in PASSWORD_RE.finditer(transcript):
+        candidate = _maybe_dedouble(match.group(1)).strip().strip("\r\n")
         if candidate and candidate.lower() not in {"password", "passwd", "pass"}:
-            pwd = candidate
+            events.append((match.start(), match.end(), "pass", candidate))
+    events.sort()
+    logins: list[tuple[Optional[str], Optional[str], bool]] = []
+    user: Optional[str] = None
+    for index, (_start, end, kind, value) in enumerate(events):
+        if kind == "user":
+            if user is not None:
+                logins.append((user, None, False))
+            user = value
+            continue
+        following = events[index + 1][0] if index + 1 < len(events) else len(transcript)
+        rejected = LOGIN_REJECTED_RE.search(transcript, end, following) is not None
+        logins.append((user, value, rejected))
+        user = None
+    if user is not None:
+        logins.append((user, None, False))
+    return logins
+
+
+def _extract_transcript_credentials(transcript: str) -> tuple[Optional[str], Optional[str]]:
+    """The first username and the first password in a reassembled transcript."""
+    logins = _extract_transcript_logins(transcript)
+    user = next((u for u, _p, _r in logins if u), None)
+    pwd = next((p for _u, p, _r in logins if p), None)
     return user, pwd
 
 
@@ -622,15 +653,17 @@ def analyze_telnet(
     for session in sessions.values():
         # Reassembled-transcript credential pass: recovers interactive
         # (character-mode) logins the per-packet regex above cannot see.
+        logins: list[tuple[Optional[str], Optional[str], bool]] = []
         if session.transcript_parts:
             transcript = session.transcript_parts.decode("latin-1")
-            t_user, t_pass = _extract_transcript_credentials(transcript)
-            if t_user and t_user not in session.usernames:
-                counter_inc(session.usernames, t_user, max_keys=2000)
-                counter_inc(usernames, t_user)
-            if t_pass and t_pass not in session.passwords:
-                counter_inc(session.passwords, t_pass, max_keys=2000)
-                counter_inc(passwords, t_pass)
+            logins = _extract_transcript_logins(transcript)
+            for t_user, t_pass, _rejected in logins:
+                if t_user and t_user not in session.usernames:
+                    counter_inc(session.usernames, t_user, max_keys=2000)
+                    counter_inc(usernames, t_user)
+                if t_pass and t_pass not in session.passwords:
+                    counter_inc(session.passwords, t_pass, max_keys=2000)
+                    counter_inc(passwords, t_pass)
         conversations.append(
             TelnetConversation(
                 client_ip=session.client_ip,
@@ -650,6 +683,7 @@ def analyze_telnet(
                 usernames=list(session.usernames.keys()),
                 passwords=sum(session.passwords.values()),
                 password_values=tuple(session.passwords.keys()),
+                logins=tuple(logins),
             )
         )
         if session.packets <= 6 and session.bytes < 2000:

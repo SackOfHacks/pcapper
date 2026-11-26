@@ -28,6 +28,7 @@ from .industrial_helpers import (
 )
 from .utils import memoize_analysis
 
+PROTOCOL_NAME = "ANSI C12.22"
 C1222_PORT = 1153
 
 SERVICES = {
@@ -146,6 +147,27 @@ def _printable(data: bytes) -> str:
     return "".join(chr(b) for b in data if 32 <= b < 127).strip()
 
 
+def _credential(code: int, data: bytes) -> tuple[str, str | None, str | None, str] | None:
+    """(kind, user, password, detail) of a Logon or Security service."""
+    if code == 0x50 and len(data) >= 2:
+        user = _printable(data[2:12])
+        return "C12.22 Logon User", user, None, f"logon user ID {int.from_bytes(data[:2], 'big')} user {user!r}"
+    if code == 0x51:
+        password = _printable(data[:20])
+        return "C12.22 Security Password", None, password, f"security password {password!r}"
+    return None
+
+
+def credentials(payload: bytes) -> list[tuple[str, str | None, str | None, str]]:
+    """The credentials this analysis reports, for --creds: the Logon and
+    Security services of a message sent without EPSEM encryption. The parse
+    is the protocol's signature, so it matches on any port the analysis would."""
+    message = parse_c1222(payload)
+    if message is None or message.security_mode == 2:
+        return []
+    return [credential for code, data in message.services if (credential := _credential(code, data))]
+
+
 class _C1222State:
     def __init__(self) -> None:
         self.credentials: list[str] = []
@@ -166,13 +188,9 @@ class _C1222State:
         if message.services:
             self.cleartext += 1
         for code, data in message.services:
-            if code == 0x50 and len(data) >= 2:
-                self.credentials.append(
-                    f"{src} -> {dst}: logon user ID {int.from_bytes(data[:2], 'big')} user {_printable(data[2:12])!r}"
-                )
-                self.first.setdefault("cred", (src, dst, ts))
-            elif code == 0x51:
-                self.credentials.append(f"{src} -> {dst}: security password {_printable(data[:20])!r}")
+            credential = _credential(code, data)
+            if credential:
+                self.credentials.append(f"{src} -> {dst}: {credential[3]}")
                 self.first.setdefault("cred", (src, dst, ts))
             elif code in WRITE_CODES and len(data) >= 2:
                 self.writes[f"{src} -> {dst} table {int.from_bytes(data[:2], 'big')}"] += 1
@@ -220,7 +238,7 @@ def analyze_c1222(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         port_key="c1222",
         path=path,
-        protocol_name="ANSI C12.22",
+        protocol_name=PROTOCOL_NAME,
         tcp_ports={C1222_PORT},
         udp_ports={C1222_PORT},
         signature_matcher=_signature,

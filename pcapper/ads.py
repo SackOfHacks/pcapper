@@ -26,6 +26,7 @@ from .industrial_helpers import (
 )
 from .utils import memoize_analysis
 
+PROTOCOL_NAME = "Beckhoff ADS/AMS"
 ADS_TCP_PORT = 48898
 ADS_UDP_PORT = 48899
 
@@ -107,6 +108,25 @@ def parse_udp(payload: bytes) -> tuple[str, bool, dict[str, str]] | None:
     return name, response, tags
 
 
+def _logon(tags: dict[str, str]) -> tuple[str, str | None, str | None, str] | None:
+    """(kind, user, password, detail) of an AddRoute request's Windows logon."""
+    if "user name" not in tags and "password" not in tags:
+        return None
+    detail = f"user {tags.get('user name', '?')!r} password {tags.get('password', '?')!r}"
+    return "ADS AddRoute Credential", tags.get("user name"), tags.get("password"), detail
+
+
+def credentials(payload: bytes) -> list[tuple[str, str | None, str | None, str]]:
+    """The logon this analysis reports, for --creds: (kind, user, password,
+    detail) of a TwinCAT AddRoute request. The parse is the protocol's
+    signature, so it matches on any port the analysis would."""
+    udp = parse_udp(payload)
+    if udp is None or udp[0] != "AddRoute" or udp[1]:
+        return []
+    logon = _logon(udp[2])
+    return [logon] if logon else []
+
+
 def _signature(payload: bytes) -> bool:
     return bool(_ams_frames(payload)) or parse_udp(payload) is not None
 
@@ -152,10 +172,9 @@ class _AdsState:
             if service == "AddRoute" and not response:
                 self.first.setdefault("route", (src, dst, ts))
                 self.routes.append(f"{src} -> {dst}: route {tags.get('route name', '?')} for {tags.get('AMS NetId', '?')}")
-                if "user name" in tags or "password" in tags:
-                    self.credentials.append(
-                        f"{src} -> {dst}: user {tags.get('user name', '?')!r} password {tags.get('password', '?')!r}"
-                    )
+                logon = _logon(tags)
+                if logon:
+                    self.credentials.append(f"{src} -> {dst}: {logon[3]}")
             return []
         for command, flags, error, data, _source, _target in _ams_frames(payload):
             if flags & 0x0001:
@@ -225,7 +244,7 @@ def analyze_ads(path: Path, show_status: bool = True) -> IndustrialAnalysis:
     analysis = analyze_port_protocol(
         port_key="ads",
         path=path,
-        protocol_name="Beckhoff ADS/AMS",
+        protocol_name=PROTOCOL_NAME,
         tcp_ports={ADS_TCP_PORT},
         udp_ports={ADS_UDP_PORT},
         signature_matcher=_signature,

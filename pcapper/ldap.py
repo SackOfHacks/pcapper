@@ -217,6 +217,11 @@ class LdapAnalysis:
     entries_returned: int = 0
     spns: Counter[str] = field(default_factory=Counter)
     diagnostics: Counter[str] = field(default_factory=Counter)
+    # Password-bearing values in the clear: {"op", "dn", "attr", "value",
+    # "src", "dst", "port", "ts"}: simple/SASL PLAIN binds, password
+    # attributes written (Modify/Add) and returned (search results: LAPS,
+    # unicodePwd, ...). --creds reads these.
+    secret_records: List[Dict[str, object]] = field(default_factory=list)
 
 
 def _parse_http_request(
@@ -323,6 +328,7 @@ def analyze_ldap(
     ldap_users = Counter()
     ldap_systems = Counter()
     secrets = Counter()
+    secret_records: List[Dict[str, object]] = []
     ldap_binds = Counter()
     suspicious_attributes = Counter()
     public_endpoints = Counter()
@@ -424,7 +430,14 @@ def analyze_ldap(
                                 "protocol": "TCP", "identity": identity, "auth": msg.auth, "ts": ts,
                             })
                         if msg.password:
-                            counter_inc(secrets, f"simple bind {identity}: {msg.password}")
+                            bind_kind = "SASL PLAIN bind" if msg.sasl_user else "simple bind"
+                            bind_user = msg.sasl_user or identity
+                            counter_inc(secrets, f"{bind_kind} {bind_user}: {msg.password}")
+                            if len(secret_records) < MAX_LDAP_RECORDS:
+                                secret_records.append({
+                                    "op": bind_kind, "dn": bind_user, "attr": "", "value": msg.password,
+                                    "src": client_ip, "dst": server_ip, "port": server_port, "ts": ts,
+                                })
                         if ts is not None:
                             counter_inc(bind_buckets, (client_ip, int(ts // 60)))
                     elif msg.op == "SearchRequest":
@@ -449,9 +462,23 @@ def analyze_ldap(
                             if SENSITIVE_ATTRS.get(attr.lower()) in PASSWORD_ATTRS:
                                 for value in values:
                                     counter_inc(secrets, f"{msg.op} {msg.dn} {attr}: {value}")
+                                    if len(secret_records) < MAX_LDAP_RECORDS:
+                                        secret_records.append({
+                                            "op": msg.op, "dn": msg.dn, "attr": attr, "value": value,
+                                            "src": client_ip, "dst": server_ip, "port": server_port, "ts": ts,
+                                        })
                     elif msg.op == "SearchResultEntry":
                         entries_returned += 1
                         lowered = {k.lower(): v for k, v in msg.values.items()}
+                        for attr, values in msg.values.items():
+                            if SENSITIVE_ATTRS.get(attr.lower()) in PASSWORD_ATTRS:
+                                for value in values:
+                                    counter_inc(secrets, f"{msg.op} {msg.dn} {attr}: {value}")
+                                    if len(secret_records) < MAX_LDAP_RECORDS:
+                                        secret_records.append({
+                                            "op": msg.op, "dn": msg.dn, "attr": attr, "value": value,
+                                            "src": server_ip, "dst": client_ip, "port": server_port, "ts": ts,
+                                        })
                         classes = {c.lower() for c in lowered.get("objectclass", [])}
                         for value in lowered.get("samaccountname", []):
                             if "computer" in classes or value.endswith("$"):
@@ -973,4 +1000,5 @@ def analyze_ldap(
         entries_returned=entries_returned,
         spns=spns,
         diagnostics=diagnostics,
+        secret_records=secret_records,
     )

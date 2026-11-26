@@ -44,6 +44,7 @@ from .aim import analyze_aim
 from .cip import CIP_SERVICE_NAMES
 from .nfs import analyze_nfs
 from .openvpn import iter_openvpn_tcp_control_payloads, openvpn_tcp_control_opcodes
+from .ot_file_transfers import OtFileTransfer, extract_ot_file_transfers
 from .capture_parts import capture_parts
 from .lite import UNSUPPORTED, LitePacket
 from .pcap_cache import PcapMeta, complete_packet_view, iter_packets
@@ -1022,6 +1023,26 @@ def _append_ot_transfer_detections(
     return detections_out
 
 
+def _ot_transfer_artifact(transfer: OtFileTransfer) -> FileArtifact:
+    """An OT protocol's file transfer as a file artifact. A transfer whose
+    content could not be rebuilt has no payload (so no hashes) and its note
+    says why."""
+    payload = transfer.payload
+    return FileArtifact(
+        protocol=transfer.protocol,
+        src_ip=transfer.src_ip,
+        dst_ip=transfer.dst_ip,
+        src_port=transfer.src_port,
+        dst_port=transfer.dst_port,
+        filename=transfer.name,
+        size_bytes=transfer.size,
+        packet_index=transfer.first_packet,
+        note=transfer.detail,
+        file_type=detect_file_type_bytes(payload) if payload else "UNKNOWN",
+        payload=payload,
+    )
+
+
 def _flow_protocol(sport: Optional[int], dport: Optional[int]) -> str:
     ports = set(filter(None, [sport, dport]))
     if 989 in ports or 990 in ports:
@@ -1400,8 +1421,10 @@ def _assemble_stream(
     return bytes(assembled), first_packet
 
 
-def _detect_protocol_from_stream(stream: bytes, sport: int, dport: int) -> str:
-    return _detect_app_protocol_from_stream(stream, sport, dport)
+def _detect_protocol_from_stream(
+    stream: bytes, sport: int, dport: int, reverse: Optional[bytes] = None
+) -> str:
+    return _detect_app_protocol_from_stream(stream, sport, dport, reverse)
 
 
 def _looks_like_http(stream: bytes) -> bool:
@@ -1568,20 +1591,73 @@ def _looks_like_ssh(stream: bytes) -> bool:
     return stream.startswith(b"SSH-2.0-") or stream.startswith(b"SSH-1.99-")
 
 
-def _looks_like_http2(stream: bytes) -> bool:
-    preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
-    if stream.startswith(preface):
+HTTP2_PREFACE = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+# SETTINGS identifiers (RFC 9113 6.5.2, RFC 8441, RFC 9218) and the most a
+# boolean setting may hold.
+_HTTP2_SETTING_IDS = frozenset({1, 2, 3, 4, 5, 6, 8, 9})
+_HTTP2_BOOLEAN_SETTINGS = frozenset({2, 8, 9})
+
+
+def _is_http2_server_preface(stream: bytes) -> bool:
+    """The stream opens with the server connection preface: a SETTINGS frame
+    (not an ACK) on stream 0, whole in the stream, its payload complete
+    (identifier, value) pairs with known identifiers (or GREASE ones) and
+    legal values. A frame header of another type, a length that is no
+    multiple of 6 or a non-zero stream id is no HTTP/2."""
+    if len(stream) < 9 or stream[3] != 0x4 or stream[4] != 0:
+        return False
+    if stream[5:9] != b"\x00\x00\x00\x00":
+        return False
+    length = int.from_bytes(stream[0:3], "big")
+    if length % 6 or 9 + length > len(stream):
+        return False
+    for off in range(9, 9 + length, 6):
+        ident = int.from_bytes(stream[off : off + 2], "big")
+        value = int.from_bytes(stream[off + 2 : off + 6], "big")
+        if ident not in _HTTP2_SETTING_IDS and (ident & 0x0F0F) != 0x0A0A:
+            return False
+        if ident in _HTTP2_BOOLEAN_SETTINGS and value > 1:
+            return False
+        if ident == 4 and value > 0x7FFFFFFF:
+            return False
+        if ident == 5 and not 16384 <= value <= 16777215:
+            return False
+    return True
+
+
+def _looks_like_http2(stream: bytes, reverse: Optional[bytes] = None) -> bool:
+    """HTTP/2 only on real evidence: the client connection preface opening the
+    stream, or the server preface (a well-formed SETTINGS frame) opening it
+    with the preface opening the other direction. ``reverse`` is the start of
+    that other direction, None when the capture holds none of it: a server
+    preface alone then decides.
+
+    Any 9 bytes that parse as a frame header used to do: the ADS/AMS header
+    (00 00 + length) and Modbus/TCP's (transaction id, protocol id 0) both
+    read as a DATA frame, so OT streams were carved as HTTP/2 downloads."""
+    if stream.startswith(HTTP2_PREFACE):
         return True
-    if len(stream) >= 9:
-        frame_len = int.from_bytes(stream[0:3], "big")
-        frame_type = stream[3]
-        if frame_len <= len(stream) - 9 and frame_type in {0x0, 0x1, 0x4, 0x6, 0x7}:
-            return True
-    return False
+    if not _is_http2_server_preface(stream):
+        return False
+    return reverse is None or reverse.startswith(HTTP2_PREFACE)
+
+
+def _reverse_stream_head(
+    streams: Dict[Tuple[str, str, int, int], List[Tuple[int, bytes, int]]],
+    key: Tuple[str, str, int, int],
+) -> Optional[bytes]:
+    """The first bytes of the other direction of ``key``'s connection, None
+    when the capture holds no payload in that direction."""
+    src, dst, sport, dport = key
+    chunks = streams.get((dst, src, dport, sport))
+    if not chunks:
+        return None
+    head, _ = _assemble_stream(chunks, limit=len(HTTP2_PREFACE))
+    return head
 
 
 def _parse_http2_data_frames(stream: bytes) -> Dict[int, bytes]:
-    preface = b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n"
+    preface = HTTP2_PREFACE
     offset = len(preface) if stream.startswith(preface) else 0
     data_by_stream: Dict[int, bytearray] = defaultdict(bytearray)
     max_total = 20_000_000
@@ -1626,11 +1702,15 @@ def _looks_like_quic_payload(payload: bytes) -> bool:
     return True
 
 
-def _detect_app_protocol_from_stream(stream: bytes, sport: int, dport: int) -> str:
+def _detect_app_protocol_from_stream(
+    stream: bytes, sport: int, dport: int, reverse: Optional[bytes] = None
+) -> str:
+    """``reverse``: the start of the connection's other direction (None when
+    the capture holds none of it), which HTTP/2 detection needs."""
     # Content-based detection first (handles non-standard ports)
     if openvpn_tcp_control_opcodes(stream):
         return "OpenVPN"
-    if _looks_like_http2(stream):
+    if _looks_like_http2(stream, reverse):
         return "HTTP2"
     if _looks_like_http(stream):
         return "HTTP"
@@ -2708,7 +2788,12 @@ class FileExtractor:
             stream, first_pkt = _assemble_stream(chunks)
             if not stream:
                 continue
-            protocol = _detect_protocol_from_stream(stream, sport, dport)
+            protocol = _detect_protocol_from_stream(
+                stream,
+                sport,
+                dport,
+                _reverse_stream_head(self.tcp_streams, (src, dst, sport, dport)),
+            )
             if protocol != "UNKNOWN":
                 self.flow_protocol_hints[(src, dst, "TCP", sport, dport)][protocol] += 1
 
@@ -3887,7 +3972,8 @@ def _export_with_dpkt(
                     )
 
     encrypted_flow_counts: Counter[str] = Counter()
-    for (_src, _dst, sport, dport), chunks in tcp_streams.items():
+    for flow_key, chunks in tcp_streams.items():
+        _src, _dst, sport, dport = flow_key
         stream, _ = _assemble_stream(chunks, limit=131072)
         if not stream:
             continue
@@ -3909,7 +3995,7 @@ def _export_with_dpkt(
                 encrypted_flow_counts["HTTPS/TLS"] += 1
             else:
                 encrypted_flow_counts["TLS (unknown app)"] += 1
-        if _looks_like_http2(stream):
+        if _looks_like_http2(stream, _reverse_stream_head(tcp_streams, flow_key)):
             encrypted_flow_counts["HTTP/2"] += 1
 
     quic_flow_keys: set[Tuple[str, str, int, int]] = set()
@@ -3970,7 +4056,9 @@ def _export_with_dpkt(
         if not stream:
             continue
 
-        protocol = _detect_app_protocol_from_stream(stream, sport, dport)
+        protocol = _detect_app_protocol_from_stream(
+            stream, sport, dport, _reverse_stream_head(tcp_streams, (src, dst, sport, dport))
+        )
 
         # ENIP/CIP extraction (firmware or large object transfers)
         is_enip = ENIP_TCP_PORT in (sport, dport) or stream[:2] in {
@@ -4699,6 +4787,34 @@ def _export_with_dpkt(
                 hostname=None,
                 content_type=None,
             )
+        )
+
+    # File services of OT protocols: DNP3 (Group 70), MMS, BACnet atomic file.
+    ot_transfers, ot_transfer_errors = extract_ot_file_transfers(tcp_streams, udp_packets)
+    errors.extend(ot_transfer_errors)
+    for transfer in ot_transfers:
+        _add_artifact(_ot_transfer_artifact(transfer))
+    if ot_transfers:
+        by_protocol = Counter(item.protocol for item in ot_transfers)
+        carved = sum(1 for item in ot_transfers if item.payload is not None)
+        ot_sources = Counter(item.src_ip for item in ot_transfers if item.src_ip)
+        ot_destinations = Counter(item.dst_ip for item in ot_transfers if item.dst_ip)
+        detections.append(
+            {
+                "severity": "warning",
+                "summary": "OT protocol file transfers observed",
+                "details": (
+                    ", ".join(f"{proto}={count}" for proto, count in by_protocol.most_common())
+                    + f"; content carved for {carved} of {len(ot_transfers)}."
+                ),
+                "source": "Files",
+                "top_sources": ot_sources.most_common(5),
+                "top_destinations": ot_destinations.most_common(5),
+                "evidence": [
+                    f"{item.protocol} {item.operation} {item.name} {item.src_ip}->{item.dst_ip}"
+                    for item in ot_transfers[:8]
+                ],
+            }
         )
 
     if s7_transfer_events:

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+import re
 import struct
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Callable
 
+from .ads import INDEX_GROUPS as ADS_INDEX_GROUPS
 from .bacnet import BACNET_PORT, analyze_bacnet
 from .bacnet import _parse_commands as _parse_bacnet_commands
 from .cip import (
@@ -19,6 +21,7 @@ from .cip import (
 )
 from .coap import COAP_PORTS, analyze_coap
 from .coap import _parse_commands as _parse_coap_commands
+from .csp import analyze_csp
 from .df1 import analyze_df1
 from .dnp3 import (
     APP_CONTROL_FUNCTIONS,
@@ -37,6 +40,9 @@ from .ethercat import WRITE_COMMANDS as ETHERCAT_WRITE_COMMANDS
 from .ethercat import analyze_ethercat
 from .fins import FINS_PORT, analyze_fins
 from .fins import _parse_commands as _parse_fins_commands
+from .iccp import analyze_iccp
+from .iec101_103 import IEC_COMMAND_TYPES as IEC101_COMMAND_TYPES
+from .iec101_103 import analyze_iec101_103
 from .iec104 import ASDU_TYPES, IEC104_PORT, analyze_iec104
 from .iec104 import _parse_commands as _parse_iec104_commands
 from .industrial_helpers import _extract_transport
@@ -151,7 +157,6 @@ DNP3_CONTROL_NAMES = {
 
 _EXTRA_MARKERS: dict[str, tuple[str, ...]] = {
     "knx": ("reset", "restart", "propwrite", "memorywrite", "keywrite"),
-    "ads": ("writecontrol",),
     "powerlink": ("nmtstop", "nmtreset", "nmtswreset", "nmtenter"),
     "lontalk": ("update", "set node mode", "write memory", "leave domain"),
     "dlms": ("set-request", "action-request"),
@@ -159,6 +164,242 @@ _EXTRA_MARKERS: dict[str, tuple[str, ...]] = {
     "xgt": ("write",),
     "rocplus": ("write", "set "),
 }
+TRISTATION_MARKERS = ("halt", "allocate", "download", "run program", "disable", "clear", "pause")
+HART_MARKERS = ("write", "reset", "lock")
+# C37.118 command frames that change what a PMU sends (the rest ask for its
+# header/configuration frames).
+SYNCHROPHASOR_MARKERS = ("turn off data transmission", "turn on data transmission")
+# Each protocol's own state-changing verbs, by the label both --ot-commands
+# and --threats file the protocol under.
+_PROTOCOL_MARKERS: dict[str, tuple[str, ...]] = {
+    **{spec.label: _EXTRA_MARKERS.get(spec.step, ()) for spec in OT_EXTRA},
+    "TriStation": TRISTATION_MARKERS,
+    "HART-IP": HART_MARKERS,
+    "CoAP": COAP_WRITE_MARKERS,
+    "EtherCAT": ETHERCAT_WRITE_MARKERS,
+    "C37.118": SYNCHROPHASOR_MARKERS,
+}
+
+
+def control_markers_for(label: str) -> tuple[str, ...]:
+    """The built-in state-changing verbs of protocol ``label`` beyond
+    WRITE_MARKERS (none for most)."""
+    return _PROTOCOL_MARKERS.get(label, ())
+
+
+# ADS/AMS commands are classified the way ads.py classifies them
+# (_AdsState.feed): a Write, a ReadWrite through the sum-write or
+# sum-read/write index group, a WriteControl (PLC state change) and an
+# AddRoute registration -- the route a TwinCAT PLC then accepts unauthenticated
+# ADS control over, sent with the target's Windows credentials. A ReadWrite
+# through any other group is a symbol-handle lookup or a sum-up read, and
+# (Add/Delete)DeviceNotification subscribes to values: the marker words
+# ("write", "delete") counted both as process writes.
+_ADS_WRITE_GROUPS = tuple(f"[{ADS_INDEX_GROUPS[group]}]" for group in (0xF081, 0xF082))
+
+
+def _ads_command_is_control(command: str) -> bool:
+    name = command.strip()
+    if name.startswith(("Write [", "WriteControl")) or name == "Write":
+        return True
+    if name.startswith("ReadWrite"):
+        return name.endswith(_ADS_WRITE_GROUPS)
+    return name == "UDP AddRoute"
+
+
+# ICCP/TASE.2 device control as iccp.py tells it: an MMS Write in the same
+# message as a TASE.2 control object (Operate, SetTag). The MMS analyzer
+# already counts every MMS write on port 102, ICCP's included; a control
+# object named in a read is not an operation.
+ICCP_DEVICE_CONTROL = "TASE.2 device control (Operate/SetTag)"
+
+
+def _iccp_command_view(summary: object) -> object:
+    """The ICCP summary with each device-control message added as one
+    ICCP_DEVICE_CONTROL command (and command event)."""
+    from types import SimpleNamespace
+
+    from .industrial_helpers import IndustrialCommandEvent
+
+    events = list(getattr(summary, "command_events", []) or [])
+    by_message: dict[tuple[object, str, str], set[str]] = defaultdict(set)
+    for event in events:
+        by_message[(getattr(event, "ts", None), str(event.src), str(event.dst))].add(str(event.command))
+    control = [
+        IndustrialCommandEvent(ts=ts, src=src, dst=dst, command=ICCP_DEVICE_CONTROL)  # type: ignore[arg-type]
+        for (ts, src, dst), names in by_message.items()
+        if {"MMS Write", "TASE.2 Control Object"} <= names
+    ]
+    commands = Counter(getattr(summary, "commands", None) or Counter())
+    if control:
+        commands[ICCP_DEVICE_CONTROL] += len(control)
+    return SimpleNamespace(
+        commands=commands, command_events=events + control, errors=getattr(summary, "errors", []) or []
+    )
+
+
+# IEC 60870-5-101/103 control commands. iec101_103 keeps no per-command
+# counter: its "Control Command (Activation)" finding lists the busiest
+# (source, destination, command type) tuples as "src -> dst: C_SC_NA (Single
+# Command) x3 (Activation)" and the total in its details. Only command types
+# carrying an Activation/Deactivation cause are counted there, so the
+# outstation's confirmations and terminations never are.
+_IEC101_COMMAND_NAMES = frozenset(IEC101_COMMAND_TYPES.values())
+IEC101_OTHER_COMMANDS = "Control command (other)"
+_IEC101_EVIDENCE_RE = re.compile(r"^(\S+) -> (\S+): (.+) x(\d+) \(Activation\)$")
+_IEC101_TOTAL_RE = re.compile(r"^(\d+) control-command activation")
+
+
+def _iec101_103_command_view(summary: object) -> object:
+    """The IEC 101/103 control commands as a command counter and per-pair
+    service endpoints; what the finding lists beyond its busiest tuples is
+    kept under IEC101_OTHER_COMMANDS so the volume stays whole."""
+    from types import SimpleNamespace
+
+    commands: Counter[str] = Counter()
+    endpoints: dict[str, Counter[str]] = {}
+    total = 0
+    for detection in getattr(summary, "detections", []) or []:
+        if not isinstance(detection, dict) or detection.get("summary") != "IEC 101/103 Control Command (Activation)":
+            continue
+        match = _IEC101_TOTAL_RE.match(str(detection.get("details", "")))
+        total += int(match.group(1)) if match else 0
+        for line in detection.get("evidence", []) or []:
+            found = _IEC101_EVIDENCE_RE.match(str(line))
+            if found is None or found.group(3) not in _IEC101_COMMAND_NAMES:
+                continue
+            src, dst, name, count = found.group(1), found.group(2), found.group(3), int(found.group(4))
+            commands[name] += count
+            endpoints.setdefault(name, Counter())[f"{src} -> {dst}"] += count
+    rest = total - sum(commands.values())
+    if rest > 0:
+        commands[IEC101_OTHER_COMMANDS] += rest
+    return SimpleNamespace(commands=commands, service_endpoints=endpoints, errors=getattr(summary, "errors", []) or [])
+
+
+_DNP3_CONTROL_NAMES_LOWER = frozenset(str(name).lower() for name in DNP3_CONTROL_NAMES if name)
+
+
+def _dnp3_command_is_control(command: str) -> bool:
+    return command.lower() in _DNP3_CONTROL_NAMES_LOWER or _is_write_command(command)
+
+
+# Protocols whose commands follow their analyzer's own rule rather than the
+# marker words alone.
+_COMMAND_RULES: dict[str, Callable[[str], bool]] = {
+    "ADS/AMS": _ads_command_is_control,
+    "DNP3": _dnp3_command_is_control,
+    "ICCP": lambda command: command == ICCP_DEVICE_CONTROL,
+    "IEC-101/103": lambda command: command in _IEC101_COMMAND_NAMES or command == IEC101_OTHER_COMMANDS,
+}
+# Summaries whose commands need the analyzer's own grouping first.
+_COMMAND_VIEWS: dict[str, Callable[[object], object]] = {
+    "ICCP": _iccp_command_view,
+    "IEC-101/103": _iec101_103_command_view,
+}
+
+
+def command_view(label: str, summary: object) -> object:
+    """``summary`` as --ot-commands reads protocol ``label``'s commands."""
+    view = _COMMAND_VIEWS.get(label)
+    return view(summary) if view is not None and summary is not None else summary
+
+
+def control_command_counts(label: str, summary: object) -> Counter[str]:
+    """The state-changing commands, per name, of one protocol analyzer's
+    summary -- requests only, by command_is_control with the protocol's own
+    verbs: what --ot-commands counts, so --threats grades the same set. Read
+    from the analyzer's commands, else (Modbus, DNP3) its request function
+    counts."""
+    view = command_view(label, summary)
+    commands = getattr(view, "commands", None)
+    if not isinstance(commands, Counter) or not commands:
+        commands = getattr(view, "request_func_counts", None) or getattr(view, "func_counts", None)
+    markers = control_markers_for(label)
+    return Counter(
+        {
+            str(name): int(count)
+            for name, count in (commands or {}).items()
+            if command_is_control(label, str(name), markers)
+        }
+    )
+
+
+def command_is_control(
+    label: str,
+    command: str,
+    extra_markers: tuple[str, ...] = (),
+    base_markers: tuple[str, ...] = WRITE_MARKERS,
+) -> bool:
+    """Whether ``command`` of protocol ``label`` changes state -- a write,
+    control, restart, program transfer or route registration: what
+    --ot-commands counts and --threats grades, by one rule. A reply never
+    does; nor does what the protocol's own analyzer does not treat as a
+    write. Markers an operator configured (--ot-commands-config) still count."""
+    if _is_reply(command):
+        return False
+    rule = _COMMAND_RULES.get(label)
+    if rule is None:
+        return _is_write_command(command, extra_markers, base_markers)
+    if rule(command):
+        return True
+    configured = tuple(marker for marker in base_markers if marker not in WRITE_MARKERS) + tuple(extra_markers)
+    lowered = command.lower()
+    return any(marker in lowered for marker in configured)
+
+
+# How --ot-commands and --threats grade the state-changing commands they
+# count: by the most consequential kind seen, never by how many there were
+# (an HMI writes setpoints all day; a single CPU stop is rare). The first
+# token a command name contains decides its grade; one matching none is a
+# warning. A STARTDT/TESTFR is link signalling, a program upload a read of
+# the logic, a write the routine path; a stop, restart, reset, program
+# download or delete changes what the controller runs or whether it runs.
+COMMAND_SEVERITY_TOKENS: tuple[tuple[str, str], ...] = (
+    ("plcstop", "critical"),
+    ("plccoldstart", "high"),
+    ("plchotstart", "high"),
+    ("stopdt", "high"),
+    ("startdt", "warning"),
+    ("stop", "high"),
+    ("start", "warning"),
+    ("restart", "high"),
+    ("reset", "high"),
+    ("download", "high"),
+    ("upload", "warning"),
+    ("program", "high"),
+    ("firmware", "critical"),
+    ("write", "warning"),
+    ("setpoint", "high"),
+    ("override", "high"),
+    ("control", "warning"),
+    ("delete", "high"),
+    ("erase", "critical"),
+    # A PMU told to stop streaming: the denial of view --synchrophasor
+    # itself rates high.
+    ("turn off", "high"),
+)
+_SEVERITY_ORDER = {"critical": 3, "high": 2, "warning": 1, "info": 0}
+
+
+def command_severity(command: str) -> str:
+    """The grade of one state-changing command (COMMAND_SEVERITY_TOKENS)."""
+    lowered = str(command).lower()
+    for token, severity in COMMAND_SEVERITY_TOKENS:
+        if token in lowered:
+            return severity
+    return "warning"
+
+
+def worst_command_severity(commands: object) -> str:
+    """The grade of a set of state-changing commands: the worst of theirs
+    ("info" for none). Command names, or "Protocol:Command" keys."""
+    worst = "info"
+    for command in commands or ():  # type: ignore[union-attr]
+        severity = command_severity(str(command))
+        if _SEVERITY_ORDER[severity] > _SEVERITY_ORDER[worst]:
+            worst = severity
+    return worst
 
 
 def _opc_classic_control_view(summary: object) -> object:
@@ -386,7 +627,7 @@ def _collect_pair_commands(
             dst = str(getattr(msg, "dst_ip", "") or "")
             if not src or not dst:
                 continue
-            is_write = _is_write_command(command, markers, base_markers) or (
+            is_write = command_is_control(label, command, markers, base_markers) or (
                 label == "DNP3" and command.lower() in dnp3_control_names
             )
             key = (label, src, dst, command, is_write)
@@ -399,14 +640,14 @@ def _collect_pair_commands(
             dst = str(getattr(event, "dst", "") or "")
             if not command or not src or not dst or _is_reply(command):
                 continue
-            key = (label, src, dst, command, _is_write_command(command, markers, base_markers))
+            key = (label, src, dst, command, command_is_control(label, command, markers, base_markers))
             out[key] += 1
             if times is not None:
                 _note_pair_time(times, key, getattr(event, "ts", None))
         for service, endpoints in endpoints_by_service.items():
             if _is_reply(str(service)):
                 continue
-            is_write = _is_write_command(str(service), markers, base_markers)
+            is_write = command_is_control(label, str(service), markers, base_markers)
             for endpoint, count in (endpoints or {}).items():
                 src, _, dst = str(endpoint).partition(" -> ")
                 if src and dst:
@@ -443,7 +684,7 @@ def _count_from_counter(
     base_markers: tuple[str, ...] = WRITE_MARKERS,
 ) -> None:
     for key, count in counter.items():
-        if _is_write_command(str(key), extra_markers, base_markers):
+        if command_is_control(label, str(key), extra_markers, base_markers):
             out[f"{label}:{key}"] += count
 
 
@@ -459,7 +700,7 @@ def _count_from_artifacts(
         detail = str(getattr(item, "detail", "")).lower()
         if not detail:
             continue
-        if _is_write_command(detail, base_markers=base_markers):
+        if command_is_control(label, detail, base_markers=base_markers):
             out[f"{label}:payload"] += 1
             sources[str(getattr(item, "src", "-"))] += 1
             destinations[str(getattr(item, "dst", "-"))] += 1
@@ -482,7 +723,7 @@ def _count_from_events(
         command = str(getattr(item, "command", ""))
         if not command:
             continue
-        if _is_write_command(command, extra_markers, base_markers):
+        if command_is_control(label, command, extra_markers, base_markers):
             src = str(getattr(item, "src", "-"))
             dst = str(getattr(item, "dst", "-"))
             sources[src] += 1
@@ -509,9 +750,11 @@ def _count_from_service_endpoints(
     session_times: dict[str, tuple[float | None, float | None]],
     label: str,
     base_markers: tuple[str, ...] = WRITE_MARKERS,
+    extra_markers: tuple[str, ...] = (),
+    control_targets: dict[str, Counter[str]] | None = None,
 ) -> None:
     for service, counter in endpoints.items():
-        if not _is_write_command(service, base_markers=base_markers):
+        if not command_is_control(label, service, extra_markers, base_markers):
             continue
         for endpoint, count in counter.items():
             src, _, dst = str(endpoint).partition(" -> ")
@@ -522,6 +765,8 @@ def _count_from_service_endpoints(
             if src and dst:
                 key = f"{label} {src} -> {dst}"
                 session_counts[key] += count
+            if control_targets is not None and dst:
+                control_targets.setdefault(label, Counter())[f"{dst} :: {service}"] += count
 
 
 def _count_from_industrial(
@@ -847,7 +1092,7 @@ def _analyze_ot_commands_fast(
     if command_counts:
         detections.append(
             {
-                "severity": "warning",
+                "severity": worst_command_severity(command_counts),
                 "summary": "OT control/write command activity observed (fast scan)",
                 "details": "; ".join(
                     f"{cmd} ({count})" for cmd, count in command_counts.most_common(8)
@@ -1159,21 +1404,25 @@ def analyze_ot_commands(
     errors.extend(getattr(bacnet, "errors", []) or [])
 
     # Table-driven analyzers (KNXnet/IP, XGT, ROC Plus, ADS, DLMS, C12.22,
-    # LonTalk, POWERLINK), TriStation and OPC Classic: same plumbing, with
-    # each protocol's own state-changing verbs added to the write markers.
+    # LonTalk, POWERLINK), TriStation, OPC Classic, CSP and ICCP: same
+    # plumbing, with each protocol's own state-changing verbs added to the
+    # write markers (ADS and ICCP follow their analyzer's own rule instead).
     extra_sources: list[tuple[str, object, tuple[str, ...]]] = [
-        (spec.label, _analyze(spec.analyzer(), show_status=show_status), _EXTRA_MARKERS.get(spec.step, ()))
+        (spec.label, _analyze(spec.analyzer(), show_status=show_status), control_markers_for(spec.label))
         for spec in OT_EXTRA
     ]
     extra_sources.append(
-        ("TriStation", _analyze(analyze_safety, show_status=show_status),
-         ("halt", "allocate", "download", "run program", "disable", "clear", "pause"))
+        ("TriStation", _analyze(analyze_safety, show_status=show_status), TRISTATION_MARKERS)
     )
     extra_sources.append(
-        ("HART-IP", _analyze(analyze_hart, show_status=show_status), ("write", "reset", "lock"))
+        ("HART-IP", _analyze(analyze_hart, show_status=show_status), HART_MARKERS)
     )
     extra_sources.append(("OPC Classic", _opc_classic_control_view(
         _analyze(analyze_opc_classic, show_status=show_status)), ()))
+    extra_sources.append(("CSP", _analyze(analyze_csp, show_status=show_status), ()))
+    extra_sources.append(
+        ("ICCP", command_view("ICCP", _analyze(analyze_iccp, show_status=show_status)), ())
+    )
     for label, summary, markers in extra_sources:
         _count_from_industrial(
             summary,
@@ -1189,6 +1438,37 @@ def analyze_ot_commands(
             control_targets,
         )
         errors.extend(getattr(summary, "errors", []) or [])
+
+    # IEC 60870-5-101/103 control commands carrying an Activation cause.
+    iec101 = command_view("IEC-101/103", _analyze(analyze_iec101_103, show_status=show_status))
+    iec101_extra = _protocol_extra("IEC-101/103")
+    _count_from_counter(
+        getattr(iec101, "commands", Counter()), "IEC-101/103", command_counts, iec101_extra, base_markers
+    )
+    _count_from_service_endpoints(
+        getattr(iec101, "service_endpoints", {}) or {},
+        sources,
+        destinations,
+        command_sessions,
+        command_session_times,
+        "IEC-101/103",
+        base_markers,
+        iec101_extra,
+        control_targets,
+    )
+    errors.extend(getattr(iec101, "errors", []) or [])
+
+    # C37.118 command frames: turning a PMU's data stream off (or on).
+    synchrophasor = _analyze(analyze_synchrophasor, show_status=show_status)
+    synchrophasor_extra = _merge_markers(_protocol_extra("C37.118"), SYNCHROPHASOR_MARKERS)
+    _count_from_counter(
+        getattr(synchrophasor, "commands", None) or Counter(),
+        "C37.118",
+        command_counts,
+        synchrophasor_extra,
+        base_markers,
+    )
+    errors.extend(getattr(synchrophasor, "errors", []) or [])
 
     coap = _analyze(analyze_coap, show_status=show_status)
     coap_extra = _merge_markers(_protocol_extra("CoAP"), COAP_WRITE_MARKERS)
@@ -1416,8 +1696,11 @@ def analyze_ot_commands(
     _all_sources.extend(
         (label, getattr(summary, "commands", Counter())) for label, summary, _m in extra_sources
     )
+    _all_sources.append(("IEC-101/103", getattr(iec101, "commands", Counter())))
+    _all_sources.append(("C37.118", getattr(synchrophasor, "commands", None) or Counter()))
     # Publish/subscribe streams carry no commands; record that they were seen
-    # so the report does not call an IEC 61850 capture "read-only".
+    # so the report does not call an IEC 61850 capture "read-only". A C37.118
+    # stream with command frames is counted above instead.
     unnormalized: list[str] = []
     for label, func in (("GOOSE", analyze_goose), ("SV", analyze_sv), ("C37.118", analyze_synchrophasor)):
         try:
@@ -1426,7 +1709,7 @@ def analyze_ot_commands(
             continue
         count = int(getattr(seen, "goose_packets", 0) or getattr(seen, "sv_packets", 0)
                     or getattr(seen, "synchrophasor_packets", 0) or 0)
-        if count:
+        if count and not (label == "C37.118" and getattr(seen, "commands", None)):
             unnormalized.append(label)
     for _label, _ctr in _all_sources:
         for _cmd, _cnt in (_ctr or Counter()).items():
@@ -1450,6 +1733,7 @@ def analyze_ot_commands(
         (label, summary, _merge_markers(_protocol_extra(label), markers))
         for label, summary, markers in extra_sources
     )
+    pair_sources.append(("IEC-101/103", iec101, iec101_extra))
     pair_command_times: dict[tuple[str, str, str, str, bool], tuple[float, float]] = {}
     pair_commands = _collect_pair_commands(pair_sources, base_markers, dnp3_control_names, pair_command_times)
 
@@ -1457,7 +1741,10 @@ def analyze_ot_commands(
     if command_counts:
         detections.append(
             {
-                "severity": "warning",
+                # Graded as --threats grades the same commands (by the most
+                # consequential kind seen); always "warning" before, while
+                # --threats called the same commands HIGH.
+                "severity": worst_command_severity(command_counts),
                 "summary": "OT control/write command activity observed",
                 "details": "; ".join(
                     f"{cmd} ({count})" for cmd, count in command_counts.most_common(8)

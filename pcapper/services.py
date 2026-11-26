@@ -19,6 +19,7 @@ except ImportError:
     IP = TCP = UDP = Ether = IPv6 = ARP = ICMP = DNS = Raw = FlagValue = None
 
 from .lite import UNSUPPORTED, LitePacket
+from .ot_ports import COAP_PORTS, OT_PORT_PROTOCOLS, PTP_PORTS
 from .pcap_cache import PcapMeta, iter_packets
 from .openvpn import openvpn_tcp_session_start, openvpn_udp_control_opcodes
 from .utils import extract_packet_endpoints, memoize_analysis, packet_length, safe_float
@@ -86,25 +87,12 @@ class ServiceSummary:
     errors: List[str] = field(default_factory=list)
 
 
-_OT_SERVICE_PORTS = {
-    102,    # S7 / ISO-TSAP
-    502,    # Modbus
-    2404,   # IEC 60870-5-104
-    4000,   # OPC / various
-    4840,   # OPC UA
-    9600,   # OMRON FINS
-    18245,  # GE-SRTP
-    20000,  # DNP3
-    44818,  # EtherNet/IP
-    47808,  # BACnet
-    34962,  # PROFINET
-    34963,  # PROFINET
-    34964,  # PROFINET
-    5006,   # MELSEC
-    5007,   # MELSEC
-    1962,   # PCWorx
-    2222,   # EtherNet/IP I/O (also SSH-alt; OT context)
-}
+# OT/ICS service ports: the registry's, less PTP and CoAP. A PTP clock or a
+# CoAP device is as common on IT and IoT networks as in an OT zone, so one
+# beside an SSH server is no OT/IT boundary mix (and no OT/IT crossing on one
+# host). scan.py counts the same set as OT ports probed; hosts.py asks the
+# same question of a host's open ports.
+_OT_SERVICE_PORTS = frozenset(OT_PORT_PROTOCOLS) - PTP_PORTS - COAP_PORTS
 _ADMIN_SERVICE_NAMES = {"SSH", "RDP", "SMB", "VNC", "Telnet", "WinRM"}
 
 # Database / datastore services. Exposure of these is a primary IR finding:
@@ -448,21 +436,32 @@ def merge_services_summaries(
 
 # --- Constants ---
 
-COMMON_PORTS = {
+# IT, VoIP and IoT service ports. OT/ICS ports are not listed here: they come
+# from the registry (ot_ports.OT_PORT_PROTOCOLS) below, so every port an OT
+# analyzer decodes has its name in --services, --hostdetails and the overview.
+_IT_SERVICE_PORTS = {
+    20: "FTP-Data",
     21: "FTP",
     22: "SSH",
     23: "Telnet",
     25: "SMTP",
     53: "DNS",
+    # The DHCP server port only: a client's 68 would make the both-ports-known
+    # UDP rule below take every DHCP client for a server.
+    67: "DHCP",
     69: "TFTP",
     80: "HTTP",
     88: "Kerberos",
     110: "POP3",
     123: "NTP",
     135: "RPC",
+    # Session service only: NetBIOS name and datagram traffic (UDP 137/138)
+    # goes to the subnet broadcast address, which would be listed as a host.
     139: "NetBIOS",
     143: "IMAP",
     161: "SNMP",
+    # Not "SNMP": a trap receiver is no UDP amplifier.
+    162: "SNMP-Trap",
     389: "LDAP",
     443: "HTTPS",
     445: "SMB",
@@ -496,22 +495,7 @@ COMMON_PORTS = {
     853: "DoT",
     784: "QUIC",
     4433: "QUIC",
-    102: "S7/MMS/ICCP",
-    319: "PTP Event",
-    320: "PTP General",
-    502: "Modbus/TCP",
-    9600: "FINS",
-    20000: "DNP3",
-    2404: "IEC-104",
-    47808: "BACnet/IP",
-    44818: "EtherNet/IP",
-    2222: "ENIP-IO",
-    2221: "CIP Security",
-    34962: "PROFINET",
-    34963: "PROFINET",
-    34964: "PROFINET",
-    4840: "OPC UA",
-    789: "Crimson",
+    5353: "mDNS",
     # --- Phone over IP ---
     1718: "H.323 Gatekeeper Discovery (RAS)",
     1719: "H.323 Gatekeeper RAS",
@@ -527,26 +511,26 @@ COMMON_PORTS = {
     5060: "SIP",
     5061: "SIP-TLS",
     5349: "STUN/TURN over TLS",
-    1911: "Niagara Fox",
-    4911: "Niagara Fox",
-    5094: "HART-IP",
-    18245: "GE SRTP",
-    18246: "GE SRTP",
-    20547: "ProConOS",
-    1962: "PCWorx",
-    5006: "MELSEC",
-    5007: "MELSEC",
-    5683: "CoAP",
-    5684: "CoAP",
-    2455: "CODESYS",
-    1217: "CODESYS",
     1883: "MQTT",
     8883: "MQTT-TLS",
-    34378: "P-NET",
-    34379: "P-NET",
-    34380: "P-NET",
-    5313: "Yokogawa Vnet/IP",
-    55565: "Honeywell CDA",
+}
+
+# Registry ports this table names more fully than the registry's protocol
+# label: TCP/102 carries S7comm, MMS and ICCP, and the overview's OT inventory
+# matches these names ("s7/mms/iccp" marks both S7 and MMS, "enip-io" CIP I/O).
+_OT_SERVICE_LABELS = {
+    102: "S7/MMS/ICCP",
+    502: "Modbus/TCP",
+    2222: "ENIP-IO",
+    18245: "GE SRTP",
+    18246: "GE SRTP",
+    44818: "EtherNet/IP",
+    47808: "BACnet/IP",
+}
+
+COMMON_PORTS = {
+    **_IT_SERVICE_PORTS,
+    **{port: _OT_SERVICE_LABELS.get(port, label) for port, label in OT_PORT_PROTOCOLS.items()},
 }
 
 # --- Logic ---
@@ -1229,7 +1213,7 @@ def analyze_services(
             "SSH": {22, 2222},
             "RDP": {3389},
             "SMB": {445, 139},
-            "FTP": {21},
+            "FTP": {20, 21},
             "SMTP": {25},
         }
         for svc, ports in nonstandard_ports.items():

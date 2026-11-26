@@ -85,14 +85,23 @@ _ENTERPRISE_TACTIC_ORDER: dict[str, int] = {
     "Impact": 14,
 }
 
+# Every ATT&CK for ICS tactic, in matrix order. With only seven listed, a hit
+# under Execution/Persistence/Evasion/Collection (T0858 Change Operating Mode,
+# T0859 Valid Accounts, T0845 Program Upload, which analyzers tag) sat at
+# stage 99 and every later hit on the host read as a sequence regression.
 _ICS_TACTIC_ORDER: dict[str, int] = {
     "Initial Access": 1,
-    "Discovery": 2,
-    "Lateral Movement": 3,
-    "Command and Control": 4,
-    "Impair Process Control": 5,
-    "Inhibit Response Function": 6,
-    "Impact": 7,
+    "Execution": 2,
+    "Persistence": 3,
+    "Privilege Escalation": 4,
+    "Evasion": 5,
+    "Discovery": 6,
+    "Lateral Movement": 7,
+    "Collection": 8,
+    "Command and Control": 9,
+    "Impair Process Control": 10,
+    "Inhibit Response Function": 11,
+    "Impact": 12,
 }
 
 
@@ -311,6 +320,27 @@ _RULES: tuple[_TechniqueRule, ...] = (
         ("mimikatz", "sekurlsa", "lsass", "credential dump"),
         min_score=3,
     ),
+    # A logon seen in clear (FTP USER/PASS, Telnet): an account was used to
+    # authenticate, the root/Administrator ones included. The OT analyzers tag
+    # their cleartext logons T0859 Valid Accounts; this is the Enterprise one.
+    _TechniqueRule(
+        "enterprise",
+        "Initial Access",
+        "TA0001",
+        "Valid Accounts",
+        "T1078",
+        (
+            "cleartext credentials",
+            "cleartext telnet credentials",
+            "credentials in cleartext",
+            "plaintext credentials",
+            "cleartext login",
+            "cleartext logon",
+        ),
+        ("root", "admin", "administrator", "user", "pass", "login", "logon"),
+        excluded=("brute", "spray", "spraying", "failed", "failure"),
+        min_score=3,
+    ),
     _TechniqueRule(
         "enterprise",
         "Impact",
@@ -393,14 +423,35 @@ _RULES: tuple[_TechniqueRule, ...] = (
         ("write", "operate"),
         min_score=3,
     ),
+    # A program/logic transfer to the controller, said so. "engineering
+    # command" matched the generic "OT control/engineering command activity"
+    # detection (any write-like command name) and mapped ADS symbol lookups
+    # to a Program Download; a firmware update is System Firmware (T0857).
     _TechniqueRule(
         "ics",
         "Impair Process Control",
         "TA0106",
         "Program Download",
         "T0843",
-        ("program download", "firmware", "logic download", "engineering command"),
+        ("program download", "logic download"),
         ("program", "download"),
+        min_score=3,
+    ),
+    _TechniqueRule(
+        "ics",
+        "Persistence",
+        "TA0110",
+        "System Firmware",
+        "T0857",
+        (
+            "firmware update",
+            "firmware upload",
+            "firmware download",
+            "firmware transfer",
+            "firmware image transfer",
+            "update firmware",
+        ),
+        ("firmware", "plc", "controller"),
         min_score=3,
     ),
     _TechniqueRule(
@@ -885,6 +936,164 @@ _ICS_TECHNIQUE_TACTIC = {
     "T0885": "TA0101", "T0886": "TA0109", "T0888": "TA0102", "T0890": "TA0111",
     "T0891": "TA0109",
 }
+_ICS_TECHNIQUE_NAMES = {
+    "T0800": "Activate Firmware Update Mode", "T0801": "Monitor Process State",
+    "T0802": "Automated Collection", "T0803": "Block Command Message",
+    "T0804": "Block Reporting Message", "T0806": "Brute Force I/O",
+    "T0807": "Command-Line Interface", "T0809": "Data Destruction",
+    "T0811": "Data from Information Repositories", "T0812": "Default Credentials",
+    "T0813": "Denial of Control", "T0814": "Denial of Service", "T0815": "Denial of View",
+    "T0816": "Device Restart/Shutdown", "T0819": "Exploit Public-Facing Application",
+    "T0821": "Modify Controller Tasking", "T0822": "External Remote Services",
+    "T0826": "Loss of Availability", "T0827": "Loss of Control",
+    "T0828": "Loss of Productivity and Revenue", "T0829": "Loss of View",
+    "T0830": "Adversary-in-the-Middle", "T0831": "Manipulation of Control",
+    "T0832": "Manipulation of View", "T0835": "Manipulate I/O Image",
+    "T0836": "Modify Parameter", "T0837": "Loss of Protection",
+    "T0838": "Modify Alarm Settings", "T0839": "Module Firmware",
+    "T0840": "Network Connection Enumeration", "T0842": "Network Sniffing",
+    "T0843": "Program Download", "T0845": "Program Upload",
+    "T0846": "Remote System Discovery", "T0848": "Rogue Master", "T0849": "Masquerading",
+    "T0851": "Rootkit", "T0852": "Screen Capture", "T0853": "Scripting",
+    "T0855": "Unauthorized Command Message", "T0856": "Spoof Reporting Message",
+    "T0857": "System Firmware", "T0858": "Change Operating Mode", "T0859": "Valid Accounts",
+    "T0861": "Point & Tag Identification", "T0866": "Exploitation of Remote Services",
+    "T0867": "Lateral Tool Transfer", "T0868": "Detect Operating Mode",
+    "T0869": "Standard Application Layer Protocol", "T0872": "Indicator Removal on Host",
+    "T0877": "I/O Image", "T0878": "Alarm Suppression", "T0879": "Damage to Property",
+    "T0880": "Loss of Safety", "T0881": "Service Stop", "T0883": "Internet Accessible Device",
+    "T0885": "Commonly Used Port", "T0886": "Remote Services",
+    "T0888": "Remote System Information Discovery",
+    "T0890": "Exploitation for Privilege Escalation", "T0891": "Hardcoded Credentials",
+}
+
+# ATT&CK Enterprise: the tactics, and the techniques analyzers tag or name
+# (id -> primary tactic, name). A technique listed under several tactics is
+# filed under the one a network detection of it evidences.
+_ENTERPRISE_TACTICS = {
+    "TA0043": "Reconnaissance", "TA0042": "Resource Development", "TA0001": "Initial Access",
+    "TA0002": "Execution", "TA0003": "Persistence", "TA0004": "Privilege Escalation",
+    "TA0005": "Defense Evasion", "TA0006": "Credential Access", "TA0007": "Discovery",
+    "TA0008": "Lateral Movement", "TA0009": "Collection", "TA0011": "Command and Control",
+    "TA0010": "Exfiltration", "TA0040": "Impact",
+}
+_ENTERPRISE_TECHNIQUES: dict[str, tuple[str, str]] = {
+    "T1003": ("TA0006", "OS Credential Dumping"), "T1003.006": ("TA0006", "OS Credential Dumping: DCSync"),
+    "T1016": ("TA0007", "System Network Configuration Discovery"),
+    "T1018": ("TA0007", "Remote System Discovery"),
+    "T1021": ("TA0008", "Remote Services"),
+    "T1021.001": ("TA0008", "Remote Services: Remote Desktop Protocol"),
+    "T1021.002": ("TA0008", "Remote Services: SMB/Windows Admin Shares"),
+    "T1021.003": ("TA0008", "Remote Services: Distributed Component Object Model"),
+    "T1021.004": ("TA0008", "Remote Services: SSH"),
+    "T1021.005": ("TA0008", "Remote Services: VNC"),
+    "T1021.006": ("TA0008", "Remote Services: Windows Remote Management"),
+    "T1027": ("TA0005", "Obfuscated Files or Information"),
+    "T1029": ("TA0010", "Scheduled Transfer"), "T1030": ("TA0010", "Data Transfer Size Limits"),
+    "T1036": ("TA0005", "Masquerading"), "T1040": ("TA0006", "Network Sniffing"),
+    "T1041": ("TA0010", "Exfiltration Over C2 Channel"),
+    "T1046": ("TA0007", "Network Service Discovery"),
+    "T1047": ("TA0002", "Windows Management Instrumentation"),
+    "T1048": ("TA0010", "Exfiltration Over Alternative Protocol"),
+    "T1049": ("TA0007", "System Network Connections Discovery"),
+    "T1053": ("TA0002", "Scheduled Task/Job"), "T1053.002": ("TA0002", "Scheduled Task/Job: At"),
+    "T1053.005": ("TA0002", "Scheduled Task/Job: Scheduled Task"),
+    "T1059": ("TA0002", "Command and Scripting Interpreter"),
+    "T1069": ("TA0007", "Permission Groups Discovery"),
+    "T1070": ("TA0005", "Indicator Removal"),
+    "T1070.001": ("TA0005", "Indicator Removal: Clear Windows Event Logs"),
+    "T1071": ("TA0011", "Application Layer Protocol"),
+    "T1071.001": ("TA0011", "Application Layer Protocol: Web Protocols"),
+    "T1071.003": ("TA0011", "Application Layer Protocol: Mail Protocols"),
+    "T1071.004": ("TA0011", "Application Layer Protocol: DNS"),
+    "T1078": ("TA0001", "Valid Accounts"), "T1082": ("TA0007", "System Information Discovery"),
+    "T1087": ("TA0007", "Account Discovery"), "T1087.002": ("TA0007", "Account Discovery: Domain Account"),
+    "T1090": ("TA0011", "Proxy"), "T1090.001": ("TA0011", "Proxy: Internal Proxy"),
+    "T1095": ("TA0011", "Non-Application Layer Protocol"),
+    "T1105": ("TA0011", "Ingress Tool Transfer"), "T1110": ("TA0006", "Brute Force"),
+    "T1112": ("TA0005", "Modify Registry"), "T1132": ("TA0011", "Data Encoding"),
+    "T1133": ("TA0001", "External Remote Services"),
+    "T1135": ("TA0007", "Network Share Discovery"),
+    "T1187": ("TA0006", "Forced Authentication"),
+    "T1189": ("TA0001", "Drive-by Compromise"),
+    "T1190": ("TA0001", "Exploit Public-Facing Application"),
+    "T1200": ("TA0001", "Hardware Additions"),
+    "T1204": ("TA0002", "User Execution"),
+    "T1210": ("TA0008", "Exploitation of Remote Services"),
+    "T1218": ("TA0005", "System Binary Proxy Execution"),
+    "T1219": ("TA0011", "Remote Access Software"),
+    "T1482": ("TA0007", "Domain Trust Discovery"),
+    "T1485": ("TA0040", "Data Destruction"), "T1486": ("TA0040", "Data Encrypted for Impact"),
+    "T1489": ("TA0040", "Service Stop"), "T1496": ("TA0040", "Resource Hijacking"),
+    "T1498": ("TA0040", "Network Denial of Service"),
+    "T1499": ("TA0040", "Endpoint Denial of Service"),
+    "T1543": ("TA0003", "Create or Modify System Process"),
+    "T1543.003": ("TA0003", "Create or Modify System Process: Windows Service"),
+    "T1550": ("TA0005", "Use Alternate Authentication Material"),
+    "T1552": ("TA0006", "Unsecured Credentials"),
+    "T1557": ("TA0006", "Adversary-in-the-Middle"),
+    "T1557.001": ("TA0006", "Adversary-in-the-Middle: LLMNR/NBT-NS Poisoning and SMB Relay"),
+    "T1558": ("TA0006", "Steal or Forge Kerberos Tickets"),
+    "T1558.003": ("TA0006", "Steal or Forge Kerberos Tickets: Kerberoasting"),
+    "T1558.004": ("TA0006", "Steal or Forge Kerberos Tickets: AS-REP Roasting"),
+    "T1566": ("TA0001", "Phishing"), "T1567": ("TA0010", "Exfiltration Over Web Service"),
+    "T1568": ("TA0011", "Dynamic Resolution"), "T1569": ("TA0002", "System Services"),
+    "T1570": ("TA0008", "Lateral Tool Transfer"), "T1571": ("TA0011", "Non-Standard Port"),
+    "T1572": ("TA0011", "Protocol Tunneling"), "T1573": ("TA0011", "Encrypted Channel"),
+    "T1590": ("TA0043", "Gather Victim Network Information"),
+    "T1592": ("TA0043", "Gather Victim Host Information"),
+    "T1595": ("TA0043", "Active Scanning"),
+}
+_RULE_BY_TECHNIQUE: dict[str, _TechniqueRule] = {}
+for _rule in _RULES:
+    _RULE_BY_TECHNIQUE.setdefault(_rule.technique_id, _rule)
+del _rule
+
+# Detection keys an analyzer files its own ATT&CK technique under (the same
+# ones the report's findings read).
+_ANALYZER_TAG_KEYS = ("attack", "technique", "mitre")
+
+
+def _technique_entry(technique_id: str) -> tuple[str, str, str, str] | None:
+    """``(framework, tactic, tactic id, name)`` of a technique this mapper
+    knows, or None for an id it does not (a typo, a retired or unrelated
+    T-number). A technique a keyword rule maps reads as that rule does, so it
+    is filed the same whichever way it was reached; a sub-technique of a
+    known technique is known."""
+    tid = str(technique_id or "").strip().upper()
+    rule = _RULE_BY_TECHNIQUE.get(tid)
+    if rule is not None:
+        return rule.framework, rule.tactic, rule.tactic_id, rule.technique
+    tactic_id = _ICS_TECHNIQUE_TACTIC.get(tid)
+    if tactic_id is not None:
+        return "ics", _ICS_TACTICS[tactic_id], tactic_id, _ICS_TECHNIQUE_NAMES.get(tid, tid)
+    known = _ENTERPRISE_TECHNIQUES.get(tid)
+    if known is not None:
+        return "enterprise", _ENTERPRISE_TACTICS[known[0]], known[0], known[1]
+    parent, dot, _sub = tid.partition(".")
+    if dot:
+        return _technique_entry(parent)
+    return None
+
+
+def _analyzer_technique_ids(item: dict[str, object], blob: str) -> list[str]:
+    """The techniques the analyzer that raised a detection attached to it:
+    its ``attack``/``technique``/``mitre`` tag, else the ids its summary or
+    details name ("... (ATT&CK T1571 Non-Standard Port)"). Each once, in the
+    analyzer's order, and only those this mapper's tables know."""
+    tagged: list[str] = []
+    for key in _ANALYZER_TAG_KEYS:
+        value = item.get(key)
+        if isinstance(value, (set, frozenset)):
+            value = sorted(str(entry) for entry in value)
+        for entry in value if isinstance(value, (list, tuple)) else (value,):
+            if entry:
+                tagged.extend(m.group(0).upper() for m in _TECHNIQUE_ID_RE.finditer(str(entry)))
+    known = [tid for tid in dict.fromkeys(tagged) if _technique_entry(tid) is not None]
+    if known:
+        return known
+    named = (m.group(0).upper() for m in _TECHNIQUE_ID_RE.finditer(blob))
+    return [tid for tid in dict.fromkeys(named) if _technique_entry(tid) is not None]
 
 
 def _fallback_from_explicit_ids(
@@ -1191,6 +1400,8 @@ def analyze_mitre(
     sequence_issues: list[str] = []
     alternate_explanations: list[str] = []
     gate_reason_by_occurrence: dict[int, str] = {}
+    # How each hit was mapped: "analyzer tag", "keyword" or "fallback".
+    method_by_hit: dict[tuple[int, str], str] = {}
 
     previous_node = "Initial Access"
 
@@ -1212,29 +1423,47 @@ def analyze_mitre(
             continue
 
         blob = f"{summary_text} {details}".lower()
-        tactic_ids, technique_ids = _extract_explicit_ids(blob)
-        rule, rule_score = _rule_from_text(blob)
-        framework = _infer_framework(blob)
-
-        if rule:
-            framework = rule.framework
-            tactic = rule.tactic
-            tactic_id = rule.tactic_id
-            technique = rule.technique
-            technique_id = rule.technique_id
+        # The techniques the analyzer attached itself come first: it knows
+        # what it decoded (an ADS AddRoute carrying credentials is T0859 Valid
+        # Accounts + T0886 Remote Services, not T1110 Brute Force for the word
+        # "password"). Keyword inference is the fallback for untagged ones.
+        # One hit per tagged technique, in kill-chain order, so two tags of
+        # one detection never read as a sequence regression.
+        rule: _TechniqueRule | None = None
+        rule_score = 0
+        mappings: list[tuple[str, str, str, str, str]] = []
+        for tid in _analyzer_technique_ids(item, blob):
+            entry = _technique_entry(tid)
+            if entry is not None:
+                mappings.append((*entry, tid))
+        mappings.sort(key=lambda mapping: _tactic_stage_index(mapping[0], mapping[1]))
+        if mappings:
+            tactic_ids, technique_ids = [], [mapping[4] for mapping in mappings]
+            method = "analyzer tag"
         else:
-            fallback = _fallback_from_explicit_ids(
-                tactic_ids,
-                technique_ids,
-                framework,
-                summary_text,
-            )
-            if fallback is None:
-                checks["sequence_plausibility"].append(
-                    f"Detection {idx} left unmapped: no ATT&CK IDs and no high-confidence keyword rule"
+            # An id the technique tables do not know is no mapping.
+            tactic_ids, _unknown_ids = _extract_explicit_ids(blob)
+            technique_ids = []
+            rule, rule_score = _rule_from_text(blob)
+            if rule:
+                mappings = [(rule.framework, rule.tactic, rule.tactic_id, rule.technique, rule.technique_id)]
+                method = "keyword"
+            else:
+                framework = _infer_framework(blob)
+                fallback = _fallback_from_explicit_ids(
+                    tactic_ids,
+                    technique_ids,
+                    framework,
+                    summary_text,
                 )
-                continue
-            tactic, tactic_id, technique, technique_id = fallback
+                if fallback is None:
+                    checks["sequence_plausibility"].append(
+                        f"Detection {idx} left unmapped: no ATT&CK IDs and no high-confidence keyword rule"
+                    )
+                    continue
+                tactic, tactic_id, technique, technique_id = fallback
+                mappings = [(framework, tactic, tactic_id, technique, technique_id)]
+                method = "fallback"
 
         matched_keywords = _matched_keywords(rule, blob)
         evidence = _extract_evidence(item)
@@ -1257,79 +1486,83 @@ def analyze_mitre(
                 f"Detection {idx} left unmapped: {gate_reason}"
             )
             continue
+        if method == "analyzer tag":
+            gate_reason = "analyzer ATT&CK tag"
 
-        # Crown-jewel ICS process/safety-impact techniques require a high or
-        # critical source detection. A low-severity, generic "OT control
-        # activity" warning (which can fire on port collisions in IT captures)
-        # must not be mapped to Industroyer/FrostyGoop-grade techniques.
         detection_severity = str(item.get("severity", "info") or "info").lower()
-        if (
-            technique_id in _HIGH_SEVERITY_REQUIRED_TECHNIQUES
-            and detection_severity not in {"high", "critical"}
-            and not (tactic_ids or technique_ids)
-        ):
-            checks["sequence_plausibility"].append(
-                f"Detection {idx} not mapped to {technique_id}: high-impact ICS "
-                f"technique requires high/critical severity (was {detection_severity})"
-            )
-            continue
-        gate_reason_by_occurrence[idx] = gate_reason
-
         hit_first, hit_last = _extract_detection_times(
             item,
             threat_summary.first_seen,
             threat_summary.last_seen,
         )
 
-        contradictory_signals: list[str] = []
+        for framework, tactic, tactic_id, technique, technique_id in mappings:
+            # Crown-jewel ICS process/safety-impact techniques require a high or
+            # critical source detection. A low-severity, generic "OT control
+            # activity" warning (which can fire on port collisions in IT captures)
+            # must not be mapped to Industroyer/FrostyGoop-grade techniques.
+            if (
+                technique_id in _HIGH_SEVERITY_REQUIRED_TECHNIQUES
+                and detection_severity not in {"high", "critical"}
+                and not (tactic_ids or technique_ids)
+            ):
+                checks["sequence_plausibility"].append(
+                    f"Detection {idx} not mapped to {technique_id}: high-impact ICS "
+                    f"technique requires high/critical severity (was {detection_severity})"
+                )
+                continue
+            gate_reason_by_occurrence[idx] = gate_reason
+            method_by_hit[(idx, technique_id)] = method
 
-        if framework == "ics" and tactic in {
-            "Impair Process Control",
-            "Inhibit Response Function",
-            "Impact",
-        }:
-            checks["ics_process_impact"].append(
-                f"Potential process/safety impact from {technique_id} at occurrence {idx}"
+            contradictory_signals: list[str] = []
+
+            if framework == "ics" and tactic in {
+                "Impair Process Control",
+                "Inhibit Response Function",
+                "Impact",
+            }:
+                checks["ics_process_impact"].append(
+                    f"Potential process/safety impact from {technique_id} at occurrence {idx}"
+                )
+
+            if len(host_refs) >= 2:
+                checks["host_boundary_activity"].append(
+                    f"Multi-host evidence for {technique_id}: {', '.join(host_refs[:4])}"
+                )
+
+            hit = MitreHit(
+                framework=framework,
+                tactic=tactic,
+                tactic_id=tactic_id,
+                technique=technique,
+                technique_id=technique_id,
+                procedure=summary_text or "Detection Procedure",
+                source=str(item.get("source", "threats") or "threats"),
+                severity=detection_severity,
+                confidence=confidence,
+                details=details,
+                evidence=evidence,
+                artifacts=artifacts,
+                iocs=iocs,
+                first_seen=hit_first,
+                last_seen=hit_last,
+                occurrence=idx,
+                matched_keywords=matched_keywords,
+                contradictory_signals=contradictory_signals,
+                packet_refs=packet_refs,
+                flow_refs=flow_refs,
+                host_refs=host_refs,
             )
+            hits.append(hit)
 
-        if len(host_refs) >= 2:
-            checks["host_boundary_activity"].append(
-                f"Multi-host evidence for {technique_id}: {', '.join(host_refs[:4])}"
-            )
-
-        hit = MitreHit(
-            framework=framework,
-            tactic=tactic,
-            tactic_id=tactic_id,
-            technique=technique,
-            technique_id=technique_id,
-            procedure=summary_text or "Detection Procedure",
-            source=str(item.get("source", "threats") or "threats"),
-            severity=str(item.get("severity", "info") or "info").lower(),
-            confidence=confidence,
-            details=details,
-            evidence=evidence,
-            artifacts=artifacts,
-            iocs=iocs,
-            first_seen=hit_first,
-            last_seen=hit_last,
-            occurrence=idx,
-            matched_keywords=matched_keywords,
-            contradictory_signals=contradictory_signals,
-            packet_refs=packet_refs,
-            flow_refs=flow_refs,
-            host_refs=host_refs,
-        )
-        hits.append(hit)
-
-        tactic_counts[f"{tactic} ({tactic_id})"] += 1
-        technique_counts[f"{technique} ({technique_id})"] += 1
-        procedure_counts[hit.procedure] += 1
-        framework_counts[framework] += 1
-        for value in iocs:
-            ioc_counts[value] += 1
-        for value in artifacts:
-            artifact_counts[value] += 1
+            tactic_counts[f"{tactic} ({tactic_id})"] += 1
+            technique_counts[f"{technique} ({technique_id})"] += 1
+            procedure_counts[hit.procedure] += 1
+            framework_counts[framework] += 1
+            for value in iocs:
+                ioc_counts[value] += 1
+            for value in artifacts:
+                artifact_counts[value] += 1
 
     if hits:
         source_by_technique: dict[str, set[str]] = defaultdict(set)
@@ -1350,8 +1583,11 @@ def analyze_mitre(
                     f"{hit.technique_id} corroborated by {corroborating_sources} sources"
                 )
 
+            method = method_by_hit.get((hit.occurrence, hit.technique_id)) or (
+                "keyword" if hit.matched_keywords else "fallback"
+            )
             rationale_parts = [
-                f"Technique mapped via {'keyword' if hit.matched_keywords else 'fallback'} logic",
+                f"Technique mapped via {method} logic",
                 f"keywords={','.join(hit.matched_keywords[:5]) or '-'}",
                 f"evidence_items={len(hit.evidence)}",
                 f"sources_for_technique={corroborating_sources}",

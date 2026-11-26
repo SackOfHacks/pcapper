@@ -50,6 +50,7 @@ KERBEROS_PORTS = {88, 464}
 LDAP_PORTS = {389, 636, 3268, 3269}
 SIP_PORTS = {5060, 5061}
 RDP_PORTS = {3389}
+ADS_UDP_PORT = 48899  # TwinCAT discovery / AddRoute (ads.ADS_UDP_PORT)
 LLDP_ETHERTYPE = 0x88CC
 CDP_SNAP_HEADER = b"\xaa\xaa\x03\x00\x00\x0c\x20\x00"
 CDP_MULTICAST_MAC = "01:00:0c:cc:cc:cc"
@@ -1328,6 +1329,65 @@ def _extract_modbus_device_id_hostnames(
                         )
                     )
         idx = end
+    return findings
+
+
+def _extract_ads_hostnames(payload: bytes) -> list[tuple[str, str, str, str]]:
+    """Names a TwinCAT UDP 48899 message gives its SENDER (the parsing is
+    ``ads.parse_udp``'s, the one --ads reports from).
+
+    A discovery or AddRoute *reply* carries the device's own host name (tag 5:
+    ``CX_0D7560`` for a Beckhoff CX PLC). An AddRoute *request* names the
+    engineering station adding the route: the route name (tag 12, which
+    TwinCAT defaults to the station's host name but a user can change) and the
+    address the device is to route back to (tag 5, normally the station
+    itself, here when it is a name rather than an IP)."""
+    try:
+        from .ads import parse_udp
+
+        parsed = parse_udp(payload)
+    except Exception:
+        return []
+    if parsed is None:
+        return []
+    service, response, tags = parsed
+    netid = str(tags.get("AMS NetId", "") or "").strip()
+    netid_text = f", AMS NetId {netid}" if netid else ""
+    host = str(tags.get("host/address", "") or "").strip()
+    findings: list[tuple[str, str, str, str]] = []
+    if response:
+        if host:
+            findings.append(
+                (
+                    host,
+                    "TwinCAT ADS discovery reply" if service == "Discovery" else f"TwinCAT ADS {service} reply",
+                    "HIGH",
+                    f"TwinCAT UDP {service} reply naming its sender{netid_text}",
+                )
+            )
+        return findings
+    if service != "AddRoute":
+        return findings
+    route = str(tags.get("route name", "") or "").strip()
+    if route:
+        findings.append(
+            (
+                route,
+                "TwinCAT AddRoute route name",
+                "LOW",
+                f"route name of an AddRoute request (TwinCAT's default is the "
+                f"requesting station's host name){netid_text}",
+            )
+        )
+    if host and not _is_ip_literal(host) and _normalize_hostname(host) != _normalize_hostname(route):
+        findings.append(
+            (
+                host,
+                "TwinCAT AddRoute route address",
+                "LOW",
+                f"address an AddRoute request asks the device to route back to{netid_text}",
+            )
+        )
     return findings
 
 
@@ -3306,6 +3366,31 @@ def analyze_hostname(
                         ):
                             found_evidence = True
                             summary.protocol_counts["Modbus"] += 1
+                            summary.method_counts[method] += 1
+
+                if udp_layer is not None and ADS_UDP_PORT in (sport, dport):
+                    # TwinCAT discovery / AddRoute: each name is the sender's.
+                    for (
+                        host_value,
+                        method,
+                        confidence,
+                        detail,
+                    ) in _extract_ads_hostnames(payload):
+                        if _match(src_ip) and _record_finding(
+                            findings_map,
+                            hostname=host_value,
+                            mapped_ip=src_ip,
+                            protocol="ADS/AMS",
+                            method=method,
+                            confidence=confidence,
+                            details=f"{detail} on ports {sport}->{dport}",
+                            src_ip=src_ip,
+                            dst_ip=dst_ip,
+                            ts=ts,
+                            packet_index=packet_index,
+                        ):
+                            found_evidence = True
+                            summary.protocol_counts["ADS/AMS"] += 1
                             summary.method_counts[method] += 1
 
                 if sport in OT_PORT_PROTOCOLS or dport in OT_PORT_PROTOCOLS:

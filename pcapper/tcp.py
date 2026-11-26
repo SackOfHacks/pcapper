@@ -9,6 +9,7 @@ from typing import Optional
 from .files import analyze_files
 from .http import analyze_http
 from .lite import UNSUPPORTED, LitePacket
+from .ot_ports import OT_PORT_PROTOCOLS, foreign_service_reply
 from .pcap_cache import iter_packets
 from .progress import run_with_busy_status
 from .services import analyze_services
@@ -151,6 +152,18 @@ def _stats_from_samples(samples: list[int]) -> dict[str, float]:
         "p50": _percentile(sorted_vals, 50.0),
         "p95": _percentile(sorted_vals, 95.0),
     }
+
+
+def _is_internal_ot_flow(src_ip: str, dst_ip: str, sport: int, dport: int) -> bool:
+    """A flow between two private hosts with an OT service (ot_ports) on the
+    server side: the destination port (unless the source is another service
+    answering a client whose ephemeral port equals an OT port), or the source
+    port of a reply to an ephemeral port."""
+    if not (is_private_ip(src_ip) and is_private_ip(dst_ip)):
+        return False
+    if dport in OT_PORT_PROTOCOLS:
+        return not foreign_service_reply(sport, {dport})
+    return sport in OT_PORT_PROTOCOLS and dport >= 32768
 
 
 def _is_likely_tcp_responder_packet(sport: int, dport: int) -> bool:
@@ -975,6 +988,7 @@ def analyze_tcp(
         )
 
     beacon_hits = []
+    ot_poll_hits = []
     for (src_ip, dst_ip, sport, dport), tracker in beacon_trackers.items():
         intervals = tracker.get("intervals") or []
         payloads = tracker.get("payloads") or []
@@ -993,15 +1007,30 @@ def analyze_tcp(
         payload_mean = sum(payloads) / max(len(payloads), 1) if payloads else 0
         if payload_mean > 1024:
             continue
-        beacon_hits.append(
-            f"{src_ip}:{sport} -> {dst_ip}:{dport} ({mean_interval:.2f}s avg)"
-        )
+        hit = f"{src_ip}:{sport} -> {dst_ip}:{dport} ({mean_interval:.2f}s avg)"
+        (ot_poll_hits if _is_internal_ot_flow(src_ip, dst_ip, sport, dport) else beacon_hits).append(hit)
     if beacon_hits:
         detections.append(
             {
                 "severity": "high",
                 "summary": "Possible TCP beaconing",
                 "details": ", ".join(beacon_hits[:5]),
+            }
+        )
+    # Internal-only periodicity on an OT service port is HMI/SCADA polling,
+    # the verdict the beacon analysis and the threat engine reach for the
+    # same flows (internal_periodicity "ot_baseline", never a C2 technique).
+    # It was HIGH "possible beaconing" here while they called it baseline.
+    if ot_poll_hits:
+        detections.append(
+            {
+                "severity": "info",
+                "summary": "Periodic internal OT polling (likely baseline)",
+                "details": ", ".join(ot_poll_hits[:5])
+                + " [internal-only cyclic polling on an OT service port; verify the "
+                "(src,dst,port) tuples against a process baseline]",
+                "internal_periodicity": "ot_baseline",
+                "confidence": "low",
             }
         )
 
